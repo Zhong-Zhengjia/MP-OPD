@@ -1,2 +1,2 @@
 # G-OPD
-Official repository for the paper "Learning beyond Teacher: Generalized On-Policy Distillation with Extrapolated Rewards"
+Official repository for the paper "Learning beyond Teacher: Generalized On-Policy Distillation with Reward Extrapolation"
