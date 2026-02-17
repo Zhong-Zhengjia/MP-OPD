@@ -59,5 +59,10 @@ Our training code is mainly based on [verl](https://github.com/volcengine/verl).
 ## Citation
 If you find our work helpful, please kindly cite as
 ```bibtex
-
+@article{yang2026learning,
+  title={Learning beyond Teacher: Generalized On-Policy Distillation with Reward Extrapolation},
+  author={Yang, Wenkai and Liu, Weijie and Xie, Ruobing and Yang, Kai and Yang, Saiyong and Lin, Yankai},
+  journal={arXiv preprint arXiv:2602.12125},
+  year={2026}
+}
 ```
