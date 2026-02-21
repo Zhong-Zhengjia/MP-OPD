@@ -27,6 +27,10 @@ pip install math-verify
 ## Training
 Our training data is provided in [here](https://huggingface.co/datasets/Keven16/G-OPD-Training-Data).
 
+### GRPO
+
+We provide an example for GRPO training in the script `verl/examples/grpo_trainer/run_qwen3-4b-math.sh`.
+
 ### Single-Teacher Distillation
 
 An example for running G-OPD in the single-teacher distillation setting is
