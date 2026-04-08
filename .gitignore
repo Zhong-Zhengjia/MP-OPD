@@ -207,3 +207,7 @@ outputs
 
 # data
 *.parquet
+
+eval_outputs/
+plots/
+verl/debug_data/

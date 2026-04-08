@@ -58,7 +58,7 @@ def remove_boxed(s):
     except Exception:
         return None
 
-
+# reward model
 def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0) -> bool:
     # verify_func = math_metric(
     #     gold_extraction_target=(LatexExtractionConfig(),),

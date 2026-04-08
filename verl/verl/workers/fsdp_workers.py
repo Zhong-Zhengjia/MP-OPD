@@ -80,7 +80,7 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
+from verl.utils.model import compute_position_id_with_mask, convert_weight_keys, get_generation_config
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
@@ -131,7 +131,7 @@ def get_vl_model_vision_tower(vl_model_instance):
     return None
 
 
-class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+class ActorRolloutRefWorker(Worker, DistProfilerExtension): 
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
     or a hybrid engine based on the config.rollout
@@ -752,6 +752,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
+        from transformers import AutoModelForCausalLM
 
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
@@ -760,6 +761,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         use_remove_padding = self.config.model.get("use_remove_padding", False)
         use_shm = self.config.model.get("use_shm", False)
         use_fused_kernels = self.config.model.get("use_fused_kernels", False)
+
+        # for teacher rollout generation: use a standalone HF model instead of FSDP-wrapped ref model
+        self.teacher_generate_module = None
 
         if self._is_actor or self._is_rollout:
             # we need the model for actor and rollout
@@ -819,7 +823,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             if self.rank == 0:
                 print("reference model:", ref_model_path)
+
             local_path = copy_to_local(ref_model_path, use_shm=use_shm)
+
+            # Keep the original ref FSDP model for log_prob / distillation-related computation
             self.ref_module_fsdp = self._build_model_optimizer(
                 model_path=local_path,
                 fsdp_config=omega_conf_to_dataclass(self.config.ref.fsdp_config),
@@ -831,11 +838,47 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 use_liger=self.config.model.get("use_liger", False),
                 role="ref",
             )[0]
+
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
+
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+
+            # In heterogeneous distillation mode, ref model is treated as teacher model
+            self.teacher_module_fsdp = self.ref_module_fsdp
+            self.teacher_policy = self.ref_policy
+
+            # ------------------------------------------------------------------
+            # Build a standalone non-FSDP teacher model for rollout generation.
+            # This avoids FSDP/offload/materialization issues during model.generate().
+            # ------------------------------------------------------------------
+            teacher_dtype = None
+            try:
+                import torch
+                # Prefer bf16 if available / commonly used in training
+                teacher_dtype = torch.bfloat16
+            except Exception:
+                teacher_dtype = None
+
+            if self.rank == 0:
+                print("[hetero_distill] Building standalone teacher_generate_module for rollout generate")
+
+            self.teacher_generate_module = AutoModelForCausalLM.from_pretrained(
+                local_path,
+                torch_dtype=teacher_dtype,
+                trust_remote_code=self.config.model.get("trust_remote_code", False),
+            )
+            self.teacher_generate_module.eval()
+            self.teacher_generate_module.to(get_device_id())
+
+            if self.rank == 0:
+                try:
+                    first_param = next(self.teacher_generate_module.parameters())
+                    print(f"[hetero_distill] teacher_generate_module device = {first_param.device}")
+                except Exception:
+                    print("[hetero_distill] failed to inspect teacher_generate_module device")
 
         # Initialize base models for corrected reward computation
         # Actor's base model (for computing base_log_prob)
@@ -867,6 +910,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self._has_base_model = True
             if self.rank == 0:
                 print(f"Actor base model initialized successfully from {base_model_path}")
+            # In heterogeneous distillation mode, actor base model is used as frozen student-base / self-teacher
+            self.student_base_module_fsdp = self.base_module_fsdp
+            self.student_base_policy = self.base_policy
 
         # Ref's base model (for computing base_ref_log_prob)
         self.base_ref_policy = None
@@ -899,6 +945,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self.rank == 0:
                 print(f"Ref base model initialized successfully from {ref_base_model_path}")
 
+        if self._is_actor and self._is_ref:
+            if self.teacher_policy is None and self.ref_policy is not None:
+                self.teacher_policy = self.ref_policy
+                self.teacher_module_fsdp = self.ref_module_fsdp
+
+        if self._is_actor:
+            if self.student_base_policy is None and self.base_policy is not None:
+                self.student_base_policy = self.base_policy
+                self.student_base_module_fsdp = self.base_module_fsdp
+
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
             self.checkpoint_manager = FSDPCheckpointManager(
@@ -912,7 +968,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if not self._is_actor and self._is_rollout:
             # If ActorRolloutRefWorker is initialized as a standalone rollout,
             # create a checkpoint manager for FSDP model to allow loading FSDP checkpoints for rollout.
-
             checkpoint_contents = OmegaConf.create({"load_contents": ["model"], "save_contents": []})
             self.checkpoint_manager = FSDPCheckpointManager(
                 model=self.actor_module_fsdp,
@@ -1013,6 +1068,191 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # clear kv cache
         get_torch_device().empty_cache()
+        return output
+
+    def _generate_sequences_with_policy(
+        self,
+        prompts: DataProto,
+        policy_module,
+        temperature=1.0,
+        top_p=1.0,
+        do_sample=True,
+    ):
+        import torch
+
+        prompts = prompts.to(get_device_id())
+
+        input_ids = prompts.batch["input_ids"]
+        attention_mask = prompts.batch["attention_mask"]
+
+        # prompt length per sample
+        prompt_lens = attention_mask.sum(dim=-1)
+
+        model = policy_module
+        model.eval()
+
+        # if self.rank == 0:
+        #     try:
+        #         first_param = next(model.parameters())
+        #         print(
+        #             f"[hetero_distill] generate with model device={first_param.device}, "
+        #             f"input_ids device={input_ids.device}"
+        #         )
+        #     except Exception as e:
+        #         print(f"[hetero_distill] failed to inspect model device: {e}")
+
+        gen_kwargs = {
+            "max_new_tokens": 2048,
+            "do_sample": do_sample,
+            "temperature": temperature,
+            "top_p": top_p,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "use_cache": True,
+        }
+
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **gen_kwargs,
+            )
+
+        # Slice response part
+        responses = []
+        full_input_ids = []
+        full_attention_mask = []
+        full_position_ids = []
+
+        for i in range(outputs.shape[0]):
+            p_len = int(prompt_lens[i].item())
+            full_seq = outputs[i]
+            resp = full_seq[p_len:]
+
+            full_input_ids.append(full_seq)
+            full_attention_mask.append(torch.ones_like(full_seq, dtype=attention_mask.dtype))
+            full_position_ids.append(torch.arange(full_seq.shape[0], device=full_seq.device, dtype=torch.long))
+            responses.append(resp)
+
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        max_resp_len = max(x.shape[0] for x in responses) if len(responses) > 0 else 1
+        max_full_len = max(x.shape[0] for x in full_input_ids) if len(full_input_ids) > 0 else 1
+
+        def pad_1d(x, max_len, pad_value):
+            if x.shape[0] == max_len:
+                return x
+            pad = torch.full((max_len - x.shape[0],), pad_value, dtype=x.dtype, device=x.device)
+            return torch.cat([x, pad], dim=0)
+
+        responses = torch.stack([pad_1d(x, max_resp_len, pad_id) for x in responses], dim=0)
+        full_input_ids = torch.stack([pad_1d(x, max_full_len, pad_id) for x in full_input_ids], dim=0)
+        full_attention_mask = torch.stack([pad_1d(x, max_full_len, 0) for x in full_attention_mask], dim=0)
+        full_position_ids = torch.stack([pad_1d(x, max_full_len, 0) for x in full_position_ids], dim=0)
+
+        output = DataProto.from_dict(
+            tensors={
+                "input_ids": full_input_ids,
+                "attention_mask": full_attention_mask,
+                "position_ids": full_position_ids,
+                "responses": responses,
+            },
+            meta_info={
+                "temperature": temperature,
+            },
+        )
+        return output.to("cpu")
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    @DistProfiler.annotate(color="magenta", role="teacher_rollout_generate")
+    def generate_sequences_teacher(self, prompts: DataProto):
+        assert self.teacher_generate_module is not None, "Teacher generate model is not initialized."
+
+        # if self.rank == 0:
+        #     print("[hetero_distill] generate_sequences_teacher called")
+
+        temperature = self.config.rollout.get("temperature", 1.0)
+        top_p = self.config.rollout.get("top_p", 1.0)
+        do_sample = True
+
+        output = self._generate_sequences_with_policy(
+            prompts=prompts,
+            policy_module=self.teacher_generate_module,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+        )
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="orange", role="actor_update_distill")
+    def update_actor_distill(self, data: DataProto):
+        assert self._is_actor
+        assert self.actor is not None, "Student actor is not initialized."
+        assert self.teacher_policy is not None, "Teacher policy is not initialized."
+        assert self.student_base_policy is not None, "Student base policy is not initialized."
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+
+        # Load frozen teacher / student-base if needed
+        # They may use CPU offload under FSDP ref config
+        if hasattr(self, "ref_module_fsdp") and self.ref_module_fsdp is not None:
+            try:
+                load_fsdp_model_to_gpu(self.ref_module_fsdp)
+            except Exception:
+                pass
+        if hasattr(self, "base_module_fsdp") and self.base_module_fsdp is not None:
+            try:
+                load_fsdp_model_to_gpu(self.base_module_fsdp)
+            except Exception:
+                pass
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+
+            with Timer(name="update_policy_distill", logger=None) as timer:
+                metrics = self.actor.update_policy_distill(
+                    data=data,
+                    teacher_actor=self.teacher_policy,
+                    student_base_actor=self.student_base_policy,
+                    tokenizer=self.tokenizer,
+                )
+
+            delta_time = timer.last
+            metrics["perf/update_policy_distill_time"] = delta_time
+            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+
+            if self.actor_lr_scheduler is not None:
+                lr = self.actor_lr_scheduler.get_last_lr()[0]
+                metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+                self.actor_lr_scheduler.step()
+
+            output = DataProto(meta_info={"metrics": metrics})
+            output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during update_actor_distill", logger=logger)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            log_gpu_memory_usage("After offload actor optimizer during update_actor_distill", logger=logger)
+
+        # Offload frozen models back if needed
+        if hasattr(self, "ref_module_fsdp") and self.ref_module_fsdp is not None:
+            try:
+                offload_fsdp_model_to_cpu(self.ref_module_fsdp)
+            except Exception:
+                pass
+        if hasattr(self, "base_module_fsdp") and self.base_module_fsdp is not None:
+            try:
+                offload_fsdp_model_to_cpu(self.base_module_fsdp)
+            except Exception:
+                pass
+
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

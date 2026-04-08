@@ -31,6 +31,8 @@ from verl.utils.config import validate_config
 from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
 
+from rich import print
+
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
@@ -39,6 +41,8 @@ def main(config):
     Args:
         config_dict: Hydra configuration dictionary containing training parameters.
     """
+    # print(config)
+    
     run_ppo(config)
 
 
@@ -127,7 +131,7 @@ class TaskRunner:
             actor_rollout_cls = (
                 AsyncActorRolloutRefWorker
                 if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker
+                else ActorRolloutRefWorker   # use sync mode
             )
             ray_worker_group_cls = RayWorkerGroup
 
@@ -146,6 +150,7 @@ class TaskRunner:
 
         from verl.trainer.ppo.ray_trainer import Role
 
+        # 这里将 Role.ActorRollout 映射为 ActorRolloutRefWorker
         self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
 
         return actor_rollout_cls, ray_worker_group_cls

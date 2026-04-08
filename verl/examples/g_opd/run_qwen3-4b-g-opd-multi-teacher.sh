@@ -25,7 +25,7 @@ python3 -m verl.trainer.main_ppo \
         data.val_files="$test_files" \
         data.train_batch_size=1024 \
         data.max_prompt_length=2048 \
-        data.max_response_length=16384 \
+        data.max_response_length=8192 \
         data.filter_overlong_prompts=True \
         data.truncation='error' \
         data.shuffle=True \
@@ -74,7 +74,7 @@ python3 -m verl.trainer.main_ppo \
         trainer.log_val_generations=10 \
         trainer.project_name='on-policy-distillation' \
         trainer.experiment_name='Qwen3-4B-Non-Thinking-Multi-Teacher-Distill-ExOPD' \
-        trainer.n_gpus_per_node=8 \
+        trainer.n_gpus_per_node=2 \
         trainer.nnodes=1 \
         trainer.save_freq=50 \
         trainer.default_local_dir=/G-OPD-checkpoints/Qwen3-4B-Non-Thinking-Multi-Teacher-Distill-ExOPD \

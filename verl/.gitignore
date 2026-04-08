@@ -129,3 +129,8 @@ logs
 log
 outputs
 .history
+
+
+eval_outputs/
+verl/debug_data/
+plots/

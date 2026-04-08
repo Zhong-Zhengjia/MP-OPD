@@ -21,6 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
+import random
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ import ray
 import torch
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
+from torch.nn.utils.rnn import pad_sequence
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
@@ -59,6 +61,8 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+
+from save_debug_sample import save_dataproto_single_sample_with_json_preview
 
 
 @dataclass
@@ -176,6 +180,43 @@ def compute_response_mask(data: DataProto):
     response_length = responses.size(1)
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
+
+
+def union_gen_and_rollout_batch(gen_batch: DataProto, rollout_batch: DataProto) -> DataProto:
+    prefer_rollout_tensor_keys = {
+        "input_ids",
+        "attention_mask",
+        "position_ids",
+        "responses",
+        "prompts",
+    }
+
+    gen_tensor_keys = list(gen_batch.batch.keys())
+    rollout_tensor_keys = list(rollout_batch.batch.keys())
+
+    overlap = set(gen_tensor_keys) & set(rollout_tensor_keys)
+
+    # 对于不在 prefer_rollout_tensor_keys 里的重叠字段，仍然要求完全一致
+    illegal_conflicts = []
+    for k in overlap:
+        if k in prefer_rollout_tensor_keys:
+            continue
+        if not gen_batch.batch[k].equal(rollout_batch.batch[k]):
+            illegal_conflicts.append(k)
+
+    assert len(illegal_conflicts) == 0, (
+        f"Unexpected conflicting keys during union: {illegal_conflicts}"
+    )
+
+    # 从 gen_batch 中删掉那些应该由 rollout 提供的字段
+    kept_tensor_keys = [k for k in gen_tensor_keys if k not in prefer_rollout_tensor_keys]
+
+    gen_batch_trimmed = gen_batch.select(
+        batch_keys=kept_tensor_keys,
+        non_tensor_batch_keys=list(gen_batch.non_tensor_batch.keys()),
+    )
+
+    return gen_batch_trimmed.union(rollout_batch)
 
 
 def compute_advantage(
@@ -327,6 +368,19 @@ class RayPPOTrainer:
                     "you must set data.return_raw_chat=True in config to enable re-tokenization. "
                     "This is needed to access the original messages for re-tokenizing with ref model's chat template."
                 )
+
+        # training mode
+        self.train_mode = self.config.algorithm.get("train_mode", "ppo")
+        self.is_hetero_distill = self.train_mode == "heterogeneous_distill"
+
+        hetero_cfg = self.config.algorithm.get("hetero_distill", {})
+        self.student_rollout_n = hetero_cfg.get("student_rollout_n", 1)
+        self.teacher_rollout_n = hetero_cfg.get("teacher_rollout_n", 1)
+        self.use_sdft = hetero_cfg.get("use_sdft", True)
+        self.use_icl_opd = hetero_cfg.get("use_icl_opd", True)
+        self.sdft_weight = hetero_cfg.get("sdft_weight", 1.0)
+        self.icl_opd_weight = hetero_cfg.get("icl_opd_weight", 1.0)
+        self.sample_demo_strategy = hetero_cfg.get("sample_demo_strategy", "random")
 
         # Store base model paths for corrected reward computation
         self.base_model_path = config.actor_rollout_ref.model.get("base_model_path", None)
@@ -710,10 +764,14 @@ class RayPPOTrainer:
         # create actor and rollout
         if self.hybrid_engine:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            actor_rollout_role = str(Role.ActorRollout)
+            if self.config.algorithm.get("train_mode", None) == "heterogeneous_distill":
+                actor_rollout_role = "actor_rollout_ref"
+
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=self.config.actor_rollout_ref,
-                role=str(Role.ActorRollout),
+                role=actor_rollout_role,
             )
             self.resource_pool_to_cls[resource_pool][str(Role.ActorRollout)] = actor_rollout_cls
         else:
@@ -982,6 +1040,560 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _is_empty_dataproto(self, batch: DataProto) -> bool:
+        if batch is None:
+            return True
+        if not hasattr(batch, "batch") or batch.batch is None:
+            return True
+        if "input_ids" not in batch.batch:
+            return True
+        input_ids = batch.batch["input_ids"]
+        if input_ids is None:
+            return True
+        if not hasattr(input_ids, "shape"):
+            return True
+        if input_ids.shape[0] == 0:
+            return True
+        return False
+
+    def _extract_response_texts_from_batch(self, batch: DataProto):
+        responses = batch.batch["responses"]
+        return [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
+
+    def _compute_binary_correctness_from_reward_tensor(self, reward_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            reward_tensor: [bsz, resp_len] or [bsz]
+        Returns:
+            correctness: [bsz] bool tensor
+        """
+        if reward_tensor.dim() > 1:
+            scores = reward_tensor.sum(dim=-1)
+        else:
+            scores = reward_tensor
+        return scores > 0
+
+    def _repeat_base_batch_for_rollout_n(self, base_batch: DataProto, rollout_n: int) -> DataProto:
+        return base_batch.repeat(repeat_times=rollout_n, interleave=True)
+
+    def _build_hetero_distill_batch(
+        self,
+        base_batch: DataProto,
+        student_batch: DataProto,
+        teacher_batch: DataProto,
+        student_reward_tensor: torch.Tensor,
+        teacher_reward_tensor: torch.Tensor,
+    ) -> DataProto:
+        """
+        Build heterogeneous distillation training batch.
+
+        Output samples are all student wrong trajectories, each paired with either:
+        - sdft: a correct student trajectory as demonstration
+        - icl_opd: a correct teacher trajectory as demonstration
+
+        If both student and teacher are all correct or all wrong for one prompt, skip that prompt.
+        """
+        import numpy as np
+        import torch
+        from collections import defaultdict
+
+        if base_batch is None or student_batch is None or teacher_batch is None:
+            return None
+        if "input_ids" not in base_batch.batch:
+            return None
+        if "responses" not in student_batch.batch or "responses" not in teacher_batch.batch:
+            return None
+        if base_batch.batch["input_ids"].shape[0] == 0:
+            return None
+        if student_batch.batch["responses"].shape[0] == 0 or teacher_batch.batch["responses"].shape[0] == 0:
+            return None
+        if student_reward_tensor is None or teacher_reward_tensor is None:
+            return None
+        if student_reward_tensor.numel() == 0 or teacher_reward_tensor.numel() == 0:
+            return None
+
+        student_correct = self._compute_binary_correctness_from_reward_tensor(student_reward_tensor).cpu()
+        teacher_correct = self._compute_binary_correctness_from_reward_tensor(teacher_reward_tensor).cpu()
+
+        base_bs = len(base_batch.batch["input_ids"])
+        student_n = self.student_rollout_n
+        teacher_n = self.teacher_rollout_n
+
+        if student_n <= 0 or teacher_n <= 0:
+            return None
+
+        expected_student = base_bs * student_n
+        expected_teacher = base_bs * teacher_n
+
+        if student_reward_tensor.shape[0] != expected_student:
+            return None
+        if teacher_reward_tensor.shape[0] != expected_teacher:
+            return None
+        if student_batch.batch["responses"].shape[0] != expected_student:
+            return None
+        if teacher_batch.batch["responses"].shape[0] != expected_teacher:
+            return None
+
+        student_resp_texts = self._extract_response_texts_from_batch(student_batch)
+        teacher_resp_texts = self._extract_response_texts_from_batch(teacher_batch)
+
+        # prompt texts
+        prompt_texts = [
+            self.tokenizer.decode(ids, skip_special_tokens=True)
+            for ids in base_batch.batch["input_ids"]
+        ]
+
+        # fallback uid
+        if "uid" in base_batch.non_tensor_batch:
+            uids = list(base_batch.non_tensor_batch["uid"])
+        else:
+            uids = [str(uuid.uuid4()) for _ in range(base_bs)]
+
+        tensor_input_ids = []
+        tensor_attention_mask = []
+        tensor_position_ids = []
+        tensor_responses = []
+        tensor_response_mask = []
+
+        non_tensor_distill_type = []
+        non_tensor_demo_text = []
+        non_tensor_wrong_response_text = []
+        non_tensor_prompt_text = []
+        non_tensor_uid = []
+
+        def choose_one(items):
+            if len(items) == 0:
+                return None
+            if self.sample_demo_strategy == "random":
+                idx = np.random.randint(0, len(items))
+                return items[idx]
+            return items[0]
+
+        for i in range(base_bs):
+            s_l = i * student_n
+            s_r = (i + 1) * student_n
+            t_l = i * teacher_n
+            t_r = (i + 1) * teacher_n
+
+            student_correct_texts = [
+                student_resp_texts[j] for j in range(s_l, s_r) if bool(student_correct[j].item())
+            ]
+            student_wrong_items = [
+                (j, student_resp_texts[j]) for j in range(s_l, s_r) if not bool(student_correct[j].item())
+            ]
+            teacher_correct_texts = [
+                teacher_resp_texts[j] for j in range(t_l, t_r) if bool(teacher_correct[j].item())
+            ]
+
+            # skip if both all correct or both all wrong
+            student_has_correct = len(student_correct_texts) > 0
+            student_has_wrong = len(student_wrong_items) > 0
+            teacher_has_correct = len(teacher_correct_texts) > 0
+            teacher_has_wrong = (t_r - t_l - len(teacher_correct_texts)) > 0
+
+            # 1) student 全对：跳过
+            if not student_has_wrong:
+                continue
+
+            # 2) student 和 teacher 全错：跳过
+            if (not student_has_correct) and (not teacher_has_correct):
+                continue
+
+            prompt_text = prompt_texts[i]
+            uid = uids[i]
+
+            # SDFT samples: use student correct demonstration on student wrong trajectories
+            if self.use_sdft and len(student_correct_texts) > 0:
+                demo_text = choose_one(student_correct_texts)
+                for _, wrong_text in student_wrong_items:
+                    full_text = prompt_text + wrong_text
+                    encoded_full = self.tokenizer(
+                        full_text,
+                        return_tensors="pt",
+                        add_special_tokens=False,
+                    )
+                    encoded_prompt = self.tokenizer(
+                        prompt_text,
+                        return_tensors="pt",
+                        add_special_tokens=False,
+                    )
+
+                    input_ids = encoded_full["input_ids"][0]
+                    attention_mask = encoded_full["attention_mask"][0]
+                    prompt_len = encoded_prompt["input_ids"].shape[-1]
+                    response_ids = input_ids[prompt_len:]
+                    if response_ids.numel() == 0:
+                        continue
+
+                    response_mask = torch.ones_like(response_ids, dtype=torch.long)
+                    position_ids = torch.arange(input_ids.shape[0], dtype=torch.long)
+
+                    tensor_input_ids.append(input_ids)
+                    tensor_attention_mask.append(attention_mask)
+                    tensor_position_ids.append(position_ids)
+                    tensor_responses.append(response_ids)
+                    tensor_response_mask.append(response_mask)
+
+                    non_tensor_distill_type.append("sdft")
+                    non_tensor_demo_text.append(demo_text)
+                    non_tensor_wrong_response_text.append(wrong_text)
+                    non_tensor_prompt_text.append(prompt_text)
+                    non_tensor_uid.append(uid)
+
+            # ICL-OPD samples: use teacher correct demonstration on student wrong trajectories
+            if self.use_icl_opd and len(teacher_correct_texts) > 0:
+                demo_text = choose_one(teacher_correct_texts)
+                for _, wrong_text in student_wrong_items:
+                    full_text = prompt_text + wrong_text
+                    encoded_full = self.tokenizer(
+                        full_text,
+                        return_tensors="pt",
+                        add_special_tokens=False,
+                    )
+                    encoded_prompt = self.tokenizer(
+                        prompt_text,
+                        return_tensors="pt",
+                        add_special_tokens=False,
+                    )
+
+                    input_ids = encoded_full["input_ids"][0]
+                    attention_mask = encoded_full["attention_mask"][0]
+                    prompt_len = encoded_prompt["input_ids"].shape[-1]
+                    response_ids = input_ids[prompt_len:]
+                    if response_ids.numel() == 0:
+                        continue
+
+                    response_mask = torch.ones_like(response_ids, dtype=torch.long)
+                    position_ids = torch.arange(input_ids.shape[0], dtype=torch.long)
+
+                    tensor_input_ids.append(input_ids)
+                    tensor_attention_mask.append(attention_mask)
+                    tensor_position_ids.append(position_ids)
+                    tensor_responses.append(response_ids)
+                    tensor_response_mask.append(response_mask)
+
+                    non_tensor_distill_type.append("icl_opd")
+                    non_tensor_demo_text.append(demo_text)
+                    non_tensor_wrong_response_text.append(wrong_text)
+                    non_tensor_prompt_text.append(prompt_text)
+                    non_tensor_uid.append(uid)
+
+        if len(tensor_input_ids) == 0:
+            return None
+
+        # pad tensors
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        max_input_len = max(x.shape[0] for x in tensor_input_ids)
+        max_resp_len = max(x.shape[0] for x in tensor_responses)
+
+        def pad_1d(x, max_len, pad_value=0):
+            if x.shape[0] == max_len:
+                return x
+            pad = torch.full((max_len - x.shape[0],), pad_value, dtype=x.dtype)
+            return torch.cat([x, pad], dim=0)
+
+        input_ids = torch.stack([pad_1d(x, max_input_len, pad_id) for x in tensor_input_ids], dim=0)
+        attention_mask = torch.stack([pad_1d(x, max_input_len, 0) for x in tensor_attention_mask], dim=0)
+        position_ids = torch.stack([pad_1d(x, max_input_len, 0) for x in tensor_position_ids], dim=0)
+        responses = torch.stack([pad_1d(x, max_resp_len, pad_id) for x in tensor_responses], dim=0)
+        response_mask = torch.stack([pad_1d(x, max_resp_len, 0) for x in tensor_response_mask], dim=0)
+
+        distill_batch = DataProto.from_dict(
+            tensors={
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "responses": responses,
+                "response_mask": response_mask,
+            },
+            non_tensors={
+                "distill_type": np.array(non_tensor_distill_type, dtype=object),
+                "demo_text": np.array(non_tensor_demo_text, dtype=object),
+                "wrong_response_text": np.array(non_tensor_wrong_response_text, dtype=object),
+                "prompt_text": np.array(non_tensor_prompt_text, dtype=object),
+                "uid": np.array(non_tensor_uid, dtype=object),
+            },
+            meta_info={
+                "distill_mode": "heterogeneous_distill",
+                "sdft_weight": self.sdft_weight,
+                "icl_opd_weight": self.icl_opd_weight,
+            },
+        )
+        return distill_batch
+
+    def fit_heterogeneous_distill(self):
+        from omegaconf import OmegaConf
+        from pprint import pprint
+        from tqdm import tqdm
+        from verl.utils.tracking import Tracking
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        self.global_steps = 0
+
+        # load checkpoint first
+        self._load_checkpoint()
+
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            val_metrics = self._validate()
+            if val_metrics:
+                pprint(f"Initial validation metrics: {val_metrics}")
+                logger.log(data=val_metrics, step=self.global_steps)
+            if self.config.trainer.get("val_only", False):
+                return
+
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="HeteroDistill Progress")
+        self.global_steps += 1
+        last_val_metrics = None
+
+        for epoch in range(self.config.trainer.total_epochs):
+            for batch_dict in self.train_dataloader:
+                metrics = {}
+                batch: DataProto = DataProto.from_single_dict(batch_dict)
+
+                is_last_step = self.global_steps >= self.total_training_steps
+
+
+                if self._is_empty_dataproto(batch):
+                    metrics = {
+                        "hetero/skip_empty_base_batch": 1,
+                        "training/global_step": self.global_steps,
+                        "training/epoch": epoch,
+                    }
+                    logger.log(data=metrics, step=self.global_steps)
+                    progress_bar.update(1)
+                    self.global_steps += 1
+                    if is_last_step:
+                        pprint(f"Final validation metrics: {last_val_metrics}")
+                        progress_bar.close()
+                        return
+                    continue
+
+                # add uid
+                if "uid" not in batch.non_tensor_batch:
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch["input_ids"]))], dtype=object
+                    )
+
+                
+
+                # =========================
+                # 1) student rollout
+                # =========================
+                student_gen_batch = self._repeat_base_batch_for_rollout_n(batch, self.student_rollout_n)
+                if self._is_empty_dataproto(student_gen_batch):
+                    metrics["hetero/skip_empty_student_gen_batch"] = 1
+
+                    if (
+                        self.val_reward_fn is not None
+                        and self.config.trainer.test_freq > 0
+                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                    ):
+                        val_metrics = self._validate()
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                        metrics.update(val_metrics)
+
+                    metrics.update(
+                        {
+                            "training/global_step": self.global_steps,
+                            "training/epoch": epoch,
+                        }
+                    )
+                    logger.log(data=metrics, step=self.global_steps)
+                    progress_bar.update(1)
+                    self.global_steps += 1
+
+                    if is_last_step:
+                        pprint(f"Final validation metrics: {last_val_metrics}")
+                        progress_bar.close()
+                        return
+                    continue
+                student_gen_batch.meta_info = {
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "do_sample": True,
+                    "validate": False,
+                    "global_steps": self.global_steps,
+                }
+
+                student_rollout_batch = self.actor_rollout_wg.generate_sequences(student_gen_batch)
+                student_batch = union_gen_and_rollout_batch(student_gen_batch, student_rollout_batch)
+
+                if "response_mask" not in student_batch.batch:
+                    student_batch.batch["response_mask"] = compute_response_mask(student_batch)
+
+                # =========================
+                # 2) teacher rollout
+                # =========================
+                teacher_gen_batch = self._repeat_base_batch_for_rollout_n(batch, self.teacher_rollout_n)
+                if self._is_empty_dataproto(teacher_gen_batch):
+                    metrics["hetero/skip_empty_teacher_gen_batch"] = 1
+
+                    if (
+                        self.val_reward_fn is not None
+                        and self.config.trainer.test_freq > 0
+                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                    ):
+                        val_metrics = self._validate()
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                        metrics.update(val_metrics)
+
+                    metrics.update(
+                        {
+                            "training/global_step": self.global_steps,
+                            "training/epoch": epoch,
+                        }
+                    )
+                    logger.log(data=metrics, step=self.global_steps)
+                    progress_bar.update(1)
+                    self.global_steps += 1
+
+                    if is_last_step:
+                        pprint(f"Final validation metrics: {last_val_metrics}")
+                        progress_bar.close()
+                        return
+                    continue
+                teacher_gen_batch.meta_info = {
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "do_sample": True,
+                    "validate": False,
+                    "global_steps": self.global_steps,
+                }
+
+                teacher_rollout_batch = self.actor_rollout_wg.generate_sequences_teacher(teacher_gen_batch)
+                teacher_batch = union_gen_and_rollout_batch(teacher_gen_batch, teacher_rollout_batch)
+
+                # =====================================
+                print('='*20, ' DEBUG START ', '='*20)    
+                for i in range(self.teacher_rollout_n):
+                    prompt_ids = teacher_batch.batch["prompts"][i]
+                    prompt_length = prompt_ids.shape[0]
+                    attention_mask = teacher_batch.batch["attention_mask"][i]
+                    response_ids = teacher_batch.batch["responses"][i]
+                    print("prompts shape:", teacher_batch.batch["prompts"][i].shape)
+                    print("responses shape:", teacher_batch.batch["responses"][i].shape)
+                    print("attention_mask shape:", teacher_batch.batch["attention_mask"][i].shape)
+                    print(
+                        "prompt+response len =",
+                        teacher_batch.batch["prompts"][i].shape[0] + teacher_batch.batch["responses"][i].shape[0],
+                    )
+                    print(
+                        "attention len =",
+                        teacher_batch.batch["attention_mask"][i].shape[0],
+                    )
+                    valid_response_length = attention_mask[prompt_length:].sum().item()
+                    valid_response_ids = response_ids[:valid_response_length]
+                    response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
+                    print("response_text:")
+                    print(repr(response_text))
+                print('='*20, ' DEBUG END ', '='*20)
+                # =======================================
+
+                if "response_mask" not in teacher_batch.batch:
+                    teacher_batch.batch["response_mask"] = compute_response_mask(teacher_batch)
+
+                # =========================
+                # 3) reward / correctness
+                # =========================
+                student_reward_tensor, student_reward_extra_infos = compute_reward(student_batch, self.reward_fn)
+                teacher_reward_tensor, teacher_reward_extra_infos = compute_reward(teacher_batch, self.reward_fn)
+
+                # =========================
+                # 4) build distillation batch
+                # =========================
+                distill_batch = self._build_hetero_distill_batch(
+                    base_batch=batch,
+                    student_batch=student_batch,
+                    teacher_batch=teacher_batch,
+                    student_reward_tensor=student_reward_tensor,
+                    teacher_reward_tensor=teacher_reward_tensor,
+                )
+
+                student_correct = self._compute_binary_correctness_from_reward_tensor(student_reward_tensor)
+                teacher_correct = self._compute_binary_correctness_from_reward_tensor(teacher_reward_tensor)
+
+                metrics["hetero/student_rollout_correct_rate"] = student_correct.float().mean().item()
+                metrics["hetero/teacher_rollout_correct_rate"] = teacher_correct.float().mean().item()
+                metrics["hetero/student_rollout_count"] = int(student_correct.numel())
+                metrics["hetero/teacher_rollout_count"] = int(teacher_correct.numel())
+
+                if distill_batch is None or len(distill_batch.batch["input_ids"]) == 0:
+                    metrics["hetero/distill_sample_count"] = 0
+
+                    if (
+                        self.val_reward_fn is not None
+                        and self.config.trainer.test_freq > 0
+                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                    ):
+                        val_metrics = self._validate()
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                        metrics.update(val_metrics)
+
+                    logger.log(data=metrics, step=self.global_steps)
+                    progress_bar.update(1)
+                    self.global_steps += 1
+
+                    if is_last_step:
+                        pprint(f"Final validation metrics: {last_val_metrics}")
+                        progress_bar.close()
+                        return
+                    continue
+
+                metrics["hetero/distill_sample_count"] = len(distill_batch.batch["input_ids"])
+                distill_types = list(distill_batch.non_tensor_batch["distill_type"])
+                metrics["hetero/sdft_sample_count"] = sum(1 for x in distill_types if x == "sdft")
+                metrics["hetero/icl_opd_sample_count"] = sum(1 for x in distill_types if x == "icl_opd")
+
+                # =========================
+                # 5) update student by distillation
+                # =========================
+                actor_output = self.actor_rollout_wg.update_actor_distill(distill_batch)
+                actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                metrics.update(actor_output_metrics)
+
+                # =========================
+                # 6) validate / save / log
+                # =========================
+                if (
+                    self.val_reward_fn is not None
+                    and self.config.trainer.test_freq > 0
+                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                ):
+                    val_metrics = self._validate()
+                    if is_last_step:
+                        last_val_metrics = val_metrics
+                    metrics.update(val_metrics)
+
+                if self.config.trainer.save_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                ):
+                    self._save_checkpoint()
+
+                metrics.update(
+                    {
+                        "training/global_step": self.global_steps,
+                        "training/epoch": epoch,
+                    }
+                )
+
+                logger.log(data=metrics, step=self.global_steps)
+                progress_bar.update(1)
+                self.global_steps += 1
+
+                if is_last_step:
+                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    progress_bar.close()
+                    return
+
     def fit(self):
         """
         The training loop of PPO.
@@ -989,6 +1601,9 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        if self.is_hetero_distill:
+            return self.fit_heterogeneous_distill()
+
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
@@ -1081,6 +1696,7 @@ class RayPPOTrainer:
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
                             if not self.async_rollout_mode:
+                                # generate policy model output
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
@@ -1183,7 +1799,7 @@ class RayPPOTrainer:
                                     apply_chat_template_kwargs=apply_chat_template_kwargs,
                                 )
                                 
-                                if not self.ref_in_actor:
+                                if not self.ref_in_actor: 
                                     ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                                 else:
                                     ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
@@ -1196,6 +1812,18 @@ class RayPPOTrainer:
                                 else:
                                     ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                                 batch = batch.union(ref_log_prob)
+
+                    if not hasattr(self, "_debug_sample_saved"):
+                        self._debug_sample_saved = False
+
+                    if not self._debug_sample_saved:
+                        save_dataproto_single_sample_with_json_preview(
+                            batch=batch,
+                            save_path="./debug_data/sample_step{}_idx0.pt".format(self.global_steps),
+                            json_path="./debug_data/sample_step{}_idx0_preview.json".format(self.global_steps),
+                            idx=0,
+                        )
+                        self._debug_sample_saved = True
 
                     # Compute base model log probs for corrected reward computation
                     # This computes: base_log_prob from actor's base model (using input_ids)

@@ -42,10 +42,10 @@ class Role(Enum):
     def _get_role_string(self):
         role_mapping = {
             Role.Actor: "actor",
-            Role.Rollout: "rollout",
+            Role.Rollout: "rollout",   # policy model, student model
             Role.ActorRollout: "actor_rollout",
             Role.Critic: "critic",
-            Role.RefPolicy: "ref",
+            Role.RefPolicy: "ref",   # teacher model
             Role.RewardModel: "rm",
             Role.ActorRolloutRef: "actor_rollout_ref",
         }
