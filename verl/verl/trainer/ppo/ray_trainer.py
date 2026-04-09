@@ -1434,33 +1434,36 @@ class RayPPOTrainer:
                 student_rollout_start = time.time()
                 student_rollout_batch = self.actor_rollout_wg.generate_sequences(student_gen_batch)
                 student_rollout_end = time.time()
-                print(f'[DEBUG] Teacher rollout time cost: {student_rollout_end-student_rollout_start} s')
+                print(f'[DEBUG] Student rollout time cost: {student_rollout_end-student_rollout_start} s')
                 student_batch = union_gen_and_rollout_batch(student_gen_batch, student_rollout_batch)
 
                 # =====================================
                 # print('='*20, ' DEBUG START ', '='*20) 
-                # print(student_gen_batch.batch.keys())    
-                # for i in range(self.student_rollout_n):
-                #     prompt_ids = student_batch.batch["prompts"][i]
-                #     prompt_length = prompt_ids.shape[0]
-                #     attention_mask = student_batch.batch["attention_mask"][i]
-                #     response_ids = student_batch.batch["responses"][i]
-                #     print("prompts shape:", student_batch.batch["prompts"][i].shape)
-                #     print("responses shape:", student_batch.batch["responses"][i].shape)
-                #     print("attention_mask shape:", student_batch.batch["attention_mask"][i].shape)
-                #     print(
-                #         "prompt+response len =",
-                #         student_batch.batch["prompts"][i].shape[0] + student_batch.batch["responses"][i].shape[0],
-                #     )
-                #     print(
-                #         "attention len =",
-                #         student_batch.batch["attention_mask"][i].shape[0],
-                #     )
-                #     valid_response_length = attention_mask[prompt_length:].sum().item()
-                #     valid_response_ids = response_ids[:valid_response_length]
-                #     response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
-                #     print("response_text:")
-                #     print(repr(response_text))
+                # print(student_gen_batch.batch.keys())   
+                student_average_response_length = 0 
+                for i in range(self.student_rollout_n):
+                    prompt_ids = student_batch.batch["prompts"][i]
+                    prompt_length = prompt_ids.shape[0]
+                    attention_mask = student_batch.batch["attention_mask"][i]
+                    # response_ids = student_batch.batch["responses"][i]
+                    # print("prompts shape:", student_batch.batch["prompts"][i].shape)
+                    # print("responses shape:", student_batch.batch["responses"][i].shape)
+                    # print("attention_mask shape:", student_batch.batch["attention_mask"][i].shape)
+                    # print(
+                    #     "prompt+response len =",
+                    #     student_batch.batch["prompts"][i].shape[0] + student_batch.batch["responses"][i].shape[0],
+                    # )
+                    # print(
+                    #     "attention len =",
+                    #     student_batch.batch["attention_mask"][i].shape[0],
+                    # )
+                    valid_response_length = attention_mask[prompt_length:].sum().item()
+                    student_average_response_length += valid_response_length
+                    # valid_response_ids = response_ids[:valid_response_length]
+                    # response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
+                    # print("response_text:")
+                    # print(repr(response_text))
+                print(f'[DEBUG] Student average response length: {student_average_response_length/self.student_rollout_n}')
                 # print('='*20, ' DEBUG END ', '='*20)
                 # =======================================
 
@@ -1518,27 +1521,30 @@ class RayPPOTrainer:
                 # =====================================
                 # print('='*20, ' DEBUG START ', '='*20)   
                 # print(teacher_gen_batch.batch.keys()) 
-                # for i in range(self.teacher_rollout_n):
-                #     prompt_ids = teacher_batch.batch["prompts"][i]
-                #     prompt_length = prompt_ids.shape[0]
-                #     attention_mask = teacher_batch.batch["attention_mask"][i]
-                #     response_ids = teacher_batch.batch["responses"][i]
-                #     print("prompts shape:", teacher_batch.batch["prompts"][i].shape)
-                #     print("responses shape:", teacher_batch.batch["responses"][i].shape)
-                #     print("attention_mask shape:", teacher_batch.batch["attention_mask"][i].shape)
-                #     print(
-                #         "prompt+response len =",
-                #         teacher_batch.batch["prompts"][i].shape[0] + teacher_batch.batch["responses"][i].shape[0],
-                #     )
-                #     print(
-                #         "attention len =",
-                #         teacher_batch.batch["attention_mask"][i].shape[0],
-                #     )
-                #     valid_response_length = attention_mask[prompt_length:].sum().item()
-                #     valid_response_ids = response_ids[:valid_response_length]
-                #     response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
-                #     print("response_text:")
-                #     print(repr(response_text))
+                teacher_average_response_length = 0
+                for i in range(self.teacher_rollout_n):
+                    prompt_ids = teacher_batch.batch["prompts"][i]
+                    prompt_length = prompt_ids.shape[0]
+                    attention_mask = teacher_batch.batch["attention_mask"][i]
+                    # response_ids = teacher_batch.batch["responses"][i]
+                    # print("prompts shape:", teacher_batch.batch["prompts"][i].shape)
+                    # print("responses shape:", teacher_batch.batch["responses"][i].shape)
+                    # print("attention_mask shape:", teacher_batch.batch["attention_mask"][i].shape)
+                    # print(
+                    #     "prompt+response len =",
+                    #     teacher_batch.batch["prompts"][i].shape[0] + teacher_batch.batch["responses"][i].shape[0],
+                    # )
+                    # print(
+                    #     "attention len =",
+                    #     teacher_batch.batch["attention_mask"][i].shape[0],
+                    # )
+                    valid_response_length = attention_mask[prompt_length:].sum().item()
+                    teacher_average_response_length += valid_response_length
+                    # valid_response_ids = response_ids[:valid_response_length]
+                    # response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
+                    # print("response_text:")
+                    # print(repr(response_text))
+                print(f'[DEBUG] Teacher average response length: {teacher_average_response_length/self.teacher_rollout_n}')
                 # print('='*20, ' DEBUG END ', '='*20)
                 # =======================================
 
