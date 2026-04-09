@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import time
 import json
 import os
 import uuid
@@ -1430,7 +1431,10 @@ class RayPPOTrainer:
                     "global_steps": self.global_steps,
                 }
 
+                student_rollout_start = time.time()
                 student_rollout_batch = self.actor_rollout_wg.generate_sequences(student_gen_batch)
+                student_rollout_end = time.time()
+                print(f'[DEBUG] Teacher rollout time cost: {student_rollout_end-student_rollout_start} s')
                 student_batch = union_gen_and_rollout_batch(student_gen_batch, student_rollout_batch)
 
                 # =====================================
@@ -1503,8 +1507,13 @@ class RayPPOTrainer:
                     "global_steps": self.global_steps,
                 }
 
+                teacher_rollout_start = time.time()
                 teacher_rollout_batch = self.actor_rollout_wg.generate_sequences_teacher(teacher_gen_batch)
+                teacher_rollout_end = time.time()
+                print(f'[DEBUG] Teacher rollout time cost: {teacher_rollout_end-teacher_rollout_start} s')
+                
                 teacher_batch = union_gen_and_rollout_batch(teacher_gen_batch, teacher_rollout_batch)
+
 
                 # =====================================
                 # print('='*20, ' DEBUG START ', '='*20)   

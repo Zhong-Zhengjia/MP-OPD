@@ -559,7 +559,7 @@ class DataParallelPPOActor(BasePPOActor):
         import torch.nn.functional as F
         import torch.distributed as dist
 
-        # print('[DEBUG] Start model update')
+        print('[DEBUG] Start model update')
 
         self.actor_module.train()
 
