@@ -977,48 +977,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=checkpoint_contents,
             )
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="red", role="actor_update")
-    def update_actor(self, data: DataProto):
-        assert self._is_actor
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
-
-        with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
-
-            # perform training
-            with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
-            delta_time = timer.last
-            global_num_tokens = data.meta_info["global_token_num"]
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/actor"] = (
-                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
-            )
-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
-
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
-            self.actor_lr_scheduler.step()
-
-            # TODO: here, we should return all metrics
-            output = DataProto(meta_info={"metrics": metrics})
-
-            output = output.to("cpu")
-
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
-
-        return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
@@ -1078,86 +1036,122 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         top_p=1.0,
         do_sample=True,
     ):
+        """
+        Correct version (Fix #1):
+        - Keep the dataset prompt format (left padded) in the returned full sequence.
+        - Always define the response span starting at `base_prompt_len = prompt_ids.shape[1]`
+        (NOT `p_len = prompt_lens[i]`).
+        - Build attention_mask so that:
+            * prompt part uses dataset prompt_attention_mask
+            * response part is 1 for non-pad tokens and 0 for pad tokens
+        - Return responses sliced from base_prompt_len, consistent with attention_mask and compute_response_mask().
+        """
         import torch
 
         prompts = prompts.to(get_device_id())
 
-        input_ids = prompts.batch["input_ids"]
-        attention_mask = prompts.batch["attention_mask"]
+        # dataset prompt tokens (left padded)
+        prompt_ids = prompts.batch["input_ids"]  # [bs, base_prompt_len]
+        prompt_attention_mask = prompts.batch["attention_mask"]  # [bs, base_prompt_len]
+        prompt_position_ids = prompts.batch.get("position_ids", None)
 
-        # prompt length per sample
-        prompt_lens = attention_mask.sum(dim=-1)
+        bs, base_prompt_len = prompt_ids.shape
+        device = prompt_ids.device
+
+        # real prompt token count per sample (remove left pad)
+        prompt_lens = prompt_attention_mask.sum(dim=-1).to(torch.long)  # [bs]
 
         model = policy_module
         model.eval()
 
-        # if self.rank == 0:
-        #     try:
-        #         first_param = next(model.parameters())
-        #         print(
-        #             f"[hetero_distill] generate with model device={first_param.device}, "
-        #             f"input_ids device={input_ids.device}"
-        #         )
-        #     except Exception as e:
-        #         print(f"[hetero_distill] failed to inspect model device: {e}")
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        eos_id = self.tokenizer.eos_token_id
+
+        target_resp_len = int(getattr(self.config, "response_length", 9216))
 
         gen_kwargs = {
-            "max_new_tokens": 2048,
+            "max_new_tokens": int(target_resp_len),
             "do_sample": do_sample,
-            "temperature": temperature,
-            "top_p": top_p,
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "eos_token_id": self.tokenizer.eos_token_id,
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "pad_token_id": pad_id,
+            "eos_token_id": eos_id,
             "use_cache": True,
         }
 
         with torch.no_grad():
+            # outputs: [bs, base_prompt_len + gen_len] (padded within batch to same length)
             outputs = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+                input_ids=prompt_ids,
+                attention_mask=prompt_attention_mask,
                 **gen_kwargs,
             )
 
-        # Slice response part
-        responses = []
+        # Build per-sample full_seq = [left-padded prompt (base_prompt_len), response (target_resp_len)]
         full_input_ids = []
         full_attention_mask = []
         full_position_ids = []
 
-        for i in range(outputs.shape[0]):
-            p_len = int(prompt_lens[i].item())
-            full_seq = outputs[i]
-            resp = full_seq[p_len:]
+        for i in range(bs):
+            full_seq = outputs[i]  # 1D, length may vary across batch (but padded by generate)
 
-            full_input_ids.append(full_seq)
-            full_attention_mask.append(torch.ones_like(full_seq, dtype=attention_mask.dtype))
-            full_position_ids.append(torch.arange(full_seq.shape[0], device=full_seq.device, dtype=torch.long))
-            responses.append(resp)
+            # 1) prompt part: ALWAYS keep the left-padded dataset prompt slice
+            prompt_part = full_seq[:base_prompt_len]
 
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        max_resp_len = max(x.shape[0] for x in responses) if len(responses) > 0 else 1
-        max_full_len = max(x.shape[0] for x in full_input_ids) if len(full_input_ids) > 0 else 1
+            # 2) response part: ALWAYS starts at base_prompt_len
+            resp_part = full_seq[base_prompt_len:]
 
-        def pad_1d(x, max_len, pad_value):
-            if x.shape[0] == max_len:
-                return x
-            pad = torch.full((max_len - x.shape[0],), pad_value, dtype=x.dtype, device=x.device)
-            return torch.cat([x, pad], dim=0)
+            # 3) force response to fixed length (pad/truncate) to match vLLM-like behavior
+            if resp_part.numel() > target_resp_len:
+                resp_part = resp_part[:target_resp_len]
+            elif resp_part.numel() < target_resp_len:
+                resp_pad = torch.full(
+                    (target_resp_len - resp_part.numel(),),
+                    pad_id,
+                    dtype=resp_part.dtype,
+                    device=device,
+                )
+                resp_part = torch.cat([resp_part, resp_pad], dim=0)
 
-        responses = torch.stack([pad_1d(x, max_resp_len, pad_id) for x in responses], dim=0)
-        full_input_ids = torch.stack([pad_1d(x, max_full_len, pad_id) for x in full_input_ids], dim=0)
-        full_attention_mask = torch.stack([pad_1d(x, max_full_len, 0) for x in full_attention_mask], dim=0)
-        full_position_ids = torch.stack([pad_1d(x, max_full_len, 0) for x in full_position_ids], dim=0)
+            # 4) final full sequence
+            final_seq = torch.cat([prompt_part, resp_part], dim=0)  # [base_prompt_len + target_resp_len]
+            full_input_ids.append(final_seq)
+
+            # 5) attention_mask: prompt from dataset, response is non-pad
+            am_prompt = prompt_attention_mask[i].to(torch.long)  # [base_prompt_len]
+            am_resp = (resp_part != pad_id).to(torch.long)        # [target_resp_len]
+            am = torch.cat([am_prompt, am_resp], dim=0)
+            full_attention_mask.append(am)
+
+            # 6) position_ids
+            #    - simplest and robust: monotonic positions for the whole final_seq
+            #    - (pad positions don't matter as long as attention_mask masks them)
+            #
+            # If you need stricter compatibility with special position schemes (mRoPE etc.),
+            # you'll need model-specific logic here. This version matches most decoder-only LMs.
+            pos = torch.arange(final_seq.numel(), device=device, dtype=torch.long)
+            full_position_ids.append(pos)
+
+        full_input_ids = torch.stack(full_input_ids, dim=0)         # [bs, base_prompt_len + target_resp_len]
+        full_attention_mask = torch.stack(full_attention_mask, dim=0)  # same shape
+        full_position_ids = torch.stack(full_position_ids, dim=0)   # same shape
+
+        # responses: always aligned with compute_response_mask() which slices the tail
+        responses = full_input_ids[:, base_prompt_len:]  # [bs, target_resp_len]
 
         output = DataProto.from_dict(
             tensors={
+                "prompts": prompt_ids,  # left padded prompts as-is
+                "responses": responses,
                 "input_ids": full_input_ids,
                 "attention_mask": full_attention_mask,
                 "position_ids": full_position_ids,
-                "responses": responses,
             },
+            non_tensors=dict(prompts.non_tensor_batch),
             meta_info={
-                "temperature": temperature,
+                "temperature": float(temperature),
+                "top_p": float(top_p),
+                "do_sample": bool(do_sample),
             },
         )
         return output.to("cpu")
@@ -1167,12 +1161,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def generate_sequences_teacher(self, prompts: DataProto):
         assert self.teacher_generate_module is not None, "Teacher generate model is not initialized."
 
-        # if self.rank == 0:
-        #     print("[hetero_distill] generate_sequences_teacher called")
-
         temperature = self.config.rollout.get("temperature", 1.0)
         top_p = self.config.rollout.get("top_p", 1.0)
-        do_sample = True
+        do_sample = prompts.meta_info.get("do_sample", True)
 
         output = self._generate_sequences_with_policy(
             prompts=prompts,
@@ -1252,6 +1243,49 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 offload_fsdp_model_to_cpu(self.base_module_fsdp)
             except Exception:
                 pass
+
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="actor_update")
+    def update_actor(self, data: DataProto):
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
+
+            # perform training
+            with Timer(name="update_policy", logger=None) as timer:
+                metrics = self.actor.update_policy(data=data)
+            delta_time = timer.last
+            global_num_tokens = data.meta_info["global_token_num"]
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics["perf/mfu/actor"] = (
+                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            )
+            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+
+            lr = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+            self.actor_lr_scheduler.step()
+
+            # TODO: here, we should return all metrics
+            output = DataProto(meta_info={"metrics": metrics})
+
+            output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
         return output
 

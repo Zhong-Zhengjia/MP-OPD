@@ -1,23 +1,15 @@
 #!/usr/bin/env bash
 
-largest_power_of_two_leq() {
-    local n=$1
-    local p=1
-    while [ $((p * 2)) -le "$n" ]; do
-        p=$((p * 2))
-    done
-    echo "$p"
-}
-
 calc_rollout_tp() {
     local n_gpu=$1
-    largest_power_of_two_leq "$n_gpu"
+    local tp=$(( n_gpu / 2 ))
+    (( tp < 1 )) && tp=1
+    echo "$tp"
 }
-
 
 calc_train_batch_size() {
     local n_gpu=$1
-    local per_gpu_batch=16
+    local per_gpu_batch=4
     echo $((n_gpu * per_gpu_batch))
 }
 
@@ -39,12 +31,12 @@ calc_ppo_micro_batch_size_per_gpu() {
 
 calc_logprob_micro_batch_size_per_gpu() {
     local n_gpu=$1
-    echo 4
+    echo 2
 }
 
 calc_ppo_max_token_len_per_gpu() {
     local n_gpu=$1
-    echo 16384
+    echo 2048
 }
 
 setup_verl_train_params() {

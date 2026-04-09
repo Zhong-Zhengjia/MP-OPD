@@ -419,9 +419,14 @@ class DataParallelPPOActor(BasePPOActor):
             logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_len, vocab_size)
             return logits
 
-    def _build_distill_inputs_for_micro_batch(self, micro_batch, tokenizer):
+    def _build_distill_inputs_for_micro_batch(self, micro_batch, tokenizer, selected_indices=None):
         """
         Build tokenized target inputs for teacher/student-base with demonstration context.
+
+        Args:
+            micro_batch: DataProto micro batch
+            tokenizer: tokenizer
+            selected_indices: optional list[int], only build selected samples
 
         Returns:
             dict with:
@@ -431,22 +436,34 @@ class DataParallelPPOActor(BasePPOActor):
                 responses
                 response_mask
                 distill_types
+                original_indices
         """
+        import torch
 
         prompt_texts = micro_batch.non_tensor_batch["prompt_text"]
         demo_texts = micro_batch.non_tensor_batch["demo_text"]
         wrong_response_texts = micro_batch.non_tensor_batch["wrong_response_text"]
         distill_types = micro_batch.non_tensor_batch["distill_type"]
 
+        if selected_indices is None:
+            selected_indices = list(range(len(distill_types)))
+
         target_input_ids_list = []
         target_attention_mask_list = []
         target_position_ids_list = []
         target_responses_list = []
         target_response_mask_list = []
+        selected_distill_types = []
+        original_indices = []
 
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
-        for prompt_text, demo_text, wrong_resp_text in zip(prompt_texts, demo_texts, wrong_response_texts):
+        for idx in selected_indices:
+            prompt_text = prompt_texts[idx]
+            demo_text = demo_texts[idx]
+            wrong_resp_text = wrong_response_texts[idx]
+            distill_type = distill_types[idx]
+
             prefix_text = (
                 f"{prompt_text}\n\n"
                 f"Correct solution:\n{demo_text}\n\n"
@@ -470,7 +487,6 @@ class DataParallelPPOActor(BasePPOActor):
             response_ids = full_ids[prefix_ids.shape[0]:]
 
             if response_ids.numel() == 0:
-                # fallback: use tokenizer on wrong response directly
                 encoded_resp = tokenizer(
                     wrong_resp_text,
                     return_tensors="pt",
@@ -488,6 +504,20 @@ class DataParallelPPOActor(BasePPOActor):
             target_position_ids_list.append(position_ids)
             target_responses_list.append(response_ids)
             target_response_mask_list.append(response_mask)
+            selected_distill_types.append(distill_type)
+            original_indices.append(idx)
+
+        # 注意：如果 selected_indices 为空，这里不返回空张量，改由上层决定是否构造 dummy
+        if len(target_input_ids_list) == 0:
+            return {
+                "input_ids": None,
+                "attention_mask": None,
+                "position_ids": None,
+                "responses": None,
+                "response_mask": None,
+                "distill_types": [],
+                "original_indices": [],
+            }
 
         max_input_len = max(x.shape[0] for x in target_input_ids_list)
         max_resp_len = max(x.shape[0] for x in target_responses_list)
@@ -510,58 +540,26 @@ class DataParallelPPOActor(BasePPOActor):
             "position_ids": target_position_ids,
             "responses": target_responses,
             "response_mask": target_response_mask,
-            "distill_types": distill_types,
+            "distill_types": selected_distill_types,
+            "original_indices": original_indices,
         }
-
-    def _kl_divergence_with_logits(self, student_logits, target_logits, response_mask):
-        """
-        Args:
-            student_logits: (bsz, resp_len, vocab)
-            target_logits: (bsz, resp_len, vocab)
-            response_mask:  (bsz, resp_len)
-
-        Returns:
-            scalar loss
-            token_kl: (bsz, resp_len)
-        """
-        import torch
-        import torch.nn.functional as F
-
-        student_log_probs = F.log_softmax(student_logits, dim=-1)
-        target_probs = F.softmax(target_logits, dim=-1)
-
-        token_kl = F.kl_div(student_log_probs, target_probs, reduction="none").sum(dim=-1)
-        masked_kl = token_kl * response_mask.float()
-
-        denom = response_mask.float().sum().clamp_min(1.0)
-        loss = masked_kl.sum() / denom
-        return loss, token_kl
 
     @GPUMemoryLogger(role="dp actor distill", logger=logger)
     def update_policy_distill(self, data: DataProto, teacher_actor, student_base_actor, tokenizer):
         """
-        Heterogeneous distillation update.
+        Heterogeneous distillation update with type-wise synchronized execution.
 
-        data contains:
-            tensor batch:
-                - input_ids: original prompt + wrong response
-                - attention_mask
-                - position_ids
-                - responses
-                - response_mask
-            non_tensor batch:
-                - distill_type: "sdft" | "icl_opd"
-                - demo_text
-                - wrong_response_text
-                - prompt_text
-                - uid
-
-        teacher_actor: frozen teacher model wrapper (DataParallelPPOActor)
-        student_base_actor: frozen student base model wrapper (DataParallelPPOActor)
-        tokenizer: tokenizer used to build in-context target inputs
+        Key idea:
+        - Split each micro-batch into homogeneous sub-batches by distill_type
+        - Process in fixed global order: sdft -> icl_opd
+        - If a type exists on any rank, all ranks enter that branch
+        - Ranks without local samples for that type use a dummy sample to preserve FSDP order
         """
         import torch
         import torch.nn.functional as F
+        import torch.distributed as dist
+
+        # print('[DEBUG] Start model update')
 
         self.actor_module.train()
 
@@ -581,13 +579,57 @@ class DataParallelPPOActor(BasePPOActor):
         ]
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
-
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
 
         sdft_weight = data.meta_info.get("sdft_weight", 1.0)
         icl_opd_weight = data.meta_info.get("icl_opd_weight", 1.0)
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        device = get_device_id()
+
+        def gather_tensor_sub_batch(batch_dict, indices):
+            return {
+                "input_ids": batch_dict["input_ids"][indices],
+                "attention_mask": batch_dict["attention_mask"][indices],
+                "position_ids": batch_dict["position_ids"][indices],
+                "responses": batch_dict["responses"][indices],
+                "response_mask": batch_dict["response_mask"][indices],
+            }
+
+        def gather_tensor_sub_batch_or_dummy(batch_dict, indices):
+            """
+            Return (sub_batch, is_dummy)
+            If indices is empty, use the first sample as dummy to preserve forward order.
+            Dummy sample will be masked out from loss later.
+            """
+            if len(indices) > 0:
+                return gather_tensor_sub_batch(batch_dict, indices), False
+
+            dummy_idx = [0]
+            sub_batch = {
+                "input_ids": batch_dict["input_ids"][dummy_idx],
+                "attention_mask": batch_dict["attention_mask"][dummy_idx],
+                "position_ids": batch_dict["position_ids"][dummy_idx],
+                "responses": batch_dict["responses"][dummy_idx],
+                "response_mask": torch.zeros_like(batch_dict["response_mask"][dummy_idx]),  # zero loss mask
+            }
+            return sub_batch, True
+
+        def forward_target_module(target_module, sub_batch):
+            target_module.eval()
+            with torch.no_grad():
+                with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
+                    output = target_module(
+                        input_ids=sub_batch["input_ids"],
+                        attention_mask=sub_batch["attention_mask"],
+                        position_ids=sub_batch["position_ids"],
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                    sub_logits = output.logits[:, -sub_batch["responses"].shape[1] - 1 : -1, :]
+            return sub_logits
 
         for _ in range(self.config.ppo_epochs):
             for mini_batch in mini_batches:
@@ -604,124 +646,125 @@ class DataParallelPPOActor(BasePPOActor):
                 self.actor_optimizer.zero_grad()
 
                 for micro_batch in micro_batches:
-                    micro_batch = micro_batch.to(get_device_id())
-                    response_mask = micro_batch.batch["response_mask"].float()
+                    micro_batch = micro_batch.to(device)
 
-                    # 1. student logits on original wrong trajectory
-                    student_logits = self._forward_micro_batch_logits(micro_batch.batch)
+                    local_distill_types = list(micro_batch.non_tensor_batch["distill_type"])
+                    sdft_indices = [i for i, t in enumerate(local_distill_types) if t == "sdft"]
+                    icl_indices = [i for i, t in enumerate(local_distill_types) if t == "icl_opd"]
 
-                    # 2. build target inputs with demonstration context
-                    target_inputs = self._build_distill_inputs_for_micro_batch(micro_batch, tokenizer)
+                    # 固定顺序处理，保证所有 rank 的模块调用顺序一致
+                    type_specs = [
+                        ("sdft", sdft_indices, student_base_actor.actor_module, sdft_weight),
+                        ("icl_opd", icl_indices, teacher_actor.actor_module, icl_opd_weight),
+                    ]
 
-                    target_input_ids = target_inputs["input_ids"].to(get_device_id())
-                    target_attention_mask = target_inputs["attention_mask"].to(get_device_id())
-                    target_position_ids = target_inputs["position_ids"].to(get_device_id())
-                    target_responses = target_inputs["responses"].to(get_device_id())
-                    target_response_mask = target_inputs["response_mask"].to(get_device_id())
-                    distill_types = list(target_inputs["distill_types"])
+                    micro_total_loss = 0.0
+                    micro_sdft_loss = torch.tensor(0.0, device=device)
+                    micro_icl_loss = torch.tensor(0.0, device=device)
+                    micro_mean_token_kl_num = torch.tensor(0.0, device=device)
+                    micro_mean_token_kl_den = torch.tensor(0.0, device=device)
 
-                    batch_size = target_input_ids.shape[0]
-                    vocab_size = student_logits.shape[-1]
-                    target_logits = torch.zeros(
-                        batch_size,
-                        target_responses.shape[1],
-                        vocab_size,
-                        device=student_logits.device,
-                        dtype=student_logits.dtype,
-                    )
+                    for distill_type_name, local_indices, target_module, loss_weight in type_specs:
+                        local_has_type = torch.tensor([1 if len(local_indices) > 0 else 0], device=device, dtype=torch.int64)
+                        if dist.is_initialized():
+                            dist.all_reduce(local_has_type, op=dist.ReduceOp.MAX)
+                        global_has_type = bool(local_has_type.item())
 
-                    sdft_mask = torch.zeros(batch_size, device=student_logits.device, dtype=torch.float32)
-                    icl_opd_mask = torch.zeros(batch_size, device=student_logits.device, dtype=torch.float32)
+                        # 全局都没有该 type，则所有 rank 一起跳过
+                        if not global_has_type:
+                            continue
 
-                    # 3. route each sample to target model
-                    sdft_indices = [i for i, t in enumerate(distill_types) if t == "sdft"]
-                    icl_indices = [i for i, t in enumerate(distill_types) if t == "icl_opd"]
+                        # 1) student trainable actor forward on this type-only sub-batch
+                        actor_sub_batch, actor_is_dummy = gather_tensor_sub_batch_or_dummy(micro_batch.batch, local_indices)
+                        response_mask = actor_sub_batch["response_mask"].float()
 
-                    # helper to gather a sub-batch
-                    def gather_sub_batch(indices):
-                        return {
-                            "input_ids": target_input_ids[indices],
-                            "attention_mask": target_attention_mask[indices],
-                            "position_ids": target_position_ids[indices],
-                            "responses": target_responses[indices],
+                        # 训练 actor 的 forward：所有 rank 都会进入一次
+                        student_logits = self._forward_micro_batch_logits(actor_sub_batch)
+
+                        # 2) build target inputs for this type-only sub-batch
+                        target_inputs = self._build_distill_inputs_for_micro_batch(
+                            micro_batch, tokenizer, selected_indices=local_indices if len(local_indices) > 0 else [0]
+                        )
+
+                        target_input_ids = target_inputs["input_ids"].to(device)
+                        target_attention_mask = target_inputs["attention_mask"].to(device)
+                        target_position_ids = target_inputs["position_ids"].to(device)
+                        target_responses = target_inputs["responses"].to(device)
+                        target_response_mask = target_inputs["response_mask"].to(device).float()
+
+                        # 如果是 dummy，占位样本不参与 loss
+                        if actor_is_dummy:
+                            target_response_mask = torch.zeros_like(target_response_mask)
+
+                        # 3) target forward for this type: all ranks enter in synchronized order
+                        target_sub_batch = {
+                            "input_ids": target_input_ids,
+                            "attention_mask": target_attention_mask,
+                            "position_ids": target_position_ids,
+                            "responses": target_responses,
                         }
+                        target_logits = forward_target_module(target_module, target_sub_batch)
 
-                    # 3.1 student-base logits for SDFT
-                    if len(sdft_indices) > 0:
-                        sdft_mask[sdft_indices] = 1.0
-                        sub_batch = gather_sub_batch(sdft_indices)
+                        # 4) align lengths
+                        resp_len = min(
+                            student_logits.shape[1],
+                            target_logits.shape[1],
+                            response_mask.shape[1],
+                            target_response_mask.shape[1],
+                        )
+                        student_logits = student_logits[:, :resp_len, :]
+                        target_logits = target_logits[:, :resp_len, :]
+                        response_mask_local = response_mask[:, :resp_len] * target_response_mask[:, :resp_len]
 
-                        with torch.no_grad():
-                            target_module = student_base_actor.actor_module
-                            target_module.eval()
-                            with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
-                                output = target_module(
-                                    input_ids=sub_batch["input_ids"],
-                                    attention_mask=sub_batch["attention_mask"],
-                                    position_ids=sub_batch["position_ids"],
-                                    use_cache=False,
-                                    return_dict=True,
-                                )
-                                sub_logits = output.logits[:, -sub_batch["responses"].shape[1] - 1 : -1, :]
+                        # 5) KL loss for this homogeneous type sub-batch
+                        token_student_log_probs = F.log_softmax(student_logits, dim=-1)
+                        token_target_probs = F.softmax(target_logits, dim=-1)
+                        token_kl = F.kl_div(
+                            token_student_log_probs,
+                            token_target_probs,
+                            reduction="none",
+                        ).sum(dim=-1)
 
-                        target_logits[sdft_indices, : sub_logits.shape[1], :] = sub_logits
+                        denom = response_mask_local.sum().clamp_min(1.0)
+                        type_loss = (token_kl * response_mask_local).sum() / denom
 
-                    # 3.2 teacher logits for ICL-OPD
-                    if len(icl_indices) > 0:
-                        icl_opd_mask[icl_indices] = 1.0
-                        sub_batch = gather_sub_batch(icl_indices)
+                        weighted_type_loss = loss_weight * type_loss
+                        micro_total_loss = micro_total_loss + weighted_type_loss
 
-                        with torch.no_grad():
-                            target_module = teacher_actor.actor_module
-                            target_module.eval()
-                            with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
-                                output = target_module(
-                                    input_ids=sub_batch["input_ids"],
-                                    attention_mask=sub_batch["attention_mask"],
-                                    position_ids=sub_batch["position_ids"],
-                                    use_cache=False,
-                                    return_dict=True,
-                                )
-                                sub_logits = output.logits[:, -sub_batch["responses"].shape[1] - 1 : -1, :]
+                        if distill_type_name == "sdft":
+                            micro_sdft_loss = type_loss.detach()
+                        else:
+                            micro_icl_loss = type_loss.detach()
 
-                        target_logits[icl_indices, : sub_logits.shape[1], :] = sub_logits
+                        micro_mean_token_kl_num = micro_mean_token_kl_num + (token_kl * response_mask_local).sum().detach()
+                        micro_mean_token_kl_den = micro_mean_token_kl_den + response_mask_local.sum().detach()
 
-                    # 4. align lengths if necessary
-                    resp_len = min(student_logits.shape[1], target_logits.shape[1], response_mask.shape[1], target_response_mask.shape[1])
-                    student_logits = student_logits[:, :resp_len, :]
-                    target_logits = target_logits[:, :resp_len, :]
-                    response_mask_local = response_mask[:, :resp_len] * target_response_mask[:, :resp_len].float()
+                        # if rank == 0:
+                        #     print(
+                        #         f"[rank {rank}] type={distill_type_name}, "
+                        #         f"local_n={len(local_indices)}, actor_is_dummy={actor_is_dummy}, "
+                        #         f"global_has_type={global_has_type}"
+                        #     )
 
-                    # 5. KL loss
-                    token_student_log_probs = F.log_softmax(student_logits, dim=-1)
-                    token_target_probs = F.softmax(target_logits, dim=-1)
-                    token_kl = F.kl_div(token_student_log_probs, token_target_probs, reduction="none").sum(dim=-1)
-
-                    sdft_token_mask = response_mask_local * sdft_mask.unsqueeze(-1)
-                    icl_opd_token_mask = response_mask_local * icl_opd_mask.unsqueeze(-1)
-
-                    sdft_denom = sdft_token_mask.sum().clamp_min(1.0)
-                    icl_opd_denom = icl_opd_token_mask.sum().clamp_min(1.0)
-
-                    sdft_loss = (token_kl * sdft_token_mask).sum() / sdft_denom
-                    icl_opd_loss = (token_kl * icl_opd_token_mask).sum() / icl_opd_denom
-
-                    total_loss = sdft_weight * sdft_loss + icl_opd_weight * icl_opd_loss
-                    total_loss = total_loss / max(gradient_accumulation, 1)
+                    # backward once per micro-batch
+                    micro_total_loss = micro_total_loss / max(gradient_accumulation, 1)
 
                     if self.scaler is not None:
-                        self.scaler.scale(total_loss).backward()
+                        self.scaler.scale(micro_total_loss).backward()
                     else:
-                        total_loss.backward()
+                        micro_total_loss.backward()
+
+                    mean_token_kl = (
+                        micro_mean_token_kl_num / micro_mean_token_kl_den.clamp_min(1.0)
+                    ).item()
 
                     micro_metrics = {
-                        "distill/loss": total_loss.detach().item(),
-                        "distill/sdft_loss": sdft_loss.detach().item(),
-                        "distill/icl_opd_loss": icl_opd_loss.detach().item(),
+                        "distill/loss": micro_total_loss.detach().item(),
+                        "distill/sdft_loss": micro_sdft_loss.item(),
+                        "distill/icl_opd_loss": micro_icl_loss.item(),
                         "distill/sdft_samples": float(len(sdft_indices)),
                         "distill/icl_opd_samples": float(len(icl_indices)),
-                        "distill/mean_token_kl": (token_kl * response_mask_local).sum().detach().item()
-                        / response_mask_local.sum().clamp_min(1.0).item(),
+                        "distill/mean_token_kl": mean_token_kl,
                     }
                     append_to_dict(metrics, micro_metrics)
 

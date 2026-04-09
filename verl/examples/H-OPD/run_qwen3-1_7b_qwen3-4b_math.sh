@@ -25,8 +25,7 @@ output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${abil
 method=HOPD
 output_path="/mnt/petrelfs/fudaocheng/checkpoints/trained/${output_model_name}_${method}"
 
-batch_size=32
-n_gpu=2
+n_gpu=8
 lr=1e-6
 
 unset ROCR_VISIBLE_DEVICES
@@ -47,6 +46,10 @@ unset RAY_PORT
 export RAY_TMPDIR=/tmp/ray_${USER}_${SLURM_JOB_ID}
 mkdir -p "${RAY_TMPDIR}"
 
+# export NCCL_DEBUG=INFO
+# export NCCL_ASYNC_ERROR_HANDLING=1
+# export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
+
 python3 -m verl.trainer.main_ppo \
     +algorithm.train_mode=heterogeneous_distill \
     +algorithm.hetero_distill.student_rollout_n=4 \
@@ -59,8 +62,8 @@ python3 -m verl.trainer.main_ppo \
     data.train_files=$train_files \
     data.val_files=$test_files \
     data.train_batch_size=$TRAIN_BATCH_SIZE \
-    data.max_prompt_length=2048 \
-    data.max_response_length=10240 \
+    data.max_prompt_length=1024 \
+    data.max_response_length=8192 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=True \
@@ -82,9 +85,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$LOGPROB_MICRO_BATCH_SIZE_PER_GPU \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.n=1 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=9216 \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
@@ -114,7 +117,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name="${output_model_name}_${method}" \
     trainer.n_gpus_per_node=$n_gpu \
     trainer.nnodes=1 \
-    trainer.save_freq=50 \
+    trainer.save_freq=10 \
     trainer.default_local_dir=$output_path \
     trainer.test_freq=10 \
     trainer.total_epochs=2 $@
