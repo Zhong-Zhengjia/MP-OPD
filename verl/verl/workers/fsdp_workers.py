@@ -24,6 +24,9 @@ import warnings
 from dataclasses import asdict
 from typing import Any, Optional
 
+import asyncio
+import threading
+
 import numpy as np
 import psutil
 import torch
@@ -266,6 +269,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_ref and self.config.ref.log_prob_micro_batch_size is not None:
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
+
+    def _ensure_background_loop(self):
+        if getattr(self, "_bg_loop", None) is not None:
+            return
+
+        self._bg_loop = asyncio.new_event_loop()
+
+        def _runner():
+            asyncio.set_event_loop(self._bg_loop)
+            self._bg_loop.run_forever()
+
+        self._bg_thread = threading.Thread(target=_runner, daemon=True)
+        self._bg_thread.start()
+
+    def _run_coro_blocking(self, coro):
+        self._ensure_background_loop()
+        fut = asyncio.run_coroutine_threadsafe(coro, self._bg_loop)
+        return fut.result()
 
     def _build_model_optimizer(
         self,
@@ -646,8 +667,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # For sync mode, we directly switch to trainer mode here.
         # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.
         if rollout_config.mode == "sync" and self._is_actor:
-            loop = get_event_loop()
-            loop.run_until_complete(self.trainer_mode())
+            self._run_coro_blocking(self.trainer_mode())
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
@@ -753,7 +773,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
-        from transformers import AutoModelForCausalLM
 
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
@@ -762,9 +781,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         use_remove_padding = self.config.model.get("use_remove_padding", False)
         use_shm = self.config.model.get("use_shm", False)
         use_fused_kernels = self.config.model.get("use_fused_kernels", False)
-
-        # for teacher rollout generation: use a standalone HF model instead of FSDP-wrapped ref model
-        self.teacher_generate_module = None
 
         if self._is_actor or self._is_rollout:
             # we need the model for actor and rollout
@@ -850,38 +866,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # In heterogeneous distillation mode, ref model is treated as teacher model
             self.teacher_module_fsdp = self.ref_module_fsdp
             self.teacher_policy = self.ref_policy
-
-            # ------------------------------------------------------------------
-            # Build a standalone non-FSDP teacher model for rollout generation.
-            # This avoids FSDP/offload/materialization issues during model.generate().
-            # ------------------------------------------------------------------
-            teacher_dtype = None
-            try:
-                import torch
-                # Prefer bf16 if available / commonly used in training
-                teacher_dtype = torch.bfloat16
-            except Exception:
-                teacher_dtype = None
-
-            # teacher rollout model initialization:
-            if self.rank == 0:
-                print("[hetero_distill] Building standalone teacher_generate_module for rollout generate")
-
-            self.teacher_generate_module = AutoModelForCausalLM.from_pretrained(
-                local_path,
-                torch_dtype=teacher_dtype,
-                trust_remote_code=self.config.model.get("trust_remote_code", False),
-            )
-            self.teacher_generate_module.eval()
-            self.teacher_generate_module.to(get_device_id())
-            print('[DEBUG] device id: ', get_device_id())
-
-            if self.rank == 0:
-                try:
-                    first_param = next(self.teacher_generate_module.parameters())
-                    print(f"[hetero_distill] teacher_generate_module device = {first_param.device}")
-                except Exception:
-                    print("[hetero_distill] failed to inspect teacher_generate_module device")
 
         # Initialize base models for corrected reward computation
         # Actor's base model (for computing base_log_prob)
@@ -984,9 +968,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
-
-        import torch.distributed as dist
-        print("[DEBUG] student rank", dist.get_rank(), "enter generate, bs", prompts.batch["input_ids"].shape[0])
         # Support all hardwares
         assert self._is_rollout
         prompts = prompts.to(get_device_id())
@@ -1003,15 +984,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
-            loop = get_event_loop()
-            loop.run_until_complete(self.rollout_mode())
+            self._run_coro_blocking(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(prompts=prompts)
 
         if self._is_actor:
-            loop.run_until_complete(self.trainer_mode())
+            self._run_coro_blocking(self.trainer_mode())
             log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
         # We calculate the average timing across all ranks
@@ -1032,169 +1012,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # clear kv cache
         get_torch_device().empty_cache()
-        return output
-
-    def _generate_sequences_with_policy(
-        self,
-        prompts: DataProto,
-        policy_module,
-        temperature=1.0,
-        top_p=1.0,
-        do_sample=True,
-    ):
-        """
-        Correct version (Fix #1):
-        - Keep the dataset prompt format (left padded) in the returned full sequence.
-        - Always define the response span starting at `base_prompt_len = prompt_ids.shape[1]`
-        (NOT `p_len = prompt_lens[i]`).
-        - Build attention_mask so that:
-            * prompt part uses dataset prompt_attention_mask
-            * response part is 1 for non-pad tokens and 0 for pad tokens
-        - Return responses sliced from base_prompt_len, consistent with attention_mask and compute_response_mask().
-        """
-        import torch
-        import torch.distributed as dist
-        print("[DEBUG] teacher rank", dist.get_rank(), "enter generate, bs", prompts.batch["input_ids"].shape[0])
-
-        prompts = prompts.to(get_device_id())
-
-        # dataset prompt tokens (left padded)
-        prompt_ids = prompts.batch["input_ids"]  # [bs, base_prompt_len]
-        prompt_attention_mask = prompts.batch["attention_mask"]  # [bs, base_prompt_len]
-        prompt_position_ids = prompts.batch.get("position_ids", None)
-
-        bs, base_prompt_len = prompt_ids.shape
-        device = prompt_ids.device
-
-        # real prompt token count per sample (remove left pad)
-        prompt_lens = prompt_attention_mask.sum(dim=-1).to(torch.long)  # [bs]
-
-        model = policy_module
-        model.eval()
-        print("[DEBUG] is cuda:", next(model.parameters()).is_cuda)
-        print("[DEBUG] param dtype:", next(model.parameters()).dtype)
-        print("[DEBUG] any meta:", any(p.is_meta for p in model.parameters()))
-        print("[DEBUG] is fsdp:", isinstance(model, FSDP))
-        devices = {}
-        for n,p in model.named_parameters():
-            devices[str(p.device)] = devices.get(str(p.device), 0) + p.numel()
-        print("teacher param devices:", devices)
-
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        eos_id = self.tokenizer.eos_token_id
-
-        target_resp_len = int(getattr(self.config, "response_length", 9216))
-
-        gen_kwargs = {
-            "max_new_tokens": int(target_resp_len),
-            "do_sample": do_sample,
-            "temperature": float(temperature),
-            "top_p": float(top_p),
-            "pad_token_id": pad_id,
-            "eos_token_id": eos_id,
-            "use_cache": True,
-        }
-
-        with torch.no_grad():
-            # outputs: [bs, base_prompt_len + gen_len] (padded within batch to same length)
-            torch.cuda.synchronize()
-            t0 = time.time()
-            outputs = model.generate(
-                input_ids=prompt_ids,
-                attention_mask=prompt_attention_mask,
-                **gen_kwargs,
-            )
-            torch.cuda.synchronize()
-            t1 = time.time()
-            print("[DEBUG] generate sec:", t1-t0)
-
-        print("[DEBUG] outputs shape:", outputs.shape)
-
-        # Build per-sample full_seq = [left-padded prompt (base_prompt_len), response (target_resp_len)]
-        full_input_ids = []
-        full_attention_mask = []
-        full_position_ids = []
-
-        for i in range(bs):
-            full_seq = outputs[i]  # 1D, length may vary across batch (but padded by generate)
-
-            # 1) prompt part: ALWAYS keep the left-padded dataset prompt slice
-            prompt_part = full_seq[:base_prompt_len]
-
-            # 2) response part: ALWAYS starts at base_prompt_len
-            resp_part = full_seq[base_prompt_len:]
-
-            # 3) force response to fixed length (pad/truncate) to match vLLM-like behavior
-            if resp_part.numel() > target_resp_len:
-                resp_part = resp_part[:target_resp_len]
-            elif resp_part.numel() < target_resp_len:
-                resp_pad = torch.full(
-                    (target_resp_len - resp_part.numel(),),
-                    pad_id,
-                    dtype=resp_part.dtype,
-                    device=device,
-                )
-                resp_part = torch.cat([resp_part, resp_pad], dim=0)
-
-            # 4) final full sequence
-            final_seq = torch.cat([prompt_part, resp_part], dim=0)  # [base_prompt_len + target_resp_len]
-            full_input_ids.append(final_seq)
-
-            # 5) attention_mask: prompt from dataset, response is non-pad
-            am_prompt = prompt_attention_mask[i].to(torch.long)  # [base_prompt_len]
-            am_resp = (resp_part != pad_id).to(torch.long)        # [target_resp_len]
-            am = torch.cat([am_prompt, am_resp], dim=0)
-            full_attention_mask.append(am)
-
-            # 6) position_ids
-            #    - simplest and robust: monotonic positions for the whole final_seq
-            #    - (pad positions don't matter as long as attention_mask masks them)
-            #
-            # If you need stricter compatibility with special position schemes (mRoPE etc.),
-            # you'll need model-specific logic here. This version matches most decoder-only LMs.
-            pos = torch.arange(final_seq.numel(), device=device, dtype=torch.long)
-            full_position_ids.append(pos)
-
-        full_input_ids = torch.stack(full_input_ids, dim=0)         # [bs, base_prompt_len + target_resp_len]
-        full_attention_mask = torch.stack(full_attention_mask, dim=0)  # same shape
-        full_position_ids = torch.stack(full_position_ids, dim=0)   # same shape
-
-        # responses: always aligned with compute_response_mask() which slices the tail
-        responses = full_input_ids[:, base_prompt_len:]  # [bs, target_resp_len]
-
-        output = DataProto.from_dict(
-            tensors={
-                "prompts": prompt_ids,  # left padded prompts as-is
-                "responses": responses,
-                "input_ids": full_input_ids,
-                "attention_mask": full_attention_mask,
-                "position_ids": full_position_ids,
-            },
-            non_tensors=dict(prompts.non_tensor_batch),
-            meta_info={
-                "temperature": float(temperature),
-                "top_p": float(top_p),
-                "do_sample": bool(do_sample),
-            },
-        )
-        return output.to("cpu")
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
-    @DistProfiler.annotate(color="magenta", role="teacher_rollout_generate")
-    def generate_sequences_teacher(self, prompts: DataProto):
-        assert self.teacher_generate_module is not None, "Teacher generate model is not initialized."
-
-        temperature = self.config.rollout.get("temperature", 1.0)
-        top_p = self.config.rollout.get("top_p", 1.0)
-        do_sample = prompts.meta_info.get("do_sample", True)
-
-        output = self._generate_sequences_with_policy(
-            prompts=prompts,
-            policy_module=self.teacher_generate_module,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=do_sample,
-        )
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

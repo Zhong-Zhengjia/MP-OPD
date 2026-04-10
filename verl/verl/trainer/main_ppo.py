@@ -106,6 +106,10 @@ def run_ppo(config, task_runner_class=None) -> None:
         ray.timeline(filename=timeline_json_file)
 
 
+from pprint import pprint
+
+
+
 class TaskRunner:
     """Ray remote class for executing distributed PPO training tasks.
 
@@ -131,7 +135,7 @@ class TaskRunner:
             actor_rollout_cls = (
                 AsyncActorRolloutRefWorker
                 if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker   # use sync mode
+                else ActorRolloutRefWorker
             )
             ray_worker_group_cls = RayWorkerGroup
 
@@ -150,10 +154,25 @@ class TaskRunner:
 
         from verl.trainer.ppo.ray_trainer import Role
 
-        # 这里将 Role.ActorRollout 映射为 ActorRolloutRefWorker
         self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
 
         return actor_rollout_cls, ray_worker_group_cls
+
+    def add_teacher_rollout_worker(self, config):
+        """Add teacher rollout worker for heterogeneous distillation."""
+        from verl.single_controller.ray import RayWorkerGroup
+        from verl.trainer.ppo.ray_trainer import Role
+
+        if config.algorithm.get("train_mode", None) != "heterogeneous_distill":
+            return None, None
+
+        from verl.workers.teacher_rollout_worker import TeacherRolloutWorker
+
+        teacher_rollout_cls = TeacherRolloutWorker
+        ray_worker_group_cls = RayWorkerGroup
+
+        self.role_worker_mapping[Role.TeacherRollout] = ray.remote(teacher_rollout_cls)
+        return teacher_rollout_cls, ray_worker_group_cls
 
     def add_critic_worker(self, config):
         """Add critic worker to role mapping."""
@@ -180,13 +199,52 @@ class TaskRunner:
 
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
-        from verl.trainer.ppo.ray_trainer import Role
+        from verl.trainer.ppo.ray_trainer import Role, ResourcePoolManager
 
-        global_pool_id = "global_pool"
-        resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-        }
-        # TODO Here you can use the new registration method to support dynamic registration of roles
+        train_mode = config.algorithm.get("train_mode", None)
+
+        # Heterogeneous distill: isolate actor rollout and teacher rollout
+        # into different resource pools so that different vLLM engines /
+        # tensor parallel sizes do not share the same colocated worker group.
+        if train_mode == "heterogeneous_distill":
+            actor_pool_id = "actor_pool"
+            teacher_pool_id = "teacher_pool"
+
+            total_gpus = config.trainer.n_gpus_per_node
+            if total_gpus < 2:
+                raise ValueError("heterogeneous_distill requires at least 2 GPUs to isolate actor and teacher pools")
+
+            # Simple split for single-node use case:
+            # actor gets the larger half, teacher gets the remaining GPUs.
+            actor_gpus = 2
+            teacher_gpus = total_gpus - actor_gpus
+            if teacher_gpus <= 0:
+                raise ValueError("teacher_pool must have at least 1 GPU")
+
+            resource_pool_spec = {
+                actor_pool_id: [actor_gpus] * config.trainer.nnodes,
+                teacher_pool_id: [teacher_gpus] * config.trainer.nnodes,
+            }
+
+            self.mapping[Role.ActorRollout] = actor_pool_id
+            self.mapping[Role.Critic] = actor_pool_id
+            self.mapping[Role.TeacherRollout] = teacher_pool_id
+
+            if Role.RefPolicy in self.role_worker_mapping:
+                self.mapping[Role.RefPolicy] = actor_pool_id
+
+        else:
+            global_pool_id = "global_pool"
+            resource_pool_spec = {
+                global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            }
+
+            self.mapping[Role.ActorRollout] = global_pool_id
+            self.mapping[Role.Critic] = global_pool_id
+
+            if Role.RefPolicy in self.role_worker_mapping:
+                self.mapping[Role.RefPolicy] = global_pool_id
+
         if config.reward_model.enable_resource_pool:
             if config.reward_model.n_gpus_per_node <= 0:
                 raise ValueError("config.reward_model.n_gpus_per_node must be greater than 0")
@@ -195,10 +253,8 @@ class TaskRunner:
 
             reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
             resource_pool_spec["reward_pool"] = reward_pool
-
-        self.mapping[Role.ActorRollout] = global_pool_id
-        self.mapping[Role.Critic] = global_pool_id
-        from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+            if Role.RewardModel in self.role_worker_mapping:
+                self.mapping[Role.RewardModel] = "reward_pool"
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
         return resource_pool_manager
@@ -238,86 +294,65 @@ class TaskRunner:
             self.mapping[Role.RefPolicy] = "global_pool"
 
     def run(self, config):
-        """Execute the main PPO training workflow.
-
-        This method sets up the distributed training environment, initializes
-        workers, datasets, and reward functions, then starts the training process.
-
-        Args:
-            config: Training configuration object containing all parameters needed
-                   for setting up and running the PPO training process.
-        """
-        # Print the initial configuration. `resolve=True` will evaluate symbolic values.
-        from pprint import pprint
+        """Execute the main PPO training workflow."""
 
         from omegaconf import OmegaConf
 
         from verl.utils.fs import copy_to_local
+        from verl.utils.dataset.rl_dataset import collate_fn
+        from verl.utils import hf_processor, hf_tokenizer
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
+        self.add_teacher_rollout_worker(config)
         self.add_critic_worker(config)
-
-        # We should adopt a multi-source reward function here:
-        # - for rule-based rm, we directly call a reward score
-        # - for model-based rm, we call a model
-        # - for code related prompt, we send to a sandbox if there are test cases
-        # finally, we combine all the rewards together
-        # The reward type depends on the tag of the data
         self.add_reward_model_worker(config)
-
-        # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
 
-        # validate config
         validate_config(
             config=config,
             use_reference_policy=need_reference_policy(self.role_worker_mapping),
             use_critic=need_critic(config),
         )
 
-        # Download the checkpoint from HDFS to the local machine.
-        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
         local_path = copy_to_local(
-            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+            config.actor_rollout_ref.model.path,
+            use_shm=config.actor_rollout_ref.model.get("use_shm", False),
         )
-
-        # Instantiate the tokenizer and processor.
-        from verl.utils import hf_processor, hf_tokenizer
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
-        # Load ref_tokenizer if ref model uses a different path/tokenizer
         ref_tokenizer = None
         ref_model_config = config.actor_rollout_ref.ref.get("model", {})
         ref_model_path = ref_model_config.get("path", None) if ref_model_config else None
         if ref_model_path is not None:
-            # Ref model uses a different model, need to load its tokenizer
             ref_local_path = copy_to_local(
-                ref_model_path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+                ref_model_path,
+                use_shm=config.actor_rollout_ref.model.get("use_shm", False),
             )
             ref_tokenizer = hf_tokenizer(ref_local_path, trust_remote_code=trust_remote_code)
             print(f"Loaded ref_tokenizer from {ref_local_path} for re-tokenization")
 
-        # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+            config,
+            tokenizer,
+            num_examine=0,
+            **config.reward_model.get("reward_kwargs", {}),
         )
         val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+            config,
+            tokenizer,
+            num_examine=1,
+            **config.reward_model.get("reward_kwargs", {}),
         )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
-        from verl.utils.dataset.rl_dataset import collate_fn
-
-        # Create training and validation datasets.
         train_dataset = create_rl_dataset(
             config.data.train_files,
             config.data,
@@ -336,7 +371,6 @@ class TaskRunner:
         )
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
-        # Initialize the PPO trainer.
         trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
@@ -352,12 +386,9 @@ class TaskRunner:
             train_sampler=train_sampler,
             ref_tokenizer=ref_tokenizer,
         )
-        # Initialize the workers of the trainer.
+
         trainer.init_workers()
-
-        # Start the training process.
         trainer.fit()
-
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):
     """Create a dataset.
@@ -386,12 +417,6 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
                 f"The custom dataset class '{data_config.custom_cls.name}' from "
                 f"'{data_config.custom_cls.path}' must inherit from torch.utils.data.Dataset"
             )
-    elif "datagen" in data_config and data_config.datagen.get("path", None) is not None and is_train:
-        # If a data generation strategy is specified, use the DynamicGenDataset class
-        from verl.utils.dataset.dynamicgen_dataset import DynamicGenDataset
-
-        dataset_cls = DynamicGenDataset
-        print("Using DynamicGenDataset for data generation.")
     else:
         # Use the default RLHFDataset class if no custom class is specified
         dataset_cls = RLHFDataset

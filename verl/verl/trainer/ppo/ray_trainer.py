@@ -423,6 +423,8 @@ class RayPPOTrainer:
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
+        self.teacher_rollout_wg = None
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -750,68 +752,15 @@ class RayPPOTrainer:
         return metric_dict
 
     def init_workers(self):
-        """Initialize distributed training workers using Ray backend.
-
-        Creates:
-        1. Ray resource pools from configuration
-        2. Worker groups for each role (actor, critic, etc.)
-        """
+        """Initialize distributed training workers using Ray backend."""
         self.resource_pool_manager.create_resource_pool()
 
-        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
-
-        # create actor and rollout
-        if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
-            actor_rollout_role = str(Role.ActorRollout)
-            if self.config.algorithm.get("train_mode", None) == "heterogeneous_distill":
-                actor_rollout_role = "actor_rollout_ref"
-
-            actor_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.ActorRollout],
-                config=self.config.actor_rollout_ref,
-                role=actor_rollout_role,
-            )
-            self.resource_pool_to_cls[resource_pool][str(Role.ActorRollout)] = actor_rollout_cls
-        else:
-            raise NotImplementedError
-
-        # create critic
-        if self.use_critic:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            critic_cfg = omega_conf_to_dataclass(self.config.critic)
-            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
-            self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
-
-        # create reference policy if needed
-        if self.use_reference_policy:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
-            ref_policy_cls = RayClassWithInitArgs(
-                self.role_worker_mapping[Role.RefPolicy],
-                config=self.config.actor_rollout_ref,
-                role=str(Role.RefPolicy),
-            )
-            self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
-
-        # create a reward model if reward_fn is None
-        if self.use_rm:
-            # we create a RM here
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
-            self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
-
-        # initialize WorkerGroup
-        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
-        # you should not use `create_colocated_worker_cls`.
-        # Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
         all_wg = {}
-        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
+        wg_kwargs = {}
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
             wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
         if OmegaConf.select(self.config.global_profiler, "steps") is not None:
             wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
-            # Only require nsight worker options when tool is nsys
             if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
                 assert (
                     OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
@@ -822,15 +771,128 @@ class RayPPOTrainer:
                 )
         wg_kwargs["device_name"] = self.device_name
 
-        for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-            wg_dict = self.ray_worker_group_cls(
+        train_mode = self.config.algorithm.get("train_mode", None)
+
+        def _spawn_single_worker_group(role, ray_cls_with_init, prefix_name=None):
+            resource_pool = self.resource_pool_manager.get_resource_pool(role)
+            wg = self.ray_worker_group_cls(
                 resource_pool=resource_pool,
-                ray_cls_with_init=worker_dict_cls,
+                ray_cls_with_init=ray_cls_with_init,
                 **wg_kwargs,
             )
-            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
-            all_wg.update(spawn_wg)
+            key = prefix_name or str(role)
+            spawned = wg.spawn(prefix_set={key})
+            return spawned[key]
+
+        # heterogeneous_distill: do NOT colocate different roles
+        if train_mode == "heterogeneous_distill":
+            if self.hybrid_engine:
+                actor_rollout_role = "actor_rollout_ref"
+                actor_rollout_cls = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.ActorRollout],
+                    config=self.config.actor_rollout_ref,
+                    role=actor_rollout_role,
+                )
+                all_wg[str(Role.ActorRollout)] = _spawn_single_worker_group(
+                    Role.ActorRollout, actor_rollout_cls, prefix_name=str(Role.ActorRollout)
+                )
+            else:
+                raise NotImplementedError
+
+            teacher_rollout_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.TeacherRollout],
+                config=self.config,
+                role=str(Role.TeacherRollout),
+            )
+            all_wg[str(Role.TeacherRollout)] = _spawn_single_worker_group(
+                Role.TeacherRollout, teacher_rollout_cls
+            )
+
+            if self.use_critic:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+                critic_cfg = omega_conf_to_dataclass(self.config.critic)
+                critic_cls = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.Critic],
+                    config=critic_cfg,
+                )
+                critic_wg = self.ray_worker_group_cls(
+                    resource_pool=resource_pool,
+                    ray_cls_with_init=critic_cls,
+                    **wg_kwargs,
+                )
+                all_wg[str(Role.Critic)] = critic_wg.spawn(prefix_set={str(Role.Critic)})[str(Role.Critic)]
+
+            if self.use_reference_policy and not self.ref_in_actor:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+                ref_policy_cls = RayClassWithInitArgs(
+                    self.role_worker_mapping[Role.RefPolicy],
+                    config=self.config.actor_rollout_ref,
+                    role=str(Role.RefPolicy),
+                )
+                ref_wg = self.ray_worker_group_cls(
+                    resource_pool=resource_pool,
+                    ray_cls_with_init=ref_policy_cls,
+                    **wg_kwargs,
+                )
+                all_wg[str(Role.RefPolicy)] = ref_wg.spawn(prefix_set={str(Role.RefPolicy)})[str(Role.RefPolicy)]
+
+            if self.use_rm:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+                rm_cls = RayClassWithInitArgs(
+                    self.role_worker_mapping[Role.RewardModel],
+                    config=self.config.reward_model,
+                )
+                rm_wg = self.ray_worker_group_cls(
+                    resource_pool=resource_pool,
+                    ray_cls_with_init=rm_cls,
+                    **wg_kwargs,
+                )
+                all_wg[str(Role.RewardModel)] = rm_wg.spawn(prefix_set={str(Role.RewardModel)})[str(Role.RewardModel)]
+
+        else:
+            self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+
+            if self.hybrid_engine:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+                actor_rollout_role = str(Role.ActorRollout)
+                actor_rollout_cls = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.ActorRollout],
+                    config=self.config.actor_rollout_ref,
+                    role=actor_rollout_role,
+                )
+                self.resource_pool_to_cls[resource_pool][str(Role.ActorRollout)] = actor_rollout_cls
+            else:
+                raise NotImplementedError
+
+            if self.use_critic:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+                critic_cfg = omega_conf_to_dataclass(self.config.critic)
+                critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
+                self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
+
+            if self.use_reference_policy:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+                ref_policy_cls = RayClassWithInitArgs(
+                    self.role_worker_mapping[Role.RefPolicy],
+                    config=self.config.actor_rollout_ref,
+                    role=str(Role.RefPolicy),
+                )
+                self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
+
+            if self.use_rm:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+                rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
+                self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
+
+            for resource_pool, class_dict in self.resource_pool_to_cls.items():
+                worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+                wg_dict = self.ray_worker_group_cls(
+                    resource_pool=resource_pool,
+                    ray_cls_with_init=worker_dict_cls,
+                    **wg_kwargs,
+                )
+                spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+                all_wg.update(spawn_wg)
 
         if self.use_critic:
             self.critic_wg = all_wg[str(Role.Critic)]
@@ -841,16 +903,18 @@ class RayPPOTrainer:
             self.ref_policy_wg.init_model()
 
         self.rm_wg = None
-        # initalization of rm_wg will be deprecated in the future
         if self.use_rm:
             self.rm_wg = all_wg[str(Role.RewardModel)]
             self.rm_wg.init_model()
 
-        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
+        self.teacher_rollout_wg = None
+        if train_mode == "heterogeneous_distill":
+            self.teacher_rollout_wg = all_wg[str(Role.TeacherRollout)]
+            self.teacher_rollout_wg.init_model()
+
         self.actor_rollout_wg = all_wg[str(Role.ActorRollout)]
         self.actor_rollout_wg.init_model()
 
-        # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
             from verl.experimental.agent_loop import AgentLoopManager
@@ -1510,8 +1574,10 @@ class RayPPOTrainer:
                     "global_steps": self.global_steps,
                 }
 
+                assert self.teacher_rollout_wg is not None, "teacher_rollout_wg is not initialized"
+
                 teacher_rollout_start = time.time()
-                teacher_rollout_batch = self.actor_rollout_wg.generate_sequences_teacher(teacher_gen_batch)
+                teacher_rollout_batch = self.teacher_rollout_wg.generate_sequences(teacher_gen_batch)
                 teacher_rollout_end = time.time()
                 print(f'[DEBUG] Teacher rollout time cost: {teacher_rollout_end-teacher_rollout_start} s')
                 
