@@ -216,7 +216,7 @@ class TaskRunner:
 
             # Simple split for single-node use case:
             # actor gets the larger half, teacher gets the remaining GPUs.
-            actor_gpus = 2
+            actor_gpus = 6
             teacher_gpus = total_gpus - actor_gpus
             if teacher_gpus <= 0:
                 raise ValueError("teacher_pool must have at least 1 GPU")

@@ -12,10 +12,9 @@ from verl.utils.device import get_device_name
 from verl.utils.distributed import get_nccl_backend
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
-from verl.utils.model import update_model_config
-from verl.utils.ray_utils import get_event_loop
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.workers.rollout import get_rollout_class
+from verl.utils.model import get_generation_config
 
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 
@@ -75,6 +74,8 @@ class TeacherRolloutWorker(Worker, DistProfilerExtension):
         self.generation_config = None
         self.model_config = None
 
+        
+
     def _build_rollout(self, trust_remote_code: bool = False):
         from torch.distributed.device_mesh import init_device_mesh
 
@@ -91,6 +92,10 @@ class TeacherRolloutWorker(Worker, DistProfilerExtension):
             self.config.teacher_rollout.model.path,
             use_shm=self.config.teacher_rollout.model.get("use_shm", False),
         )
+
+        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+
+        
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
 
@@ -162,9 +167,8 @@ class TeacherRolloutWorker(Worker, DistProfilerExtension):
     def generate_sequences(self, prompts: DataProto):
         assert self.rollout is not None, "Teacher rollout engine is not initialized."
 
-        from verl.utils.memory_buffer import aggressive_empty_cache
-        from verl.utils.torch_functional import reduce_timing, topk_reduce_ratio_min_max
-        from verl.utils.tracking import simple_timer
+        from verl.utils.memory_utils import aggressive_empty_cache
+        from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 
         prompts = prompts.to(get_device_name())
 
