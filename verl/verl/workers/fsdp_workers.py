@@ -15,6 +15,7 @@
 The main entry point to run the PPO algorithm
 """
 
+import time
 import datetime
 import json
 import logging
@@ -254,7 +255,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be larger than "
                     f"ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu}"
                 )
-
+    
         # normalize rollout config
         if self._is_rollout and self.config.rollout.log_prob_micro_batch_size is not None:
             self.config.rollout.log_prob_micro_batch_size //= (
@@ -862,6 +863,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             except Exception:
                 teacher_dtype = None
 
+            # teacher rollout model initialization:
             if self.rank == 0:
                 print("[hetero_distill] Building standalone teacher_generate_module for rollout generate")
 
@@ -872,6 +874,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
             self.teacher_generate_module.eval()
             self.teacher_generate_module.to(get_device_id())
+            print('[DEBUG] device id: ', get_device_id())
 
             if self.rank == 0:
                 try:
@@ -981,6 +984,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
+
+        import torch.distributed as dist
+        print("[DEBUG] student rank", dist.get_rank(), "enter generate, bs", prompts.batch["input_ids"].shape[0])
         # Support all hardwares
         assert self._is_rollout
         prompts = prompts.to(get_device_id())
@@ -1047,6 +1053,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         - Return responses sliced from base_prompt_len, consistent with attention_mask and compute_response_mask().
         """
         import torch
+        import torch.distributed as dist
+        print("[DEBUG] teacher rank", dist.get_rank(), "enter generate, bs", prompts.batch["input_ids"].shape[0])
 
         prompts = prompts.to(get_device_id())
 
@@ -1063,6 +1071,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         model = policy_module
         model.eval()
+        print("[DEBUG] is cuda:", next(model.parameters()).is_cuda)
+        print("[DEBUG] param dtype:", next(model.parameters()).dtype)
+        print("[DEBUG] any meta:", any(p.is_meta for p in model.parameters()))
+        print("[DEBUG] is fsdp:", isinstance(model, FSDP))
+        devices = {}
+        for n,p in model.named_parameters():
+            devices[str(p.device)] = devices.get(str(p.device), 0) + p.numel()
+        print("teacher param devices:", devices)
 
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         eos_id = self.tokenizer.eos_token_id
@@ -1081,11 +1097,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with torch.no_grad():
             # outputs: [bs, base_prompt_len + gen_len] (padded within batch to same length)
+            torch.cuda.synchronize()
+            t0 = time.time()
             outputs = model.generate(
                 input_ids=prompt_ids,
                 attention_mask=prompt_attention_mask,
                 **gen_kwargs,
             )
+            torch.cuda.synchronize()
+            t1 = time.time()
+            print("[DEBUG] generate sec:", t1-t0)
+
+        print("[DEBUG] outputs shape:", outputs.shape)
 
         # Build per-sample full_seq = [left-padded prompt (base_prompt_len), response (target_resp_len)]
         full_input_ids = []
