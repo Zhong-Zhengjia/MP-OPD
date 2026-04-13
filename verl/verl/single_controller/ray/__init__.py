@@ -18,6 +18,7 @@ from .base import (
     RayWorkerGroup,
     create_colocated_worker_cls,
     create_colocated_worker_cls_fused,
+    RayAsyncCollectHandle
 )
 
 __all__ = [

@@ -549,18 +549,31 @@ class DataParallelPPOActor(BasePPOActor):
         """
         Heterogeneous distillation update with type-wise synchronized execution.
 
-        Stability improvements:
-        - distillation temperature
-        - token KL clipping
-        - optional label smoothing on target probs
-        - finite check before backward
-        - safer fp32 KL computation
+        Distributed-safety guarantees:
+            1. All ranks iterate over the same distill types in the same fixed order.
+            2. All ranks execute one actor backward per micro-batch.
+            3. Even when a rank has no valid local samples for a type, it still builds a
+            graph-connected zero loss to preserve FSDP/DDP collective ordering.
+
+        Loss per type:
+            type_loss = loss_weight * (
+                kd_coef * KL(target || actor)
+                + prox_coef * KL(actor || base)
+                - entropy_coeff * H(actor)
+            )
+
+        where:
+            - target:
+                sdft    -> student_base_actor on demo-augmented target input
+                icl_opd -> teacher_actor on demo-augmented target input
+            - base:
+                student_base_actor on original actor input
+            - actor:
+                current trainable actor on original actor input
         """
         import torch
         import torch.nn.functional as F
         import torch.distributed as dist
-
-        print('[DEBUG] Start model update')
 
         self.actor_module.train()
 
@@ -587,17 +600,15 @@ class DataParallelPPOActor(BasePPOActor):
         sdft_weight = data.meta_info.get("sdft_weight", 1.0)
         icl_opd_weight = data.meta_info.get("icl_opd_weight", 1.0)
 
-        # ===== stability knobs =====
-        # 建议先用这些默认值，通常会明显稳定很多
-        distill_temperature = float(data.meta_info.get("distill_temperature", 2.0))
-        token_kl_clip = float(data.meta_info.get("token_kl_clip", 10.0))   # clip token-level KL
-        target_prob_floor = float(data.meta_info.get("target_prob_floor", 1e-8))
-        distill_label_smoothing = float(data.meta_info.get("distill_label_smoothing", 0.0))  # 可先保持 0
-        loss_clip_value = data.meta_info.get("distill_loss_clip", None)  # 例如 20.0，可选
-        # ==========================
+        distill_temperature = data.meta_info.get("distill_temperature", 1.0)
+        kd_coef = data.meta_info.get("kd_coef", 1.0)
+        prox_coef = data.meta_info.get("prox_coef", 0.05)
 
-        rank = dist.get_rank() if dist.is_initialized() else 0
+        loss_agg_mode = self.config.get("loss_agg_mode", "token-mean")
+        entropy_coeff = self.config.get("entropy_coeff", 0.0)
+
         device = get_device_id()
+        rank = dist.get_rank() if dist.is_initialized() else 0
 
         def gather_tensor_sub_batch(batch_dict, indices):
             return {
@@ -611,7 +622,7 @@ class DataParallelPPOActor(BasePPOActor):
         def gather_tensor_sub_batch_or_dummy(batch_dict, indices):
             """
             Return (sub_batch, is_dummy)
-            If indices is empty, use the first sample as dummy to preserve forward order.
+            If indices is empty, use the first sample as dummy to preserve synchronized forward order.
             Dummy sample will be masked out from loss later.
             """
             if len(indices) > 0:
@@ -623,7 +634,7 @@ class DataParallelPPOActor(BasePPOActor):
                 "attention_mask": batch_dict["attention_mask"][dummy_idx],
                 "position_ids": batch_dict["position_ids"][dummy_idx],
                 "responses": batch_dict["responses"][dummy_idx],
-                "response_mask": torch.zeros_like(batch_dict["response_mask"][dummy_idx]),  # zero loss mask
+                "response_mask": torch.zeros_like(batch_dict["response_mask"][dummy_idx]),
             }
             return sub_batch, True
 
@@ -641,12 +652,35 @@ class DataParallelPPOActor(BasePPOActor):
                     sub_logits = output.logits[:, -sub_batch["responses"].shape[1] - 1 : -1, :]
             return sub_logits
 
+        def zero_loss_from_logits(logits: torch.Tensor):
+            """
+            Build a graph-connected zero scalar so that all ranks still participate in
+            identical backward structure even when no valid token exists locally.
+            """
+            return logits.sum() * 0.0
+
         for _ in range(self.config.ppo_epochs):
             for mini_batch in mini_batches:
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                     gradient_accumulation = len(micro_batches)
+
+                    # 强烈建议排查 NCCL timeout 时先关闭 dynamic bsz。
+                    # 如果这里必须开，至少先检查不同 rank 的 micro batch 数是否一致。
+                    if dist.is_initialized():
+                        local_mb_num = torch.tensor([gradient_accumulation], device=device, dtype=torch.int64)
+                        min_mb_num = local_mb_num.clone()
+                        max_mb_num = local_mb_num.clone()
+                        dist.all_reduce(min_mb_num, op=dist.ReduceOp.MIN)
+                        dist.all_reduce(max_mb_num, op=dist.ReduceOp.MAX)
+                        if min_mb_num.item() != max_mb_num.item():
+                            raise RuntimeError(
+                                f"[Rank {rank}] Inconsistent number of micro-batches across ranks "
+                                f"when use_dynamic_bsz=True: local={local_mb_num.item()}, "
+                                f"global_min={min_mb_num.item()}, global_max={max_mb_num.item()}. "
+                                "This can cause distributed collective mismatch."
+                            )
                 else:
                     gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
@@ -662,17 +696,33 @@ class DataParallelPPOActor(BasePPOActor):
                     sdft_indices = [i for i, t in enumerate(local_distill_types) if t == "sdft"]
                     icl_indices = [i for i, t in enumerate(local_distill_types) if t == "icl_opd"]
 
-                    # 固定顺序处理，保证所有 rank 的模块调用顺序一致
+                    # fixed order for synchronized execution across ranks
                     type_specs = [
                         ("sdft", sdft_indices, student_base_actor.actor_module, sdft_weight),
                         ("icl_opd", icl_indices, teacher_actor.actor_module, icl_opd_weight),
                     ]
 
+                    if self.config.use_dynamic_bsz:
+                        loss_scale_factor = micro_batch.batch["input_ids"].shape[0] / self.config.ppo_mini_batch_size
+                    else:
+                        loss_scale_factor = 1 / gradient_accumulation
+
+                    # IMPORTANT:
+                    # Always initialize a graph-connected total loss by doing one dummy actor forward if needed later.
+                    # Here we keep micro_total_loss as None first, but we will guarantee it becomes a tensor
+                    # connected to actor graph before backward.
                     micro_total_loss = None
+
+                    micro_kd_loss = torch.tensor(0.0, device=device)
+                    micro_prox_loss = torch.tensor(0.0, device=device)
+                    micro_entropy = torch.tensor(0.0, device=device)
                     micro_sdft_loss = torch.tensor(0.0, device=device)
                     micro_icl_loss = torch.tensor(0.0, device=device)
-                    micro_mean_token_kl_num = torch.tensor(0.0, device=device)
-                    micro_mean_token_kl_den = torch.tensor(0.0, device=device)
+
+                    micro_mean_kd_kl_num = torch.tensor(0.0, device=device)
+                    micro_mean_kd_kl_den = torch.tensor(0.0, device=device)
+                    micro_mean_prox_kl_num = torch.tensor(0.0, device=device)
+                    micro_mean_prox_kl_den = torch.tensor(0.0, device=device)
 
                     for distill_type_name, local_indices, target_module, loss_weight in type_specs:
                         local_has_type = torch.tensor(
@@ -682,19 +732,26 @@ class DataParallelPPOActor(BasePPOActor):
                             dist.all_reduce(local_has_type, op=dist.ReduceOp.MAX)
                         global_has_type = bool(local_has_type.item())
 
-                        # 全局都没有该 type，则所有 rank 一起跳过
                         if not global_has_type:
+                            # 全局都没有这个 type，所有 rank 一起跳过是安全的
                             continue
 
-                        # 1) student trainable actor forward on this type-only sub-batch
-                        actor_sub_batch, actor_is_dummy = gather_tensor_sub_batch_or_dummy(micro_batch.batch, local_indices)
+                        # actor forward on original input
+                        actor_sub_batch, actor_is_dummy = gather_tensor_sub_batch_or_dummy(
+                            micro_batch.batch, local_indices
+                        )
                         response_mask = actor_sub_batch["response_mask"].float()
 
                         student_logits = self._forward_micro_batch_logits(actor_sub_batch)
 
-                        # 2) build target inputs for this type-only sub-batch
+                        # base forward on original input for proximal KL
+                        base_logits = forward_target_module(student_base_actor.actor_module, actor_sub_batch)
+
+                        # build demo-augmented target inputs
                         target_inputs = self._build_distill_inputs_for_micro_batch(
-                            micro_batch, tokenizer, selected_indices=local_indices if len(local_indices) > 0 else [0]
+                            micro_batch,
+                            tokenizer,
+                            selected_indices=local_indices if len(local_indices) > 0 else [0],
                         )
 
                         target_input_ids = target_inputs["input_ids"].to(device)
@@ -703,11 +760,10 @@ class DataParallelPPOActor(BasePPOActor):
                         target_responses = target_inputs["responses"].to(device)
                         target_response_mask = target_inputs["response_mask"].to(device).float()
 
-                        # 如果是 dummy，占位样本不参与 loss
                         if actor_is_dummy:
                             target_response_mask = torch.zeros_like(target_response_mask)
 
-                        # 3) target forward for this type: all ranks enter in synchronized order
+                        # target forward on demo-augmented input
                         target_sub_batch = {
                             "input_ids": target_input_ids,
                             "attention_mask": target_attention_mask,
@@ -716,110 +772,156 @@ class DataParallelPPOActor(BasePPOActor):
                         }
                         target_logits = forward_target_module(target_module, target_sub_batch)
 
-                        # 4) align lengths
+                        # align lengths
                         resp_len = min(
                             student_logits.shape[1],
+                            base_logits.shape[1],
                             target_logits.shape[1],
                             response_mask.shape[1],
                             target_response_mask.shape[1],
                         )
 
                         student_logits = student_logits[:, :resp_len, :]
+                        base_logits = base_logits[:, :resp_len, :]
                         target_logits = target_logits[:, :resp_len, :]
                         response_mask_local = response_mask[:, :resp_len] * target_response_mask[:, :resp_len]
 
-                        # 如果这个 type 在当前 rank 上实际没有有效 token，就仍然走同步图，但 loss 为 0
-                        valid_token_count = response_mask_local.sum()
+                        valid_tokens = response_mask_local.sum()
 
-                        # 5) safer KL distillation
-                        # 用 fp32 算 KL，避免 bf16/fp16 数值问题
-                        student_logits_fp32 = student_logits.float()
-                        target_logits_fp32 = target_logits.float()
+                        if valid_tokens.item() <= 0:
+                            # DO NOT continue.
+                            # Build graph-connected zero losses so all ranks preserve the same backward structure.
+                            kd_loss = zero_loss_from_logits(student_logits)
+                            prox_loss = zero_loss_from_logits(student_logits)
+                            entropy_loss = zero_loss_from_logits(student_logits)
 
-                        T = distill_temperature
-                        student_log_probs = F.log_softmax(student_logits_fp32 / T, dim=-1)
-                        target_probs = F.softmax(target_logits_fp32 / T, dim=-1)
+                            token_kd_kl = torch.zeros_like(response_mask_local)
+                            token_prox_kl = torch.zeros_like(response_mask_local)
+                        else:
+                            # numerical stability
+                            student_logits_t = torch.clamp(student_logits / distill_temperature, -30.0, 30.0)
+                            base_logits_t = torch.clamp(base_logits / distill_temperature, -30.0, 30.0)
+                            target_logits_t = torch.clamp(target_logits / distill_temperature, -30.0, 30.0)
 
-                        # 可选 label smoothing，进一步缓和 target 分布
-                        if distill_label_smoothing > 0.0:
-                            vocab_size = target_probs.shape[-1]
-                            smooth = distill_label_smoothing / vocab_size
-                            target_probs = (1.0 - distill_label_smoothing) * target_probs + smooth
+                            # actor distribution
+                            student_log_probs = F.log_softmax(student_logits_t, dim=-1)
+                            student_probs = F.softmax(student_logits_t, dim=-1)
 
-                        # 防止极小概率导致数值不稳
-                        target_probs = torch.clamp(target_probs, min=target_prob_floor)
-                        target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)
+                            # target distribution for distillation KL(target || actor)
+                            with torch.no_grad():
+                                target_log_probs = F.log_softmax(target_logits_t, dim=-1)
+                                target_probs = F.softmax(target_logits_t, dim=-1)
 
-                        token_kl = F.kl_div(
-                            student_log_probs,
-                            target_probs,
-                            reduction="none",
-                        ).sum(dim=-1)
+                            token_kd_kl = torch.sum(
+                                target_probs * (target_log_probs - student_log_probs),
+                                dim=-1,
+                            ) * (distill_temperature ** 2)
 
-                        # 蒸馏温度缩放标准做法：乘 T^2
-                        token_kl = token_kl * (T * T)
+                            kd_loss = agg_loss(
+                                loss_mat=token_kd_kl,
+                                loss_mask=response_mask_local,
+                                loss_agg_mode=loss_agg_mode,
+                            )
 
-                        # token-level clip，防止个别 token 爆炸
-                        if token_kl_clip is not None and token_kl_clip > 0:
-                            token_kl = torch.clamp(token_kl, max=token_kl_clip)
+                            # proximal KL(actor || base) on original input
+                            with torch.no_grad():
+                                base_log_probs = F.log_softmax(base_logits_t, dim=-1)
 
-                        denom = valid_token_count.clamp_min(1.0)
-                        type_loss = (token_kl * response_mask_local).sum() / denom
+                            token_prox_kl = torch.sum(
+                                student_probs * (student_log_probs - base_log_probs),
+                                dim=-1,
+                            ) * (distill_temperature ** 2)
 
-                        # 再做一次样本级别 loss clip，可选
-                        if loss_clip_value is not None:
-                            type_loss = torch.clamp(type_loss, max=float(loss_clip_value))
+                            prox_loss = agg_loss(
+                                loss_mat=token_prox_kl,
+                                loss_mask=response_mask_local,
+                                loss_agg_mode=loss_agg_mode,
+                            )
 
-                        weighted_type_loss = loss_weight * type_loss
+                            # entropy bonus on actor
+                            token_entropy = -torch.sum(student_probs * student_log_probs, dim=-1)
+                            entropy_loss = agg_loss(
+                                loss_mat=token_entropy,
+                                loss_mask=response_mask_local,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+
+                        type_loss = loss_weight * (
+                            kd_coef * kd_loss
+                            + prox_coef * prox_loss
+                            - entropy_coeff * entropy_loss
+                        )
 
                         if micro_total_loss is None:
-                            micro_total_loss = weighted_type_loss
+                            micro_total_loss = type_loss
                         else:
-                            micro_total_loss = micro_total_loss + weighted_type_loss
+                            micro_total_loss = micro_total_loss + type_loss
+
+                        # metrics
+                        micro_kd_loss += (loss_weight * kd_coef * kd_loss).detach()
+                        micro_prox_loss += (loss_weight * prox_coef * prox_loss).detach()
+                        micro_entropy += (loss_weight * entropy_loss).detach()
+
+                        micro_mean_kd_kl_num += (token_kd_kl * response_mask_local).sum().detach()
+                        micro_mean_kd_kl_den += response_mask_local.sum().detach()
+
+                        micro_mean_prox_kl_num += (token_prox_kl * response_mask_local).sum().detach()
+                        micro_mean_prox_kl_den += response_mask_local.sum().detach()
 
                         if distill_type_name == "sdft":
-                            micro_sdft_loss = type_loss.detach()
-                        else:
-                            micro_icl_loss = type_loss.detach()
+                            micro_sdft_loss += type_loss.detach()
+                        elif distill_type_name == "icl_opd":
+                            micro_icl_loss += type_loss.detach()
 
-                        micro_mean_token_kl_num = micro_mean_token_kl_num + (
-                            token_kl * response_mask_local
-                        ).sum().detach()
-                        micro_mean_token_kl_den = micro_mean_token_kl_den + valid_token_count.detach()
-
-                    # 如果这个 micro-batch 两种 type 都没有，就构造一个零 loss，避免 backward 报错
+                    # If globally neither sdft nor icl_opd exists in this micro-batch on all ranks,
+                    # micro_total_loss may still be None. In that case, create one graph-connected zero loss
+                    # from a dummy actor forward so every rank still performs one backward.
                     if micro_total_loss is None:
-                        micro_total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                        dummy_sub_batch, _ = gather_tensor_sub_batch_or_dummy(micro_batch.batch, [])
+                        dummy_logits = self._forward_micro_batch_logits(dummy_sub_batch)
+                        micro_total_loss = zero_loss_from_logits(dummy_logits)
 
-                    micro_total_loss = micro_total_loss / max(gradient_accumulation, 1)
+                    loss = micro_total_loss * loss_scale_factor
 
-                    # finite check，避免一步把模型炸掉
-                    if torch.isfinite(micro_total_loss):
-                        if self.scaler is not None:
-                            self.scaler.scale(micro_total_loss).backward()
-                        else:
-                            micro_total_loss.backward()
+                    if self.scaler is not None:
+                        self.scaler.scale(loss).backward()
                     else:
-                        if rank == 0:
-                            print(f"[WARN] skip backward because distill loss is not finite: {micro_total_loss.detach().item()}")
+                        loss.backward()
 
-                    mean_token_kl = (
-                        micro_mean_token_kl_num / micro_mean_token_kl_den.clamp_min(1.0)
-                    ).item()
-
-                    micro_metrics = {
-                        "distill/loss": micro_total_loss.detach().item(),
-                        "distill/sdft_loss": micro_sdft_loss.item(),
-                        "distill/icl_opd_loss": micro_icl_loss.item(),
-                        "distill/sdft_samples": float(len(sdft_indices)),
-                        "distill/icl_opd_samples": float(len(icl_indices)),
-                        "distill/mean_token_kl": mean_token_kl,
-                        "distill/temperature": distill_temperature,
+                    micro_batch_metrics = {
+                        "actor_distill/loss": micro_total_loss.detach().item() * loss_scale_factor,
+                        "actor_distill/kd_loss": micro_kd_loss.detach().item() * loss_scale_factor,
+                        "actor_distill/prox_loss": micro_prox_loss.detach().item() * loss_scale_factor,
+                        "actor_distill/entropy": micro_entropy.detach().item() * loss_scale_factor,
+                        "actor_distill/sdft_loss": micro_sdft_loss.detach().item() * loss_scale_factor,
+                        "actor_distill/icl_opd_loss": micro_icl_loss.detach().item() * loss_scale_factor,
+                        "actor_distill/kd_coef": float(kd_coef),
+                        "actor_distill/prox_coef": float(prox_coef),
+                        "actor_distill/entropy_coeff": float(entropy_coeff),
+                        "actor_distill/distill_temperature": float(distill_temperature),
                     }
-                    append_to_dict(metrics, micro_metrics)
+
+                    if micro_mean_kd_kl_den.item() > 0:
+                        micro_batch_metrics["actor_distill/token_kd_kl"] = (
+                            micro_mean_kd_kl_num / micro_mean_kd_kl_den
+                        ).item()
+                    else:
+                        micro_batch_metrics["actor_distill/token_kd_kl"] = 0.0
+
+                    if micro_mean_prox_kl_den.item() > 0:
+                        micro_batch_metrics["actor_distill/token_prox_kl"] = (
+                            micro_mean_prox_kl_num / micro_mean_prox_kl_den
+                        ).item()
+                    else:
+                        micro_batch_metrics["actor_distill/token_prox_kl"] = 0.0
+
+                    micro_batch_metrics["actor_distill/valid_tokens"] = micro_mean_kd_kl_den.item()
+
+                    append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
-                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+                mini_batch_metrics = {"actor_distill/grad_norm": grad_norm.detach().item()}
+                append_to_dict(metrics, mini_batch_metrics)
 
         self.actor_optimizer.zero_grad()
         return metrics

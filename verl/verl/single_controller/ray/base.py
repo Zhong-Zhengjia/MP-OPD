@@ -24,6 +24,7 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, Place
 
 from verl.protocol import DataProto, _padding_size_key
 from verl.single_controller.base import ClassWithInitArgs, ResourcePool, Worker, WorkerGroup
+from verl.single_controller.base.decorator import get_predefined_dispatch_fn, get_predefined_execute_fn
 from verl.single_controller.base.decorator import MAGIC_ATTR, Dispatch
 from verl.utils.py_functional import temp_env_var
 
@@ -57,6 +58,48 @@ def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, block
 
     # use class type to pass the method_name to get a better observability
     return type(method_name, (Functor,), {})()
+
+
+class RayAsyncCollectHandle:
+    def __init__(self, worker_group, output_refs, collect_fn, padding_count=0):
+        self.worker_group = worker_group
+        self.output_refs = output_refs
+        self.collect_fn = collect_fn
+        self.padding_count = padding_count
+
+    def get(self):
+        output = ray.get(self.output_refs)
+        output = self.collect_fn(self.worker_group, output)
+
+        if self.padding_count > 0:
+            if isinstance(output, DataProto):
+                indices = [i for i in range(len(output))][:-self.padding_count]
+                output = output.select_idxs(indices)
+            elif isinstance(output, list):
+                output = output[:-self.padding_count]
+        return output
+
+    @staticmethod
+    def gather(handles):
+        return [h.get() for h in handles]
+
+
+def async_func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
+    class Functor:
+        def __call__(this, *args, **kwargs):
+            args, kwargs = dispatch_fn(self, *args, **kwargs)
+            padding_count = kwargs.pop(_padding_size_key, 0)
+            output_refs = execute_fn(method_name, *args, **kwargs)
+
+            # async version should never block here
+            return RayAsyncCollectHandle(
+                worker_group=self,
+                output_refs=output_refs,
+                collect_fn=collect_fn,
+                padding_count=padding_count,
+            )
+
+    return type(f"{method_name}_async", (Functor,), {})()
 
 
 def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[PlacementGroup]:
@@ -324,9 +367,59 @@ class RayWorkerGroup(WorkerGroup):
 
         if ray_cls_with_init is not None:
             self._bind_worker_method(self.ray_cls_with_init.cls, func_generator)
+            self._bind_worker_method_async(self.ray_cls_with_init.cls)
 
         self.wg_dict = None
         self.method_names = []
+
+    def _bind_worker_method_async(self, user_defined_cls):
+        method_names = []
+        for method_name in dir(user_defined_cls):
+            try:
+                method = getattr(user_defined_cls, method_name)
+                assert callable(method), f"{method_name} in {user_defined_cls} is not callable"
+            except Exception:
+                continue
+
+            if hasattr(method, MAGIC_ATTR):
+                attribute = getattr(method, MAGIC_ATTR)
+                assert isinstance(attribute, dict)
+                assert "dispatch_mode" in attribute
+
+                dispatch_mode = attribute["dispatch_mode"]
+                execute_mode = attribute["execute_mode"]
+
+                if isinstance(dispatch_mode, Dispatch):
+                    fn = get_predefined_dispatch_fn(dispatch_mode=dispatch_mode)
+                    dispatch_fn = fn["dispatch_fn"]
+                    collect_fn = fn["collect_fn"]
+                else:
+                    assert isinstance(dispatch_mode, dict)
+                    dispatch_fn = dispatch_mode["dispatch_fn"]
+                    collect_fn = dispatch_mode["collect_fn"]
+
+                execute_mode = get_predefined_execute_fn(execute_mode=execute_mode)
+                wg_execute_fn_name = execute_mode["execute_fn_name"]
+
+                execute_fn = getattr(self, wg_execute_fn_name)
+                assert callable(execute_fn)
+
+                async_func = async_func_generator(
+                    self,
+                    method_name,
+                    dispatch_fn=dispatch_fn,
+                    collect_fn=collect_fn,
+                    execute_fn=execute_fn,
+                    blocking=False,
+                )
+
+                try:
+                    setattr(self, f"{method_name}_async", async_func)
+                    method_names.append(f"{method_name}_async")
+                except Exception as e:
+                    raise ValueError(f"Fail to set async method_name {method_name}_async") from e
+
+        return method_names
 
     def _is_worker_alive(self, worker: ray.actor.ActorHandle):
         """Check if a worker actor is still alive.
