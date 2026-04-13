@@ -36,6 +36,8 @@ defaults:
   # Teacher rollout model config.
   - model@teacher_rollout.model: hf_model
 
+  - actor@teacher_rollout.actor: dp_actor
+
   # Teacher rollout engine config.
   - rollout@teacher_rollout.rollout: rollout
 

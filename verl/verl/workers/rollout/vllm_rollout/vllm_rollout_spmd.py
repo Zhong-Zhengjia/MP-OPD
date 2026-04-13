@@ -112,6 +112,25 @@ if is_version_ge(pkg="vllm", minver="0.7.3"):
     VLLMHijack.hijack()
 
 
+try:
+    from vllm.config import CompilationConfig, CompilationLevel
+    _HAS_COMPILATION_CONFIG = True
+except Exception:
+    _HAS_COMPILATION_CONFIG = False
+try:
+    from vllm.compilation import CompilationMode
+    _USE_COMPILATION_MODE = True
+except Exception:
+    _USE_COMPILATION_MODE = False
+try:
+    from vllm.lora.request import LoRARequest
+    from verl.protocol import TensorLoRARequest
+except Exception:
+    LoRARequest = None
+    TensorLoRARequest = None
+
+
+
 def _check_vllm_version_for_sleep_level():
     # https://github.com/vllm-project/vllm/issues/25171
     minver = "0.11.0"
@@ -120,7 +139,6 @@ def _check_vllm_version_for_sleep_level():
         logger.warning("Could not determine vLLM version, assuming an older version for sleep_level configuration.")
         return False
     return vs.parse(current_version) >= vs.parse(minver)
-
 
 class vLLMRollout(BaseRollout):
     def __init__(

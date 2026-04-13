@@ -324,6 +324,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
 
+        # print("[DEBUG] S tokenizer class:", type(self.tokenizer))
+        # print("[DEBUG] S processor class:", type(self.processor) if self.processor is not None else None)
+        # print("[DEBUG] S bos:", self.tokenizer.bos_token_id)
+        # print("[DEBUG] S eos:", self.tokenizer.eos_token_id)
+        # print("[DEBUG] S pad:", self.tokenizer.pad_token_id)
+        # print("[DEBUG] S unk:", self.tokenizer.unk_token_id)
+        # print("[DEBUG] S chat_template:", getattr(self.tokenizer, "chat_template", None))
+
         if self.config.model.get("custom_chat_template", None) is not None:
             if self.processor is not None:
                 self.processor.chat_template = self.config.model.custom_chat_template
@@ -353,6 +361,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
 
+        # print("[DEBUG] S gen eos:", getattr(self.generation_config, "eos_token_id", None))
+        # print("[DEBUG] S gen pad:", getattr(self.generation_config, "pad_token_id", None))
+        # print("[DEBUG] S gen bos:", getattr(self.generation_config, "bos_token_id", None))
+
         override_config_kwargs = {
             "bos_token_id": self.tokenizer.bos_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
@@ -361,7 +373,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         override_config_kwargs.update(override_model_config)
         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
-            print(f"Model config after override: {actor_model_config}")
+            print(f"[DEBUG] S Model config after override: {actor_model_config}")
 
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
         init_context = get_init_weight_context_manager(
@@ -971,6 +983,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Support all hardwares
         assert self._is_rollout
         prompts = prompts.to(get_device_id())
+
+        # ===============================
+        # input_ids = prompts.batch["input_ids"]
+        # print('[DEBUG] Student Prompts', self.tokenizer.decode(input_ids[0], skip_special_tokens=False))
 
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id

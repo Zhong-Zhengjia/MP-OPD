@@ -202,7 +202,11 @@ def main(cfg: dict):
             )
         )
 
+    print(prompt_texts[0])
+
     generations = llm.generate(prompt_texts, sampling_params=sampling_params)
+
+    print(generations[0])
 
     res_data = []
     for i in range(len(input_data)):
@@ -275,13 +279,13 @@ def main(cfg: dict):
 
 
 if __name__ == "__main__":
-    model_name = 'Qwen3-4B-Thinking'
+    model_name = 'Qwen3-1.7B'
     if 'thinking' in model_name.lower():
         enable_thinking = True
     else:
         enable_thinking = False
     dataset_name = 'MathTestTotal'
-    num_outputs = 64
+    num_outputs = 1
     print('='*30)
     print(model_name, enable_thinking, num_outputs)
     print('='*30)

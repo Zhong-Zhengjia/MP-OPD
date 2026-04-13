@@ -1512,6 +1512,19 @@ class RayPPOTrainer:
                     valid_response_length = attention_mask[prompt_length:].sum().item()
                     student_average_response_length += valid_response_length
                 print(f'[DEBUG] Student average response length: {student_average_response_length/student_batch_size}')
+
+                print('='*20, ' S DEBUG START ', '='*20)
+                i= 0
+                prompt_ids = student_batch.batch["prompts"][i]
+                prompt_length = prompt_ids.shape[0]
+                attention_mask = student_batch.batch["attention_mask"][i]
+                response_ids = student_batch.batch["responses"][i]
+                valid_response_length = attention_mask[prompt_length:].sum().item()
+                valid_response_ids = response_ids[:valid_response_length]
+                response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
+                print("response_text:")
+                print(repr(response_text))
+                print('='*20, ' S DEBUG END ', '='*20)
                 # =======================================
 
                 if "response_mask" not in student_batch.batch:
@@ -1578,6 +1591,19 @@ class RayPPOTrainer:
                     valid_response_length = attention_mask[prompt_length:].sum().item()
                     teacher_average_response_length += valid_response_length
                 print(f'[DEBUG] Teacher average response length: {teacher_average_response_length/teacher_batch_size}')
+
+                print('='*20, ' T DEBUG START ', '='*20)
+                i= 0
+                prompt_ids = teacher_batch.batch["prompts"][i]
+                prompt_length = prompt_ids.shape[0]
+                attention_mask = teacher_batch.batch["attention_mask"][i]
+                response_ids = teacher_batch.batch["responses"][i]
+                valid_response_length = attention_mask[prompt_length:].sum().item()
+                valid_response_ids = response_ids[:valid_response_length]
+                response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
+                print("response_text:")
+                print(repr(response_text))
+                print('='*20, ' T DEBUG END ', '='*20)
                 # =======================================
 
                 if "response_mask" not in teacher_batch.batch:
