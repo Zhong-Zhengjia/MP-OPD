@@ -102,7 +102,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.policy_loss.multi_teacher_distill=false \
     teacher_rollout.model.path=$teacher_model_path \
     teacher_rollout.model.use_remove_padding=true \
-    teacher_rollout.actor.optim.lr=1e-5 \
     teacher_rollout.actor.optim.lr_warmup_steps_ratio=0.0 \
     teacher_rollout.actor.ppo_mini_batch_size=8 \
     teacher_rollout.actor.ppo_micro_batch_size_per_gpu=1 \

@@ -1559,7 +1559,6 @@ class RayPPOTrainer:
                     student_average_response_length += valid_response_length
                 print(f'[DEBUG] Student average response length: {student_average_response_length/student_batch_size}')
 
-                print('='*20, ' S DEBUG START ', '='*20)
                 i= 0
                 prompt_ids = student_batch.batch["prompts"][i]
                 prompt_length = prompt_ids.shape[0]
@@ -1568,9 +1567,8 @@ class RayPPOTrainer:
                 valid_response_length = attention_mask[prompt_length:].sum().item()
                 valid_response_ids = response_ids[:valid_response_length]
                 response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
-                print("response_text:")
+                print("[DEBUG] Student response_text:")
                 print(repr(response_text))
-                print('='*20, ' S DEBUG END ', '='*20)
                 # =====================================
 
                 if "response_mask" not in student_batch.batch:
@@ -1589,8 +1587,7 @@ class RayPPOTrainer:
                     valid_response_length = attention_mask[prompt_length:].sum().item()
                     teacher_average_response_length += valid_response_length
                 print(f'[DEBUG] Teacher average response length: {teacher_average_response_length/teacher_batch_size}')
-                
-                print('='*20, ' T DEBUG START ', '='*20)
+
                 i= 0
                 prompt_ids = teacher_batch.batch["prompts"][i]
                 prompt_length = prompt_ids.shape[0]
@@ -1599,128 +1596,12 @@ class RayPPOTrainer:
                 valid_response_length = attention_mask[prompt_length:].sum().item()
                 valid_response_ids = response_ids[:valid_response_length]
                 response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
-                print("response_text:")
+                print("[DEBUG] Teacher response_text:")
                 print(repr(response_text))
-                print('='*20, ' T DEBUG END ', '='*20)
                 # =====================================
 
                 if "response_mask" not in teacher_batch.batch:
                     teacher_batch.batch["response_mask"] = compute_response_mask(teacher_batch)
-
-
-                # student_rollout_start = time.time()
-                # student_rollout_batch = self.actor_rollout_wg.generate_sequences(student_gen_batch)
-                # student_rollout_end = time.time()
-                # print(f'[DEBUG] Student rollout time cost: {student_rollout_end-student_rollout_start} s')
-                # student_batch = union_gen_and_rollout_batch(student_gen_batch, student_rollout_batch)
-
-                # # =====================================  
-                # student_average_response_length = 0 
-                # student_batch_size = len(student_batch.batch["prompts"])
-                # print(f'[DEBUG] Student rollout batch size: {student_batch_size}')
-                # for i in range(student_batch_size):
-                #     prompt_ids = student_batch.batch["prompts"][i]
-                #     prompt_length = prompt_ids.shape[0]
-                #     attention_mask = student_batch.batch["attention_mask"][i]
-                #     valid_response_length = attention_mask[prompt_length:].sum().item()
-                #     student_average_response_length += valid_response_length
-                # print(f'[DEBUG] Student average response length: {student_average_response_length/student_batch_size}')
-
-                # print('='*20, ' S DEBUG START ', '='*20)
-                # i= 0
-                # prompt_ids = student_batch.batch["prompts"][i]
-                # prompt_length = prompt_ids.shape[0]
-                # attention_mask = student_batch.batch["attention_mask"][i]
-                # response_ids = student_batch.batch["responses"][i]
-                # valid_response_length = attention_mask[prompt_length:].sum().item()
-                # valid_response_ids = response_ids[:valid_response_length]
-                # response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
-                # print("response_text:")
-                # print(repr(response_text))
-                # print('='*20, ' S DEBUG END ', '='*20)
-                # # =======================================
-
-                # if "response_mask" not in student_batch.batch:
-                #     student_batch.batch["response_mask"] = compute_response_mask(student_batch)
-
-                # # =========================
-                # # 2) teacher rollout
-                # # =========================
-                # teacher_gen_batch = self._repeat_base_batch_for_rollout_n(batch, self.teacher_rollout_n)
-                # if self._is_empty_dataproto(teacher_gen_batch):
-                #     metrics["hetero/skip_empty_teacher_gen_batch"] = 1
-
-                #     if (
-                #         self.val_reward_fn is not None
-                #         and self.config.trainer.test_freq > 0
-                #         and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                #     ):
-                #         val_metrics = self._validate()
-                #         if is_last_step:
-                #             last_val_metrics = val_metrics
-                #         metrics.update(val_metrics)
-
-                #     metrics.update(
-                #         {
-                #             "training/global_step": self.global_steps,
-                #             "training/epoch": epoch,
-                #         }
-                #     )
-                #     logger.log(data=metrics, step=self.global_steps)
-                #     progress_bar.update(1)
-                #     self.global_steps += 1
-
-                #     if is_last_step:
-                #         pprint(f"Final validation metrics: {last_val_metrics}")
-                #         progress_bar.close()
-                #         return
-                #     continue
-                # teacher_gen_batch.meta_info = {
-                #     "eos_token_id": self.tokenizer.eos_token_id,
-                #     "pad_token_id": self.tokenizer.pad_token_id,
-                #     "do_sample": True,
-                #     "validate": False,
-                #     "global_steps": self.global_steps,
-                # }
-
-                # assert self.teacher_rollout_wg is not None, "teacher_rollout_wg is not initialized"
-
-                # teacher_rollout_start = time.time()
-                # teacher_rollout_batch = self.teacher_rollout_wg.generate_sequences(teacher_gen_batch)
-                # teacher_rollout_end = time.time()
-                # print(f'[DEBUG] Teacher rollout time cost: {teacher_rollout_end-teacher_rollout_start} s')
-                
-                # teacher_batch = union_gen_and_rollout_batch(teacher_gen_batch, teacher_rollout_batch)
-
-
-                # # =====================================
-                # teacher_average_response_length = 0
-                # teacher_batch_size = len(teacher_batch.batch["prompts"])
-                # print(f'[DEBUG] Teacher rollout batch size: {teacher_batch_size}')
-                # for i in range(teacher_batch_size):
-                #     prompt_ids = teacher_batch.batch["prompts"][i]
-                #     prompt_length = prompt_ids.shape[0]
-                #     attention_mask = teacher_batch.batch["attention_mask"][i]
-                #     valid_response_length = attention_mask[prompt_length:].sum().item()
-                #     teacher_average_response_length += valid_response_length
-                # print(f'[DEBUG] Teacher average response length: {teacher_average_response_length/teacher_batch_size}')
-
-                # print('='*20, ' T DEBUG START ', '='*20)
-                # i= 0
-                # prompt_ids = teacher_batch.batch["prompts"][i]
-                # prompt_length = prompt_ids.shape[0]
-                # attention_mask = teacher_batch.batch["attention_mask"][i]
-                # response_ids = teacher_batch.batch["responses"][i]
-                # valid_response_length = attention_mask[prompt_length:].sum().item()
-                # valid_response_ids = response_ids[:valid_response_length]
-                # response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
-                # print("response_text:")
-                # print(repr(response_text))
-                # print('='*20, ' T DEBUG END ', '='*20)
-                # # =======================================
-
-                # if "response_mask" not in teacher_batch.batch:
-                #     teacher_batch.batch["response_mask"] = compute_response_mask(teacher_batch)
 
                 # =========================
                 # 3) reward / correctness

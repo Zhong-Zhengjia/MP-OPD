@@ -135,6 +135,17 @@ def get_vl_model_vision_tower(vl_model_instance):
     return None
 
 
+def reduce_metrics(metrics_dict):
+    metrics = {}
+    for key, val in metrics_dict.items():
+        if isinstance(val, list) and len(val) > 0 and all(isinstance(x, list) for x in val):
+            flat = [y for x in val for y in x]
+            metrics[key] = float(np.mean(flat)) if flat else 0.0
+        else:
+            metrics[key] = float(np.mean(val))
+    return metrics
+
+
 class ActorRolloutRefWorker(Worker, DistProfilerExtension): 
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -1058,7 +1069,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")
-
             with Timer(name="update_policy_distill", logger=None) as timer:
                 metrics = self.actor.update_policy_distill(
                     data=data,
@@ -1066,20 +1076,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     student_base_actor=self.student_base_policy,
                     tokenizer=self.tokenizer,
                 )
-
+            metrics = reduce_metrics(metrics)
             delta_time = timer.last
             metrics["perf/update_policy_distill_time"] = delta_time
             metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
-
             if self.actor_lr_scheduler is not None:
                 lr = self.actor_lr_scheduler.get_last_lr()[0]
                 metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
                 self.actor_lr_scheduler.step()
-
             output = DataProto(meta_info={"metrics": metrics})
             output = output.to("cpu")
+
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
