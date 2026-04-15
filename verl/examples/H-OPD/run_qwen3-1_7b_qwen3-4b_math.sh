@@ -7,7 +7,7 @@ export WANDB_MODE=online
 export USED_MODEL="no_api"
 
 
-test_files=/mnt/petrelfs/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/val_union_mini_100.parquet
+test_files=/mnt/petrelfs/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/val_union_mini_1000.parquet
 
 train_files=/mnt/petrelfs/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_union_passed_70.parquet
 

@@ -447,6 +447,7 @@ class DataParallelPPOActor(BasePPOActor):
 
     @GPUMemoryLogger(role="dp actor distill", logger=logger)
     def update_policy_distill(self, data: DataProto, teacher_actor, student_base_actor, tokenizer):
+        import torch
         import torch.distributed as dist
 
         self.actor_module.train()
@@ -473,13 +474,20 @@ class DataParallelPPOActor(BasePPOActor):
 
         sdft_weight = data.meta_info.get("sdft_weight", 1.0)
         icl_opd_weight = data.meta_info.get("icl_opd_weight", 1.0)
-
         distill_temperature = data.meta_info.get("distill_temperature", 1.0)
 
         loss_agg_mode = self.config.get("loss_agg_mode", "token-mean")
         entropy_coeff = self.config.get("entropy_coeff", 0.0)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
         temperature = data.meta_info.get("temperature", 1.0)
+
+        # ===== new configs =====
+        advantage_normalize = self.config.get("distill_advantage_normalize", True)
+        advantage_clip = self.config.get("distill_advantage_clip", 1.0)
+        anchor_coef = self.config.get("distill_anchor_coef", 0.5)
+        anchor_loss_type = self.config.get("distill_anchor_loss_type", "mse")
+        logprob_gap_clip = self.config.get("distill_logprob_gap_clip", None)
+        # =======================
 
         device = get_device_id()
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -542,6 +550,44 @@ class DataParallelPPOActor(BasePPOActor):
                 raise ValueError(f"{name} must be scalar, got {type(x)}")
             return float(x)
 
+        def normalize_and_clip_advantages(advantages: torch.Tensor, mask: torch.Tensor):
+            valid = mask > 0
+            if valid.any():
+                adv_valid = advantages[valid]
+                if logprob_gap_clip is not None:
+                    adv_valid = torch.clamp(adv_valid, min=-logprob_gap_clip, max=logprob_gap_clip)
+                    advantages = torch.clamp(advantages, min=-logprob_gap_clip, max=logprob_gap_clip)
+
+                if advantage_normalize:
+                    adv_mean = adv_valid.mean()
+                    adv_std = adv_valid.std(unbiased=False).clamp_min(1e-6)
+                    advantages = (advantages - adv_mean) / adv_std
+
+                if advantage_clip is not None:
+                    advantages = torch.clamp(advantages, min=-advantage_clip, max=advantage_clip)
+
+            return advantages
+
+        def compute_anchor_loss(actor_log_prob, base_log_prob, response_mask_local):
+            if anchor_coef == 0:
+                return actor_log_prob.sum() * 0.0
+
+            if anchor_loss_type == "mse":
+                anchor_mat = (actor_log_prob - base_log_prob.detach()) ** 2
+            elif anchor_loss_type == "kl_token":
+                # sampled-token surrogate, not true full-vocab KL
+                # keeps actor close to base on the sampled tokens
+                anchor_mat = torch.exp(base_log_prob.detach()) * (base_log_prob.detach() - actor_log_prob)
+            else:
+                raise ValueError(f"Unknown distill_anchor_loss_type: {anchor_loss_type}")
+
+            anchor_loss = agg_loss(
+                loss_mat=anchor_mat,
+                loss_mask=response_mask_local,
+                loss_agg_mode=loss_agg_mode,
+            )
+            return anchor_loss
+
         for _ in range(self.config.ppo_epochs):
             for mini_batch in mini_batches:
                 if self.config.use_dynamic_bsz:
@@ -568,6 +614,9 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                mini_batch_metrics_accum = {}
+                mini_batch_metric_count = 0
+                last_pg_loss = None
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(device)
@@ -589,7 +638,6 @@ class DataParallelPPOActor(BasePPOActor):
 
                     micro_total_loss = None
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
-                    last_pg_loss = None
 
                     for distill_type_name, local_indices, target_module, loss_weight in type_specs:
                         local_has_type = torch.tensor(
@@ -614,7 +662,7 @@ class DataParallelPPOActor(BasePPOActor):
                             calculate_entropy=calculate_entropy,
                         )
 
-                        base_entropy, base_log_prob = forward_target_module(
+                        _, base_log_prob = forward_target_module(
                             student_base_actor.actor_module,
                             actor_sub_batch,
                             target_temperature=distill_temperature,
@@ -661,12 +709,6 @@ class DataParallelPPOActor(BasePPOActor):
                         target_log_prob = target_log_prob[:, :resp_len]
                         response_mask_local = response_mask[:, :resp_len] * target_response_mask[:, :resp_len]
 
-                        # =========================
-                        print('[DEBUG] actor log prob: ', actor_log_prob[0, :5])
-                        print('[DEBUG] base log prob: ', base_log_prob[0, :5])
-                        print('[DEBGU] target log prob: ', target_log_prob[0, :5])
-                        # =========================
-
                         if actor_entropy is not None:
                             actor_entropy = actor_entropy[:, :resp_len]
 
@@ -685,9 +727,11 @@ class DataParallelPPOActor(BasePPOActor):
                                 "actor/pg_clipfrac_lower": 0.0,
                             }
                             pg_loss = type_loss
+                            anchor_loss = type_loss
                         else:
                             old_log_prob = base_log_prob.detach()
-                            advantages = (target_log_prob.detach() - base_log_prob.detach())
+                            advantages = target_log_prob.detach() - base_log_prob.detach()
+                            advantages = normalize_and_clip_advantages(advantages, response_mask_local)
 
                             pg_loss, pg_metrics = policy_loss_fn(
                                 old_log_prob=old_log_prob,
@@ -699,7 +743,13 @@ class DataParallelPPOActor(BasePPOActor):
                                 rollout_is_weights=None,
                             )
 
-                            type_loss = pg_loss
+                            anchor_loss = compute_anchor_loss(
+                                actor_log_prob=actor_log_prob,
+                                base_log_prob=base_log_prob,
+                                response_mask_local=response_mask_local,
+                            )
+
+                            type_loss = pg_loss + anchor_coef * anchor_loss
 
                             if entropy_coeff != 0:
                                 entropy_loss = agg_loss(
@@ -723,8 +773,14 @@ class DataParallelPPOActor(BasePPOActor):
                             micro_batch_metrics[f"actor/{distill_type_name}_pg_loss"] = (
                                 pg_loss.detach().item() * loss_weight * loss_scale_factor
                             )
+                            micro_batch_metrics[f"actor/{distill_type_name}_anchor_loss"] = (
+                                anchor_loss.detach().item() * loss_weight * loss_scale_factor
+                            )
                             micro_batch_metrics[f"actor/{distill_type_name}_adv_mean"] = (
                                 ((advantages * response_mask_local).sum() / response_mask_local.sum()).detach().item()
+                            )
+                            micro_batch_metrics[f"actor/{distill_type_name}_adv_abs_mean"] = (
+                                ((advantages.abs() * response_mask_local).sum() / response_mask_local.sum()).detach().item()
                             )
                             last_pg_loss = pg_loss
 
@@ -744,8 +800,18 @@ class DataParallelPPOActor(BasePPOActor):
                     }
                     append_to_dict(metrics, sanitized_micro_batch_metrics)
 
-                    grad_norm = self._optimizer_step()
-                    append_to_dict(metrics, {"actor/grad_norm": _to_scalar(grad_norm, "actor/grad_norm")})
+                    for k, v in sanitized_micro_batch_metrics.items():
+                        mini_batch_metrics_accum[k] = mini_batch_metrics_accum.get(k, 0.0) + v
+                    mini_batch_metric_count += 1
+
+                # ===== moved optimizer step outside micro-batch loop =====
+                grad_norm = self._optimizer_step()
+                append_to_dict(metrics, {"actor/grad_norm": _to_scalar(grad_norm, "actor/grad_norm")})
+
+                if mini_batch_metric_count > 0:
+                    avg_grad_norm = _to_scalar(grad_norm, "actor/grad_norm")
+                    _ = avg_grad_norm  # keep for symmetry/debug if needed
+                # ========================================================
 
         self.actor_optimizer.zero_grad()
         return metrics
