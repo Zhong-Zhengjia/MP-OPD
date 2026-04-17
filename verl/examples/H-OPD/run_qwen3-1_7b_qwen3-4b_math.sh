@@ -21,7 +21,7 @@ student_model_path="/mnt/petrelfs/fudaocheng/checkpoints/huggingface/Qwen3-${stu
 teacher_model_path="/mnt/petrelfs/fudaocheng/checkpoints/huggingface/Qwen3-${teacher_model_subfix}"
 
 today=$(date +%Y%m%d)
-output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${ability}-default-params-actor-loss-actor-clip"
+output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${ability}-GOPD-loss-sdft-only"
 method=HOPD
 output_path="/mnt/petrelfs/fudaocheng/checkpoints/trained/${output_model_name}_${method}_${today}"
 
@@ -51,7 +51,7 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.use_sdft=true \
     +algorithm.hetero_distill.use_icl_opd=true \
     +algorithm.hetero_distill.sdft_weight=1.0 \
-    +algorithm.hetero_distill.icl_opd_weight=1.0 \
+    +algorithm.hetero_distill.icl_opd_weight=0.0 \
     +algorithm.hetero_distill.sample_demo_strategy=random \
     data.train_files=$train_files \
     data.val_files=$test_files \
@@ -129,13 +129,14 @@ python3 -m verl.trainer.main_ppo \
     algorithm.rollout_correction.bypass_mode=false \
     reward_model.reward_manager=naive \
     trainer.critic_warmup=0 \
-    trainer.val_before_train=false \
+    trainer.val_before_train=true \
     trainer.logger='["console","wandb"]' \
     trainer.log_val_generations=10 \
     trainer.project_name='heterogeneous-distillation' \
     trainer.experiment_name="${output_model_name}_${method}_${today}" \
     trainer.n_gpus_per_node=$n_gpu \
     trainer.nnodes=1 \
+    +trainer.critic_icl_opd=true \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.max_critic_ckpt_to_keep=1 \
     trainer.save_freq=10 \

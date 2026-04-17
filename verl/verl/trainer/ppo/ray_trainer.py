@@ -1154,18 +1154,9 @@ class RayPPOTrainer:
         student_reward_tensor: torch.Tensor,
         teacher_reward_tensor: torch.Tensor,
     ) -> DataProto:
-        """
-        Build heterogeneous distillation training batch.
-
-        Output samples are all student wrong trajectories, each paired with either:
-        - sdft: a correct student trajectory as demonstration
-        - icl_opd: a correct teacher trajectory as demonstration
-
-        If both student and teacher are all correct or all wrong for one prompt, skip that prompt.
-        """
         import numpy as np
         import torch
-        from collections import defaultdict
+        import uuid
 
         if base_batch is None or student_batch is None or teacher_batch is None:
             return None
@@ -1173,9 +1164,13 @@ class RayPPOTrainer:
             return None
         if "responses" not in student_batch.batch or "responses" not in teacher_batch.batch:
             return None
+        if "input_ids" not in student_batch.batch:
+            return None
         if base_batch.batch["input_ids"].shape[0] == 0:
             return None
         if student_batch.batch["responses"].shape[0] == 0 or teacher_batch.batch["responses"].shape[0] == 0:
+            return None
+        if student_batch.batch["input_ids"].shape[0] == 0:
             return None
         if student_reward_tensor is None or teacher_reward_tensor is None:
             return None
@@ -1203,21 +1198,28 @@ class RayPPOTrainer:
             return None
         if teacher_batch.batch["responses"].shape[0] != expected_teacher:
             return None
+        if student_batch.batch["input_ids"].shape[0] != expected_student:
+            return None
+
+        # Optional tensor fields in student_batch
+        has_student_attention_mask = "attention_mask" in student_batch.batch
+        has_student_position_ids = "position_ids" in student_batch.batch
+        has_student_response_mask = "response_mask" in student_batch.batch
 
         student_resp_texts = self._extract_response_texts_from_batch(student_batch)
         teacher_resp_texts = self._extract_response_texts_from_batch(teacher_batch)
 
-        # prompt texts
         prompt_texts = [
             self.tokenizer.decode(ids, skip_special_tokens=True)
             for ids in base_batch.batch["input_ids"]
         ]
 
-        # fallback uid
         if "uid" in base_batch.non_tensor_batch:
             uids = list(base_batch.non_tensor_batch["uid"])
         else:
             uids = [str(uuid.uuid4()) for _ in range(base_bs)]
+
+        critic_icl_opd = getattr(self.config.trainer, "critic_icl_opd", False)
 
         tensor_input_ids = []
         tensor_attention_mask = []
@@ -1239,6 +1241,54 @@ class RayPPOTrainer:
                 return items[idx]
             return items[0]
 
+        def build_wrong_trajectory_from_student(j):
+            """
+            Directly reuse student wrong trajectory tensors from student_batch.
+            Assumes student_batch.batch["input_ids"] already contains full prompt + response token ids.
+            """
+            input_ids = student_batch.batch["input_ids"][j]
+
+            if has_student_attention_mask:
+                attention_mask = student_batch.batch["attention_mask"][j]
+            else:
+                attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+
+            if has_student_position_ids:
+                position_ids = student_batch.batch["position_ids"][j]
+            else:
+                position_ids = torch.arange(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
+
+            responses = student_batch.batch["responses"][j]
+
+            if has_student_response_mask:
+                response_mask = student_batch.batch["response_mask"][j]
+            else:
+                response_mask = torch.ones_like(responses, dtype=torch.long)
+
+            if response_mask.numel() == 0 or response_mask.sum().item() == 0:
+                return None
+
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "responses": responses,
+                "response_mask": response_mask,
+            }
+
+        def append_sample(encoded_item, distill_type, demo_text, wrong_text, prompt_text, uid):
+            tensor_input_ids.append(encoded_item["input_ids"])
+            tensor_attention_mask.append(encoded_item["attention_mask"])
+            tensor_position_ids.append(encoded_item["position_ids"])
+            tensor_responses.append(encoded_item["responses"])
+            tensor_response_mask.append(encoded_item["response_mask"])
+
+            non_tensor_distill_type.append(distill_type)
+            non_tensor_demo_text.append(demo_text)
+            non_tensor_wrong_response_text.append(wrong_text)
+            non_tensor_prompt_text.append(prompt_text)
+            non_tensor_uid.append(uid)
+
         for i in range(base_bs):
             s_l = i * student_n
             s_r = (i + 1) * student_n
@@ -1255,11 +1305,9 @@ class RayPPOTrainer:
                 teacher_resp_texts[j] for j in range(t_l, t_r) if bool(teacher_correct[j].item())
             ]
 
-            # skip if both all correct or both all wrong
             student_has_correct = len(student_correct_texts) > 0
             student_has_wrong = len(student_wrong_items) > 0
             teacher_has_correct = len(teacher_correct_texts) > 0
-            teacher_has_wrong = (t_r - t_l - len(teacher_correct_texts)) > 0
 
             # 1) student 全对：跳过
             if not student_has_wrong:
@@ -1272,86 +1320,54 @@ class RayPPOTrainer:
             prompt_text = prompt_texts[i]
             uid = uids[i]
 
+            # Directly build all wrong student trajectories once, then reuse for sdft / icl_opd
+            encoded_wrong_items = []
+            for j, wrong_text in student_wrong_items:
+                encoded_item = build_wrong_trajectory_from_student(j)
+                if encoded_item is None:
+                    continue
+                encoded_wrong_items.append((wrong_text, encoded_item))
+
+            if len(encoded_wrong_items) == 0:
+                continue
+
             # SDFT samples: use student correct demonstration on student wrong trajectories
             if self.use_sdft and len(student_correct_texts) > 0:
                 demo_text = choose_one(student_correct_texts)
-                for _, wrong_text in student_wrong_items:
-                    full_text = prompt_text + wrong_text
-                    encoded_full = self.tokenizer(
-                        full_text,
-                        return_tensors="pt",
-                        add_special_tokens=False,
+                for wrong_text, encoded_item in encoded_wrong_items:
+                    append_sample(
+                        encoded_item=encoded_item,
+                        distill_type="sdft",
+                        demo_text=demo_text,
+                        wrong_text=wrong_text,
+                        prompt_text=prompt_text,
+                        uid=uid,
                     )
-                    encoded_prompt = self.tokenizer(
-                        prompt_text,
-                        return_tensors="pt",
-                        add_special_tokens=False,
-                    )
-
-                    input_ids = encoded_full["input_ids"][0]
-                    attention_mask = encoded_full["attention_mask"][0]
-                    prompt_len = encoded_prompt["input_ids"].shape[-1]
-                    response_ids = input_ids[prompt_len:]
-                    if response_ids.numel() == 0:
-                        continue
-
-                    response_mask = torch.ones_like(response_ids, dtype=torch.long)
-                    position_ids = torch.arange(input_ids.shape[0], dtype=torch.long)
-
-                    tensor_input_ids.append(input_ids)
-                    tensor_attention_mask.append(attention_mask)
-                    tensor_position_ids.append(position_ids)
-                    tensor_responses.append(response_ids)
-                    tensor_response_mask.append(response_mask)
-
-                    non_tensor_distill_type.append("sdft")
-                    non_tensor_demo_text.append(demo_text)
-                    non_tensor_wrong_response_text.append(wrong_text)
-                    non_tensor_prompt_text.append(prompt_text)
-                    non_tensor_uid.append(uid)
 
             # ICL-OPD samples: use teacher correct demonstration on student wrong trajectories
+            # If critic_icl_opd=True, teacher only guides when student is all wrong.
+            allow_teacher_guide = False
             if self.use_icl_opd and len(teacher_correct_texts) > 0:
+                if critic_icl_opd:
+                    allow_teacher_guide = not student_has_correct
+                else:
+                    allow_teacher_guide = True
+
+            if allow_teacher_guide:
                 demo_text = choose_one(teacher_correct_texts)
-                for _, wrong_text in student_wrong_items:
-                    full_text = prompt_text + wrong_text
-                    encoded_full = self.tokenizer(
-                        full_text,
-                        return_tensors="pt",
-                        add_special_tokens=False,
+                for wrong_text, encoded_item in encoded_wrong_items:
+                    append_sample(
+                        encoded_item=encoded_item,
+                        distill_type="icl_opd",
+                        demo_text=demo_text,
+                        wrong_text=wrong_text,
+                        prompt_text=prompt_text,
+                        uid=uid,
                     )
-                    encoded_prompt = self.tokenizer(
-                        prompt_text,
-                        return_tensors="pt",
-                        add_special_tokens=False,
-                    )
-
-                    input_ids = encoded_full["input_ids"][0]
-                    attention_mask = encoded_full["attention_mask"][0]
-                    prompt_len = encoded_prompt["input_ids"].shape[-1]
-                    response_ids = input_ids[prompt_len:]
-                    if response_ids.numel() == 0:
-                        continue
-
-                    response_mask = torch.ones_like(response_ids, dtype=torch.long)
-                    position_ids = torch.arange(input_ids.shape[0], dtype=torch.long)
-
-                    tensor_input_ids.append(input_ids)
-                    tensor_attention_mask.append(attention_mask)
-                    tensor_position_ids.append(position_ids)
-                    tensor_responses.append(response_ids)
-                    tensor_response_mask.append(response_mask)
-
-                    non_tensor_distill_type.append("icl_opd")
-                    non_tensor_demo_text.append(demo_text)
-                    non_tensor_wrong_response_text.append(wrong_text)
-                    non_tensor_prompt_text.append(prompt_text)
-                    non_tensor_uid.append(uid)
 
         if len(tensor_input_ids) == 0:
             return None
 
-        # pad tensors
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         max_input_len = max(x.shape[0] for x in tensor_input_ids)
         max_resp_len = max(x.shape[0] for x in tensor_responses)
@@ -1359,7 +1375,7 @@ class RayPPOTrainer:
         def pad_1d(x, max_len, pad_value=0):
             if x.shape[0] == max_len:
                 return x
-            pad = torch.full((max_len - x.shape[0],), pad_value, dtype=x.dtype)
+            pad = torch.full((max_len - x.shape[0],), pad_value, dtype=x.dtype, device=x.device)
             return torch.cat([x, pad], dim=0)
 
         input_ids = torch.stack([pad_1d(x, max_input_len, pad_id) for x in tensor_input_ids], dim=0)
@@ -1387,6 +1403,7 @@ class RayPPOTrainer:
                 "distill_mode": "heterogeneous_distill",
                 "sdft_weight": self.sdft_weight,
                 "icl_opd_weight": self.icl_opd_weight,
+                "critic_icl_opd": critic_icl_opd,
             },
         )
 
