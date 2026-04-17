@@ -62,6 +62,7 @@ from verl.utils.device import (
     get_torch_device,
     set_expandable_segments,
 )
+import verl.utils.hdfs_io as hdfs_io
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.fsdp_utils import (
@@ -1112,49 +1113,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="red", role="actor_update")
-    def update_actor(self, data: DataProto):
-        assert self._is_actor
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
-
-        with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
-
-            # perform training
-            with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
-            delta_time = timer.last
-            global_num_tokens = data.meta_info["global_token_num"]
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/actor"] = (
-                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
-            )
-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
-
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
-            self.actor_lr_scheduler.step()
-
-            # TODO: here, we should return all metrics
-            output = DataProto(meta_info={"metrics": metrics})
-
-            output = output.to("cpu")
-
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
-
-        return output
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
@@ -1314,82 +1272,148 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         """Check if base models are available for corrected reward computation."""
         return self._has_base_model and self._has_base_ref_model
 
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="actor_update")
+    def update_actor(self, data: DataProto):
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
+
+            # perform training
+            with Timer(name="update_policy", logger=None) as timer:
+                metrics = self.actor.update_policy(data=data)
+            delta_time = timer.last
+            global_num_tokens = data.meta_info["global_token_num"]
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics["perf/mfu/actor"] = (
+                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            )
+            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+
+            lr = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+            self.actor_lr_scheduler.step()
+
+            # TODO: here, we should return all metrics
+            output = DataProto(meta_info={"metrics": metrics})
+
+            output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+
+        return output
+
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
-        from verl.utils.logger import log_with_rank
-
-        # only support save and load ckpt for actor
         assert self._is_actor
 
+        import os
+        import torch.distributed as dist
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+        from transformers import (
+            AutoConfig,
+            AutoModel,
+            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
+            AutoModelForVision2Seq,
+        )
+
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        self.checkpoint_manager.save_checkpoint(
-            local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
-        )
-        dist.barrier()
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT, cfg):
+            state_dict = self.actor_module_fsdp.state_dict()
 
-        if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
-            lora_save_path = os.path.join(local_path, "lora_adapter")
-            peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
-            peft_config = {}
-            if dist.get_rank() == 0:
-                os.makedirs(lora_save_path, exist_ok=True)
-                peft_config = asdict(peft_model.peft_config.get("default", {}))
-                peft_config["task_type"] = peft_config["task_type"].value
-                peft_config["peft_type"] = peft_config["peft_type"].value
-                peft_config["target_modules"] = list(peft_config["target_modules"])
-            try:
-                if fsdp_version(self.actor_module_fsdp) > 0:
-                    self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
-                    lora_params = layered_summon_lora_params(self.actor_module_fsdp)
-                    if dist.get_rank() == 0:
-                        save_file(lora_params, os.path.join(lora_save_path, "adapter_model.safetensors"))
-                        with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding="utf-8") as f:
-                            json.dump(peft_config, f, ensure_ascii=False, indent=4)
-            except Exception as e:
-                log_with_rank(
-                    f"Save LoRA Adapter Error ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
-                )
+        if self.rank == 0:
+            print(f"Saving actor checkpoint to HF format: {local_path}")
+            os.makedirs(local_path, exist_ok=True)
 
-            dist.barrier()
-            log_with_rank(
-                f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_save_path}",
-                rank=dist.get_rank(),
-                logger=logger,
-                log_only_rank_0=True,
+            model_path = self.config.model.path
+            trust_remote_code = self.config.model.get("trust_remote_code", False)
+            attn_implementation = self.config.model.get("override_config", {}).get("attn_implementation", "flash_attention_2")
+
+            model_config = AutoConfig.from_pretrained(
+                model_path,
+                trust_remote_code=trust_remote_code,
+                attn_implementation=attn_implementation,
             )
 
+            has_remote_code = hasattr(model_config, "auto_map") and any(
+                model_config.architectures[0] in val for val in model_config.auto_map.values()
+            )
+
+            if has_remote_code:
+                auto_class = next(k for k, v in model_config.auto_map.items() if model_config.architectures[0] in v)
+                match auto_class:
+                    case "AutoModelForVision2Seq":
+                        model_class = AutoModelForVision2Seq
+                    case "AutoModelForCausalLM":
+                        model_class = AutoModelForCausalLM
+                    case "AutoModelForImageTextToText":
+                        model_class = AutoModelForImageTextToText
+                    case _:
+                        model_class = AutoModel
+            else:
+                if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
+                    model_class = AutoModelForVision2Seq
+                elif type(model_config) in AutoModelForCausalLM._model_mapping.keys():
+                    model_class = AutoModelForCausalLM
+                elif type(model_config) in AutoModelForImageTextToText._model_mapping.keys():
+                    model_class = AutoModelForImageTextToText
+                else:
+                    model_class = AutoModel
+
+            save_model = model_class.from_config(
+                model_config,
+                trust_remote_code=trust_remote_code,
+            ).cpu()
+
+            missing, unexpected = save_model.load_state_dict(state_dict, strict=False)
+            print(f"[INFO] missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
+
+            if hasattr(save_model, "peft_config"):
+                try:
+                    save_model = save_model.merge_and_unload()
+                    print("[INFO] LoRA merged before saving.")
+                except Exception as e:
+                    print(f"[WARN] merge_and_unload failed: {e}")
+
+            save_model.save_pretrained(local_path, safe_serialization=True)
+
+            if self.processor is not None:
+                self.processor.save_pretrained(local_path)
+            if self.tokenizer is not None:
+                self.tokenizer.save_pretrained(local_path)
+            if getattr(self, "generation_config", None) is not None:
+                try:
+                    self.generation_config.save_pretrained(local_path)
+                except Exception as e:
+                    print(f"[WARN] save generation config failed: {e}")
+
+            if hdfs_path is not None:
+                hdfs_io.makedirs(hdfs_path, exist_ok=True)
+                hdfs_io.copy(src=local_path, dst=hdfs_path)
+
+        dist.barrier()
+
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
-        assert self._is_actor or (not self._is_actor and self._is_rollout), (
-            f"Checkpoint loading is only supported for Actor or standalone Rollout Workers, but got "
-            f"{self._is_actor} and {self._is_rollout}"
-        )
-
-        # No checkpoint to load, just offload the model and optimizer to CPU
-        if local_path is None:
-            if self._is_offload_param:
-                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            if self._is_offload_optimizer:
-                offload_fsdp_optimizer(self.actor_optimizer)
-            return
-
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-
-        self.checkpoint_manager.load_checkpoint(
-            local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
-        )
-
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(self.actor_optimizer)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def start_profile(self, **kwargs) -> None:

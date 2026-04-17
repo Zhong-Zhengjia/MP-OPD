@@ -482,11 +482,11 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info.get("temperature", 1.0)
 
         # ===== new configs =====
-        advantage_normalize = self.config.get("distill_advantage_normalize", True)
-        advantage_clip = self.config.get("distill_advantage_clip", 1.0)
-        anchor_coef = self.config.get("distill_anchor_coef", 0.5)
+        advantage_normalize = self.config.get("distill_advantage_normalize", True) 
+        advantage_clip = self.config.get("distill_advantage_clip", 2.0)
+        anchor_coef = self.config.get("distill_anchor_coef", 0.05)  
         anchor_loss_type = self.config.get("distill_anchor_loss_type", "mse")
-        logprob_gap_clip = self.config.get("distill_logprob_gap_clip", None)
+        logprob_gap_clip = self.config.get("distill_logprob_gap_clip", None) 
         # =======================
 
         device = get_device_id()
@@ -730,7 +730,8 @@ class DataParallelPPOActor(BasePPOActor):
                             anchor_loss = type_loss
                         else:
                             old_log_prob = base_log_prob.detach()
-                            advantages = target_log_prob.detach() - base_log_prob.detach()
+                            # advantages = target_log_prob.detach() - base_log_prob.detach()
+                            advantages = target_log_prob.detach() - actor_log_prob.detach()
                             advantages = normalize_and_clip_advantages(advantages, response_mask_local)
 
                             pg_loss, pg_metrics = policy_loss_fn(

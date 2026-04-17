@@ -924,125 +924,132 @@ class RayPPOTrainer:
                 config=self.config, worker_group=self.actor_rollout_wg, rm_wg=self.rm_wg
             )
 
-    def _save_checkpoint(self):
+    def _get_best_metric_name(self):
+        metric_name = self.config.trainer.get("best_metric_name", None)
+        assert metric_name is not None, (
+            "trainer.best_metric_name must be set, "
+            "e.g. val-core/gsm8k/acc/mean@1"
+        )
+        return metric_name
+
+
+    def _get_best_metric_mode(self):
+        mode = self.config.trainer.get("best_metric_mode", "max")
+        assert mode in ["max", "min"], "trainer.best_metric_mode must be 'max' or 'min'"
+        return mode
+
+
+    def _is_better_metric(self, current, best):
+        if best is None:
+            return True
+        mode = self._get_best_metric_mode()
+        if mode == "max":
+            return current > best
+        return current < best
+
+    def _save_checkpoint(self, metrics=None):
+        import os
+        import shutil
+        import torch
         from verl.utils.fs import local_mkdir_safe
 
-        # path: given_path + `/global_step_{global_steps}` + `/actor`
-        local_global_step_folder = os.path.join(
-            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
+        base_dir = self.config.trainer.default_local_dir
+        if not os.path.isabs(base_dir):
+            base_dir = os.path.join(os.getcwd(), base_dir)
+        local_mkdir_safe(base_dir)
+
+        best_metric_name = self._get_best_metric_name()
+
+        if not hasattr(self, "_best_valid_metric"):
+            self._best_valid_metric = None
+        if not hasattr(self, "_best_valid_step"):
+            self._best_valid_step = None
+
+        current_metric = None
+        is_best = False
+
+        if metrics is not None and best_metric_name in metrics:
+            current_metric = float(metrics[best_metric_name])
+            is_best = self._is_better_metric(current_metric, self._best_valid_metric)
+        else:
+            print(
+                f"Warning: best metric '{best_metric_name}' not found in metrics. "
+                f"Will save as last checkpoint."
+            )
+
+        ckpt_name = "best_valid" if is_best else "last"
+        local_ckpt_folder = os.path.join(base_dir, ckpt_name)
+
+        print(
+            f"Saving checkpoint to {local_ckpt_folder}, "
+            f"global_step={self.global_steps}, is_best={is_best}, "
+            f"{best_metric_name}={current_metric}"
         )
 
-        print(f"local_global_step_folder: {local_global_step_folder}")
-        actor_local_path = os.path.join(local_global_step_folder, "actor")
+        # 清掉旧目录，只保留一个 best_valid 和一个 last
+        if os.path.exists(local_ckpt_folder):
+            shutil.rmtree(local_ckpt_folder)
+        local_mkdir_safe(local_ckpt_folder)
 
+        # actor
+        actor_local_path = os.path.join(local_ckpt_folder, "actor")
         actor_remote_path = (
             None
             if self.config.trainer.default_hdfs_dir is None
-            else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
+            else os.path.join(self.config.trainer.default_hdfs_dir, ckpt_name, "actor")
         )
-
-        remove_previous_ckpt_in_save = self.config.trainer.get("remove_previous_ckpt_in_save", False)
-        if remove_previous_ckpt_in_save:
-            print(
-                "Warning: remove_previous_ckpt_in_save is deprecated,"
-                + " set max_actor_ckpt_to_keep=1 and max_critic_ckpt_to_keep=1 instead"
-            )
-        max_actor_ckpt_to_keep = (
-            self.config.trainer.get("max_actor_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
-        )
-        max_critic_ckpt_to_keep = (
-            self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
-        )
-
         self.actor_rollout_wg.save_checkpoint(
-            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+            actor_local_path,
+            actor_remote_path,
+            self.global_steps,
+            max_ckpt_to_keep=1,
         )
 
+        # critic
         if self.use_critic:
-            critic_local_path = os.path.join(local_global_step_folder, str(Role.Critic))
+            critic_local_path = os.path.join(local_ckpt_folder, str(Role.Critic))
             critic_remote_path = (
                 None
                 if self.config.trainer.default_hdfs_dir is None
-                else os.path.join(
-                    self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", str(Role.Critic)
-                )
+                else os.path.join(self.config.trainer.default_hdfs_dir, ckpt_name, str(Role.Critic))
             )
             self.critic_wg.save_checkpoint(
-                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+                critic_local_path,
+                critic_remote_path,
+                self.global_steps,
+                max_ckpt_to_keep=1,
             )
 
-        # save dataloader
-        local_mkdir_safe(local_global_step_folder)
-        dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
+        # dataloader state
+        dataloader_local_path = os.path.join(local_ckpt_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
-        # latest checkpointed iteration tracker (for atomic usage)
-        local_latest_checkpointed_iteration = os.path.join(
-            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
-        )
+        meta = {
+            "global_steps": int(self.global_steps),
+            "is_best": bool(is_best),
+            "metric_name": best_metric_name,
+            "metric_value": current_metric,
+        }
+        torch.save(meta, os.path.join(local_ckpt_folder, "meta.pt"))
+
+        local_latest_checkpointed_iteration = os.path.join(base_dir, "latest_checkpointed_iteration.txt")
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
+        if is_best:
+            self._best_valid_metric = current_metric
+            self._best_valid_step = int(self.global_steps)
 
-    def _load_checkpoint(self):
-        if self.config.trainer.resume_mode == "disable":
-            # NOTE: while there is no checkpoint to load, we still need to offload the model and optimizer to CPU
-            self.actor_rollout_wg.load_checkpoint(None)
-            return 0
+            best_ckpt_txt = os.path.join(base_dir, "best_checkpoint.txt")
+            with open(best_ckpt_txt, "w") as f:
+                f.write(str(self.global_steps))
 
-        # load from hdfs
-        if self.config.trainer.default_hdfs_dir is not None:
-            raise NotImplementedError("load from hdfs is not implemented yet")
-        else:
-            checkpoint_folder = self.config.trainer.default_local_dir  # TODO: check path
-            if not os.path.isabs(checkpoint_folder):
-                working_dir = os.getcwd()
-                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
-
-        # find global_step_folder
-        if self.config.trainer.resume_mode == "auto":
-            if global_step_folder is None:
-                print("Training from scratch")
-                self.actor_rollout_wg.load_checkpoint(None)
-                return 0
-        else:
-            if self.config.trainer.resume_mode == "resume_path":
-                assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
-                assert "global_step_" in self.config.trainer.resume_from_path, (
-                    "resume ckpt must specify the global_steps"
-                )
-                global_step_folder = self.config.trainer.resume_from_path
-                if not os.path.isabs(global_step_folder):
-                    working_dir = os.getcwd()
-                    global_step_folder = os.path.join(working_dir, global_step_folder)
-        print(f"Load from checkpoint folder: {global_step_folder}")
-        # set global step
-        self.global_steps = int(global_step_folder.split("global_step_")[-1])
-
-        print(f"Setting global step to {self.global_steps}")
-        print(f"Resuming from {global_step_folder}")
-
-        actor_path = os.path.join(global_step_folder, "actor")
-        critic_path = os.path.join(global_step_folder, str(Role.Critic))
-        # load actor
-        self.actor_rollout_wg.load_checkpoint(
-            actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
-        )
-        # load critic
-        if self.use_critic:
-            self.critic_wg.load_checkpoint(
-                critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+            print(
+                f"Updated BEST checkpoint: "
+                f"step={self.global_steps}, {best_metric_name}={current_metric}"
             )
-
-        # load dataloader,
-        # TODO: from remote not implemented yet
-        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
-        if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
-            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+            print(f"Updated LAST checkpoint: step={self.global_steps}")
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1410,7 +1417,7 @@ class RayPPOTrainer:
         self.global_steps = 0
 
         # load checkpoint first
-        self._load_checkpoint()
+        # self._load_checkpoint()
 
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
@@ -1679,7 +1686,7 @@ class RayPPOTrainer:
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
                 ):
-                    self._save_checkpoint()
+                    self._save_checkpoint(metrics=metrics)
 
                 metrics.update(
                     {

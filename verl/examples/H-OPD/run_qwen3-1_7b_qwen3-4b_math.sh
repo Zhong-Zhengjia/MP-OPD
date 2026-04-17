@@ -20,10 +20,10 @@ ability=Math
 student_model_path="/mnt/petrelfs/fudaocheng/checkpoints/huggingface/Qwen3-${student_model_subfix}"
 teacher_model_path="/mnt/petrelfs/fudaocheng/checkpoints/huggingface/Qwen3-${teacher_model_subfix}"
 
-
-output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${ability}"
+today=$(date +%Y%m%d)
+output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${ability}-default-params-actor-loss-actor-clip"
 method=HOPD
-output_path="/mnt/petrelfs/fudaocheng/checkpoints/trained/${output_model_name}_${method}"
+output_path="/mnt/petrelfs/fudaocheng/checkpoints/trained/${output_model_name}_${method}_${today}"
 
 n_gpu=8
 lr=1e-6
@@ -43,9 +43,6 @@ unset RAY_PORT
 export RAY_TMPDIR=/tmp/ray_${USER}_${SLURM_JOB_ID}
 mkdir -p "${RAY_TMPDIR}"
 
-# export NCCL_DEBUG=INFO
-# export NCCL_ASYNC_ERROR_HANDLING=1
-# export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
 
 python3 -m verl.trainer.main_ppo \
     +algorithm.train_mode=heterogeneous_distill \
@@ -58,7 +55,7 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.sample_demo_strategy=random \
     data.train_files=$train_files \
     data.val_files=$test_files \
-    data.train_batch_size=72 \
+    data.train_batch_size=144 \
     data.max_prompt_length=1024 \
     data.max_response_length=8192 \
     data.filter_overlong_prompts=True \
@@ -73,8 +70,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-5 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 \
     actor_rollout_ref.model.use_remove_padding=true \
-    actor_rollout_ref.actor.ppo_mini_batch_size=8 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=9216 \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.actor.fsdp_config.param_offload=false \
@@ -136,10 +133,14 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger='["console","wandb"]' \
     trainer.log_val_generations=10 \
     trainer.project_name='heterogeneous-distillation' \
-    trainer.experiment_name="${output_model_name}_${method}" \
+    trainer.experiment_name="${output_model_name}_${method}_${today}" \
     trainer.n_gpus_per_node=$n_gpu \
     trainer.nnodes=1 \
+    trainer.max_actor_ckpt_to_keep=1 \
+    trainer.max_critic_ckpt_to_keep=1 \
     trainer.save_freq=10 \
+    +trainer.best_metric_name="val-core/DeepMath-103K/reward/mean@1" \
+    +trainer.best_metric_mode="max" \
     trainer.default_local_dir=$output_path \
     trainer.test_freq=10 \
     trainer.total_epochs=2 $@

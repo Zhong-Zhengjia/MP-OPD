@@ -925,6 +925,7 @@ def compute_policy_loss_vanilla(
     clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
         "clip_ratio_c", 3.0
     )
+    clip_ratio_c = 10.0
 
     cliprange = clip_ratio
     cliprange_low = clip_ratio_low
@@ -935,7 +936,7 @@ def compute_policy_loss_vanilla(
         + f" but get the value: {clip_ratio_c}."
     )
 
-    negative_approx_kl = log_prob - old_log_prob
+    negative_approx_kl = log_prob - old_log_prob   # actor-base
     # Clamp negative_approx_kl for stability
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ratio = torch.exp(negative_approx_kl)
