@@ -351,67 +351,263 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
+
+    # def _strip_demo_final_answer(self, demo_text: str) -> str:
+    #     import re
+
+    #     if demo_text is None:
+    #         return ""
+
+    #     text = str(demo_text)
+
+    #     marker_patterns = [
+    #         r"###\s*✅?\s*Final\s+Answer\s*:",
+    #         r"##\s*✅?\s*Final\s+Answer\s*:",
+    #         r"\bFinal\s+Answer\s*:",
+    #         r"✅\s*Answer\s*:",
+    #         r"\bAnswer\s*:",
+    #     ]
+
+    #     cut_pos = None
+    #     for pat in marker_patterns:
+    #         m = re.search(pat, text, flags=re.IGNORECASE)
+    #         if m is not None:
+    #             cut_pos = m.start()
+    #             break
+
+    #     if cut_pos is not None:
+    #         text = text[:cut_pos].rstrip()
+
+    #     text = re.sub(r"(<\|im_end\|>\s*)+$", "", text).rstrip()
+    #     text = re.sub(r"(<\|endoftext\|>\s*)+$", "", text).rstrip()
+
+    #     return text
+
+
+    def _strip_demo_final_answer(self, demo_text: str):
+        """
+        Use gpt-4o-mini to convert demo_text into high-level reasoning guidance.
+
+        Different from simply removing the final answer, this function asks the LLM
+        to rewrite the demo into abstract / instructional reasoning steps, so that
+        concrete intermediate results and final answers are not leaked.
+
+        Returns:
+            str  : edited guidance text
+            ""   : if demo_text is empty or the model decides no useful guidance exists
+            None : if OpenAI API call fails
+        """
+        import os
+        import hashlib
+
+        if demo_text is None:
+            return ""
+
+        text = str(demo_text).strip()
+        if len(text) == 0:
+            return ""
+
+        # Cache is important because training may call this repeatedly.
+        if not hasattr(self, "_demo_guidance_edit_cache"):
+            self._demo_guidance_edit_cache = {}
+
+        cache_key = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+        if cache_key in self._demo_guidance_edit_cache:
+            return self._demo_guidance_edit_cache[cache_key]
+
+
+        model_name = os.getenv("VERL_DEMO_EDIT_MODEL", "gpt-4o-mini")
+        timeout = float(os.getenv("VERL_DEMO_EDIT_TIMEOUT", "30"))
+
+        try:
+            from openai import OpenAI
+
+            client_kwargs = {
+                "api_key": "sk-LCNRSkN5fnAsRTJ8a5VUvyQznlWR2LJEpVCAoRhhodxx8Ls2",
+                "timeout": timeout,
+                "base_url": "http://35.220.164.252:3888/v1"
+            }
+
+            client = OpenAI(**client_kwargs)
+
+            system_prompt = (
+                "You edit solution demos into high-level reasoning guidance. "
+                "Do not solve the problem. Do not add new facts."
+            )
+
+            user_prompt = (
+                "Rewrite the demo below into brief instructional reasoning steps.\n"
+                "Use only the method shown in the demo, but make it abstract.\n"
+                "Remove all final answers, boxed answers, option letters, exact final results, "
+                "and concrete computed intermediate results.\n"
+                "Do not reveal the answer. Do not include \\boxed{}.\n"
+                "The edited results should be clean and concise.\n"
+                "If there is no useful reasoning method, output an empty string.\n\n"
+                "Demo:\n"
+                f"{text}"
+            )
+
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.0,
+            )
+
+            edited = resp.choices[0].message.content
+
+            if edited is None:
+                edited = ""
+
+            edited = str(edited).strip()
+
+            # Light cleanup only. No regex fallback.
+            if edited.startswith("```"):
+                edited = edited.strip("`").strip()
+                if edited.lower().startswith("text"):
+                    edited = edited[4:].strip()
+
+            self._demo_guidance_edit_cache[cache_key] = edited
+            return edited
+
+        except Exception:
+            return None
+
+
+    def _extract_response_ids_from_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        response_mask: torch.Tensor,
+    ):
+        """
+        Extract response token ids from original tensors.
+
+        Expected common format:
+        - input_ids: full sequence padded to max seq len
+        - attention_mask: valid-token mask for full sequence
+        - response_mask: response-only mask padded to response max len
+
+        We use:
+        - valid_input_ids = input_ids[attention_mask > 0]
+        - resp_valid_len = number of positive entries in response_mask
+        - response_ids = last resp_valid_len tokens of valid_input_ids
+        """
+        if input_ids.dim() != 1 or attention_mask.dim() != 1 or response_mask.dim() != 1:
+            raise ValueError(
+                f"Expected 1D tensors, got input_ids.shape={tuple(input_ids.shape)}, "
+                f"attention_mask.shape={tuple(attention_mask.shape)}, "
+                f"response_mask.shape={tuple(response_mask.shape)}"
+            )
+
+        valid_input_ids = input_ids[attention_mask > 0]
+        resp_valid_len = int((response_mask > 0).sum().item())
+
+        if resp_valid_len <= 0:
+            return valid_input_ids.new_empty((0,), dtype=valid_input_ids.dtype)
+
+        if resp_valid_len > valid_input_ids.shape[0]:
+            raise ValueError(
+                "response valid length is larger than number of valid input tokens: "
+                f"valid_input_len={valid_input_ids.shape[0]}, resp_valid_len={resp_valid_len}, "
+                f"input_ids.shape={tuple(input_ids.shape)}, "
+                f"attention_mask.shape={tuple(attention_mask.shape)}, "
+                f"response_mask.shape={tuple(response_mask.shape)}"
+            )
+
+        return valid_input_ids[-resp_valid_len:]
+
+
+    def _build_distill_prefix_text(self, prompt_text: str, demo_text_wo_final: str) -> str:
+        return prompt_text
+        prompt_text = "" if prompt_text is None else str(prompt_text)
+        demo_text_wo_final = "" if demo_text_wo_final is None else str(demo_text_wo_final).strip()
+
+        prefix_text = (
+            f"Question:\n{prompt_text}\n\n"
+            f"Example Solution:\n{demo_text_wo_final}\n\n"
+            f"Follow the reasoning pattern of example, solve the question step by step, do **NOT** jump directly to the answer:\n\n"
+        )
+
+        return prefix_text
+
+
     def _build_distill_inputs_for_micro_batch(self, micro_batch, tokenizer, selected_indices=None):
         import torch
 
         prompt_texts = micro_batch.non_tensor_batch["prompt_text"]
         demo_texts = micro_batch.non_tensor_batch["demo_text"]
-        wrong_response_texts = micro_batch.non_tensor_batch["wrong_response_text"]
         distill_types = micro_batch.non_tensor_batch["distill_type"]
+
+        input_ids_batch = micro_batch.batch["input_ids"]
+        attention_mask_batch = micro_batch.batch["attention_mask"]
+        response_mask_batch = micro_batch.batch["response_mask"]
 
         if selected_indices is None:
             selected_indices = list(range(len(distill_types)))
 
-        target_input_ids_list = []
-        target_attention_mask_list = []
-        target_position_ids_list = []
-        target_responses_list = []
-        target_response_mask_list = []
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+        prefix_ids_list = []
+        response_ids_list = []
         selected_distill_types = []
         original_indices = []
-
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
         for idx in selected_indices:
             prompt_text = prompt_texts[idx]
             demo_text = demo_texts[idx]
-            wrong_resp_text = wrong_response_texts[idx]
             distill_type = distill_types[idx]
 
-            prefix_text = (
-                f"{prompt_text}\n\n"
-                f"Correct solution:\n{demo_text}\n\n"
-                f"Correctly solve the original question:\n"
+            # demo_text_wo_final = self._strip_demo_final_answer(demo_text)
+            # prefix_text = self._build_distill_prefix_text(
+            #     prompt_text=prompt_text,
+            #     demo_text_wo_final=demo_text_wo_final,
+            # )
+            prefix_text = self._build_distill_prefix_text(
+                prompt_text=prompt_text,
+                demo_text_wo_final=demo_text,
             )
 
-            # TODO： 这里可以不用 wrong_resp_text 来拼接，直接使用 input_ids 的 response_mask 来拼接
-            full_text = prefix_text + wrong_resp_text
-
-            encoded_prefix = tokenizer(prefix_text, return_tensors="pt", add_special_tokens=False)
-            encoded_full = tokenizer(full_text, return_tensors="pt", add_special_tokens=False)
-
-            prefix_ids = encoded_prefix["input_ids"][0]
-            full_ids = encoded_full["input_ids"][0]
-            response_ids = full_ids[prefix_ids.shape[0]:]
+            response_ids = self._extract_response_ids_from_input_ids(
+                input_ids=input_ids_batch[idx],
+                attention_mask=attention_mask_batch[idx],
+                response_mask=response_mask_batch[idx],
+            )
 
             if response_ids.numel() == 0:
-                encoded_resp = tokenizer(wrong_resp_text, return_tensors="pt", add_special_tokens=False)
-                response_ids = encoded_resp["input_ids"][0]
-                full_ids = torch.cat([prefix_ids, response_ids], dim=0)
+                wrong_response_texts = micro_batch.non_tensor_batch.get("wrong_response_text", None)
+                if wrong_response_texts is None:
+                    continue
 
-            attention_mask = torch.ones_like(full_ids, dtype=torch.long)
-            position_ids = torch.arange(full_ids.shape[0], dtype=torch.long)
-            response_mask = torch.ones_like(response_ids, dtype=torch.long)
+                fallback_text = wrong_response_texts[idx]
+                encoded_resp = tokenizer(
+                    fallback_text,
+                    return_tensors="pt",
+                    add_special_tokens=False,
+                )
+                response_ids = encoded_resp["input_ids"][0].to(input_ids_batch[idx].device)
 
-            target_input_ids_list.append(full_ids)
-            target_attention_mask_list.append(attention_mask)
-            target_position_ids_list.append(position_ids)
-            target_responses_list.append(response_ids)
-            target_response_mask_list.append(response_mask)
+                if response_ids.numel() == 0:
+                    continue
+
+            encoded_prefix = tokenizer(
+                prefix_text,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )
+            prefix_ids = encoded_prefix["input_ids"][0].to(response_ids.device)
+
+            if prefix_ids.numel() == 0:
+                continue
+
+            prefix_ids_list.append(prefix_ids)
+            response_ids_list.append(response_ids)
             selected_distill_types.append(distill_type)
             original_indices.append(idx)
 
-        if len(target_input_ids_list) == 0:
+        if len(prefix_ids_list) == 0:
             return {
                 "input_ids": None,
                 "attention_mask": None,
@@ -422,20 +618,98 @@ class DataParallelPPOActor(BasePPOActor):
                 "original_indices": [],
             }
 
-        max_input_len = max(x.shape[0] for x in target_input_ids_list)
-        max_resp_len = max(x.shape[0] for x in target_responses_list)
+        max_prefix_len = max(x.shape[0] for x in prefix_ids_list)
+        max_resp_len = max(x.shape[0] for x in response_ids_list)
 
-        def pad_1d(x, max_len, pad_value):
-            if x.shape[0] == max_len:
-                return x
-            pad = torch.full((max_len - x.shape[0],), pad_value, dtype=x.dtype)
-            return torch.cat([x, pad], dim=0)
+        target_input_ids_list = []
+        target_attention_mask_list = []
+        target_position_ids_list = []
+        target_responses_list = []
+        target_response_mask_list = []
 
-        target_input_ids = torch.stack([pad_1d(x, max_input_len, pad_id) for x in target_input_ids_list], dim=0)
-        target_attention_mask = torch.stack([pad_1d(x, max_input_len, 0) for x in target_attention_mask_list], dim=0)
-        target_position_ids = torch.stack([pad_1d(x, max_input_len, 0) for x in target_position_ids_list], dim=0)
-        target_responses = torch.stack([pad_1d(x, max_resp_len, pad_id) for x in target_responses_list], dim=0)
-        target_response_mask = torch.stack([pad_1d(x, max_resp_len, 0) for x in target_response_mask_list], dim=0)
+        for prefix_ids, response_ids in zip(prefix_ids_list, response_ids_list):
+            device = response_ids.device
+            dtype = response_ids.dtype
+
+            prefix_len = prefix_ids.shape[0]
+            resp_len = response_ids.shape[0]
+
+            prefix_pad_len = max_prefix_len - prefix_len
+            resp_pad_len = max_resp_len - resp_len
+
+            prefix_pad = torch.full(
+                (prefix_pad_len,),
+                pad_id,
+                dtype=dtype,
+                device=device,
+            )
+
+            resp_pad = torch.full(
+                (resp_pad_len,),
+                pad_id,
+                dtype=dtype,
+                device=device,
+            )
+
+            # 关键：prefix 左 pad，response 右 pad
+            # input_ids 结构：
+            # [prefix_pad, prefix_ids, response_ids, resp_pad]
+            input_ids = torch.cat(
+                [prefix_pad, prefix_ids, response_ids, resp_pad],
+                dim=0,
+            )
+
+            attention_mask = torch.cat(
+                [
+                    torch.zeros(prefix_pad_len, dtype=torch.long, device=device),
+                    torch.ones(prefix_len, dtype=torch.long, device=device),
+                    torch.ones(resp_len, dtype=torch.long, device=device),
+                    torch.zeros(resp_pad_len, dtype=torch.long, device=device),
+                ],
+                dim=0,
+            )
+
+            responses = torch.cat(
+                [response_ids, resp_pad],
+                dim=0,
+            )
+
+            response_mask = torch.cat(
+                [
+                    torch.ones(resp_len, dtype=torch.long, device=device),
+                    torch.zeros(resp_pad_len, dtype=torch.long, device=device),
+                ],
+                dim=0,
+            )
+
+            # left padding 下 position_ids 需要按有效 token 重新累计
+            position_ids = attention_mask.cumsum(dim=0) - 1
+            position_ids = position_ids.clamp_min(0)
+
+            target_input_ids_list.append(input_ids)
+            target_attention_mask_list.append(attention_mask)
+            target_position_ids_list.append(position_ids)
+            target_responses_list.append(responses)
+            target_response_mask_list.append(response_mask)
+
+        target_input_ids = torch.stack(target_input_ids_list, dim=0)
+        target_attention_mask = torch.stack(target_attention_mask_list, dim=0)
+        target_position_ids = torch.stack(target_position_ids_list, dim=0)
+        target_responses = torch.stack(target_responses_list, dim=0)
+        target_response_mask = torch.stack(target_response_mask_list, dim=0)
+
+        # 可保留一段时间用于防御性检查
+        resp_len = target_responses.shape[1]
+
+        assert torch.equal(
+            target_input_ids[:, -resp_len:],
+            target_responses,
+        ), "target_input_ids tail must equal target_responses"
+
+        assert torch.equal(
+            target_attention_mask[:, -resp_len:],
+            target_response_mask,
+        ), "target_attention_mask tail must equal target_response_mask"
 
         return {
             "input_ids": target_input_ids,
@@ -482,12 +756,12 @@ class DataParallelPPOActor(BasePPOActor):
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
         temperature = data.meta_info.get("temperature", 1.0)
 
+        
+
         # ===== new configs =====
-        advantage_normalize = self.config.get("distill_advantage_normalize", True)
-        advantage_clip = self.config.get("distill_advantage_clip", 2.0)
-        anchor_coef = self.config.get("distill_anchor_coef", 0.0)
-        anchor_loss_type = self.config.get("distill_anchor_loss_type", "mse")
-        logprob_gap_clip = self.config.get("distill_logprob_gap_clip", None)
+        anchor_coef = 0.0 
+        anchor_loss_type = 'mse'
+        disable_sdft = True
         # =======================
 
         device = get_device_id()
@@ -559,24 +833,6 @@ class DataParallelPPOActor(BasePPOActor):
             if isinstance(x, (list, tuple)):
                 raise ValueError(f"{name} must be scalar, got {type(x)}")
             return float(x)
-
-        def normalize_and_clip_advantages(advantages: torch.Tensor, mask: torch.Tensor):
-            valid = mask > 0
-            if valid.any():
-                adv_valid = advantages[valid]
-                if logprob_gap_clip is not None:
-                    adv_valid = torch.clamp(adv_valid, min=-logprob_gap_clip, max=logprob_gap_clip)
-                    advantages = torch.clamp(advantages, min=-logprob_gap_clip, max=logprob_gap_clip)
-
-                if advantage_normalize:
-                    adv_mean = adv_valid.mean()
-                    adv_std = adv_valid.std(unbiased=False).clamp_min(1e-6)
-                    advantages = (advantages - adv_mean) / adv_std
-
-                if advantage_clip is not None:
-                    advantages = torch.clamp(advantages, min=-advantage_clip, max=advantage_clip)
-
-            return advantages
 
         def compute_anchor_loss(actor_log_prob, base_log_prob, response_mask_local):
             if anchor_coef == 0:
@@ -713,8 +969,12 @@ class DataParallelPPOActor(BasePPOActor):
                     old_log_prob_micro_batch = old_log_prob_micro_batch.to(device)
                     micro_batch_metrics = {}
 
+                    # local_distill_types = list(micro_batch.non_tensor_batch["distill_type"])
+                    # sdft_indices = [i for i, t in enumerate(local_distill_types) if t == "sdft"]
+                    # icl_indices = [i for i, t in enumerate(local_distill_types) if t == "icl_opd"]
+
                     local_distill_types = list(micro_batch.non_tensor_batch["distill_type"])
-                    sdft_indices = [i for i, t in enumerate(local_distill_types) if t == "sdft"]
+                    sdft_indices = [] if disable_sdft else [i for i, t in enumerate(local_distill_types) if t == "sdft"]
                     icl_indices = [i for i, t in enumerate(local_distill_types) if t == "icl_opd"]
 
                     type_specs = [
@@ -771,6 +1031,9 @@ class DataParallelPPOActor(BasePPOActor):
                             tokenizer,
                             selected_indices=local_indices if len(local_indices) > 0 else [0],
                         )
+
+                        if target_inputs["input_ids"] is None:
+                            continue
 
                         target_input_ids = target_inputs["input_ids"].to(device)
                         target_attention_mask = target_inputs["attention_mask"].to(device)
@@ -830,11 +1093,21 @@ class DataParallelPPOActor(BasePPOActor):
                             pg_loss = type_loss
                             anchor_loss = type_loss
                         else:
+                            # K1 estimation
                             reverse_kl = old_log_prob - base_log_prob.detach()
                             reward_correction = target_log_prob.detach() - base_log_prob.detach()
 
+                            # k3 estimation
+                            # log_ratio = old_log_prob - base_log_prob
+                            # ratio = torch.exp(log_ratio)
+                            # reverse_kl = ratio - 1 - log_ratio
+                            # target_log_ratio = target_log_prob.detach() - base_log_prob.detach()
+                            # target_ratio = torch.exp(target_log_ratio)
+                            # reward_correction = target_ratio - 1 - target_log_ratio
+
                             reverse_kl = reverse_kl - reward_correction * 1.25
                             advantages = (- (reverse_kl))
+                            # advantages = reverse_kl
 
                             # advantages = target_log_prob.detach() - actor_log_prob.detach()
                             # advantages = normalize_and_clip_advantages(advantages, response_mask_local)

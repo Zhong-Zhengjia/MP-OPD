@@ -11,8 +11,8 @@ test_files=/mnt/petrelfs/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/v
 
 train_files=/mnt/petrelfs/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_union_passed_70.parquet
 
-student_model_subfix=4B
-teacher_model_subfix=1.7B
+student_model_subfix=1.7B
+teacher_model_subfix=4B
 student_model_name="Qwen3-${student_model_subfix}"
 teacher_model_name="Qwen3-${teacher_model_subfix}"
 ability=Math
@@ -21,10 +21,13 @@ student_model_path="/mnt/petrelfs/fudaocheng/checkpoints/huggingface/Qwen3-${stu
 teacher_model_path="/mnt/petrelfs/fudaocheng/checkpoints/huggingface/Qwen3-${teacher_model_subfix}"
 
 today=$(date +%Y%m%d)
-output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${ability}-GOPD-loss-sdft-only"
+# CT: critic teacher: critic icl opd
+# NA: no final answer for demo_text
+output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${ability}-temp-debuged-nosdft"
 method=HOPD
 output_path="/mnt/petrelfs/fudaocheng/checkpoints/trained/${output_model_name}_${method}_${today}"
 
+n_node=1
 n_gpu=8
 lr=1e-6
 
@@ -51,17 +54,17 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.use_sdft=true \
     +algorithm.hetero_distill.use_icl_opd=true \
     +algorithm.hetero_distill.sdft_weight=1.0 \
-    +algorithm.hetero_distill.icl_opd_weight=0.0 \
+    +algorithm.hetero_distill.icl_opd_weight=1.0 \
     +algorithm.hetero_distill.sample_demo_strategy=random \
     data.train_files=$train_files \
     data.val_files=$test_files \
-    data.train_batch_size=144 \
+    data.train_batch_size=576 \
     data.max_prompt_length=1024 \
     data.max_response_length=8192 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=True \
-    data.seed=42 \
+    data.seed=3245 \
     data.return_raw_chat=True \
     +data.apply_chat_template_kwargs.enable_thinking=false \
     actor_rollout_ref.model.path=$student_model_path \
@@ -70,12 +73,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-5 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 \
     actor_rollout_ref.model.use_remove_padding=true \
-    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=576 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=9216 \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
-    actor_rollout_ref.actor.fsdp_config.param_offload=false \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
+    actor_rollout_ref.actor.fsdp_config.param_offload=true \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.name=vllm \
@@ -103,15 +106,17 @@ python3 -m verl.trainer.main_ppo \
     teacher_rollout.actor.ppo_mini_batch_size=8 \
     teacher_rollout.actor.ppo_micro_batch_size_per_gpu=1 \
     teacher_rollout.actor.ppo_max_token_len_per_gpu=9216 \
-    teacher_rollout.actor.fsdp_config.param_offload=false \
-    teacher_rollout.actor.fsdp_config.optimizer_offload=false \
+    teacher_rollout.actor.fsdp_config.param_offload=true \
+    teacher_rollout.actor.fsdp_config.optimizer_offload=true \
     teacher_rollout.model.enable_gradient_checkpointing=true \
     teacher_rollout.rollout.log_prob_micro_batch_size_per_gpu=4 \
     teacher_rollout.rollout.tensor_model_parallel_size=2 \
+    teacher_rollout.rollout.data_parallel_size=1 \
+    teacher_rollout.rollout.pipeline_model_parallel_size=1 \
     teacher_rollout.rollout.name=vllm \
     teacher_rollout.rollout.mode=sync \
-    teacher_rollout.rollout.free_cache_engine=false \
-    teacher_rollout.rollout.gpu_memory_utilization=0.8 \
+    teacher_rollout.rollout.free_cache_engine=true \
+    teacher_rollout.rollout.gpu_memory_utilization=0.92 \
     teacher_rollout.rollout.n=1 \
     teacher_rollout.rollout.max_num_batched_tokens=9216 \
     teacher_rollout.rollout.temperature=1.0 \
@@ -135,8 +140,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name='heterogeneous-distillation' \
     trainer.experiment_name="${output_model_name}_${method}_${today}" \
     trainer.n_gpus_per_node=$n_gpu \
-    trainer.nnodes=1 \
-    +trainer.critic_icl_opd=true \
+    trainer.nnodes=$n_node \
+    +trainer.critic_icl_opd=false \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.max_critic_ckpt_to_keep=1 \
     trainer.save_freq=10 \

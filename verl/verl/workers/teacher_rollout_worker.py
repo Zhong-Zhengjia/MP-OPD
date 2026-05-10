@@ -189,7 +189,7 @@ class TeacherRolloutWorker(Worker, DistProfilerExtension):
             "use_orig_params", False
         )
         self._is_offload_param = self.config.teacher_rollout.actor.fsdp_config.get(
-            "param_offload", False
+            "param_offload", True
         )
         self._is_offload_optimizer = self.config.teacher_rollout.actor.fsdp_config.get(
             "optimizer_offload", False
@@ -213,6 +213,9 @@ class TeacherRolloutWorker(Worker, DistProfilerExtension):
         self.actor_model_config = None
         self.base_sync_done = True
         self.layered_summon = False
+
+        self.keep_rollout_mode = False
+        self._rollout_mode_ready = False
 
     def _ensure_background_loop(self):
         if getattr(self, "_bg_loop", None) is not None:
@@ -554,6 +557,36 @@ class TeacherRolloutWorker(Worker, DistProfilerExtension):
 
         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
 
+
+    def _ensure_rollout_mode_ready(self):
+        """
+        For teacher model: enter rollout mode only once.
+
+        Teacher model is fixed, so we only need to sync FSDP weights
+        to rollout engine once.
+        """
+        if self._rollout_mode_ready:
+            return
+
+        if self.rollout is None:
+            raise RuntimeError(
+                f"Teacher rollout engine is not initialized on rank={self.rank}. "
+                f"Please make sure _build_rollout() has been called before entering rollout mode."
+            )
+
+        self._run_coro_blocking(self.rollout_mode())
+
+        if self.actor_module_fsdp is not None:
+            self.actor_module_fsdp.eval()
+
+        self._rollout_mode_ready = True
+
+        log_gpu_memory_usage(
+            "Teacher rollout mode is ready and will be kept resident",
+            logger=logger,
+        )
+
+
     def _build_rollout(self, trust_remote_code: bool = False):
         from torch.distributed.device_mesh import init_device_mesh
         from verl.workers.config import HFModelConfig, RolloutConfig
@@ -845,8 +878,12 @@ class TeacherRolloutWorker(Worker, DistProfilerExtension):
         )
 
         timing_generate = {}
-        self._run_coro_blocking(self.rollout_mode())
-        log_gpu_memory_usage("After switch teacher to rollout mode", logger=logger)
+
+        if self.keep_rollout_mode:
+            self._ensure_rollout_mode_ready()
+        else:
+            self._run_coro_blocking(self.rollout_mode())
+            log_gpu_memory_usage("After switch teacher to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(
@@ -856,8 +893,9 @@ class TeacherRolloutWorker(Worker, DistProfilerExtension):
                 top_k=top_k,
             )
 
-        self._run_coro_blocking(self.trainer_mode())
-        log_gpu_memory_usage("After switch teacher to trainer mode", logger=logger)
+        if not self.keep_rollout_mode:
+            self._run_coro_blocking(self.trainer_mode())
+            log_gpu_memory_usage("After switch teacher to trainer mode", logger=logger)
 
         timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
             timing_generate["generate_sequences"]
