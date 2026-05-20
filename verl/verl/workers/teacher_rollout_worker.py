@@ -214,7 +214,7 @@ class TeacherRolloutWorker(Worker, DistProfilerExtension):
         self.base_sync_done = True
         self.layered_summon = False
 
-        self.keep_rollout_mode = False
+        self.keep_rollout_mode = True
         self._rollout_mode_ready = False
 
     def _ensure_background_loop(self):

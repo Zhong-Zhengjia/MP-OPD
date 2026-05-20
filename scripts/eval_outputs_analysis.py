@@ -208,20 +208,20 @@ def plot_passed_comparison(
 
 
 if __name__ == "__main__":
-    model_name_1 = "Qwen3-1.7B"
-    model_name_2 = "Qwen3-4B"
-    num_samples = 8 
+    model_name_1 = "gemini-3-pro-preview"
+    model_name_2 = "gpt-5.2"
+    num_samples = 8
 
-    # fp_1 = f"/mnt/petrelfs/fudaocheng/codes/G-OPD/eval_outputs/{model_name_1}_MathTestTotal_pass@{num_samples}.jsonl"
+    fp_1 = f"/mnt/petrelfs/fudaocheng/codes/G-OPD/eval_outputs/{model_name_1}_MathTestTotal_pass@{num_samples}.jsonl"
     # fp_2 = f"/mnt/petrelfs/fudaocheng/codes/G-OPD/eval_outputs/{model_name_2}_MathTestTotal_pass@{num_samples}.jsonl"
 
-    db_1 = f"/mnt/petrelfs/fudaocheng/codes/G-OPD/eval_outputs/{model_name_1}_DeepMath-103K_pass@{num_samples}.sqlite"
-    db_2 = f"/mnt/petrelfs/fudaocheng/codes/G-OPD/eval_outputs/{model_name_2}_DeepMath-103K_pass@{num_samples}.sqlite"
+    # db_1 = f"/mnt/petrelfs/fudaocheng/codes/G-OPD/eval_outputs/{model_name_1}_MathTestTotal_pass@{num_samples}.sqlite"
+    db_2 = f"/mnt/petrelfs/fudaocheng/codes/G-OPD/eval_outputs/{model_name_2}_MathTestTotal_pass@{num_samples}.sqlite"
 
-    # final_res_1 = analysis_eval(fp_1)
+    final_res_1 = analysis_eval(fp_1)
     # final_res_2 = analysis_eval(fp_2)
 
-    final_res_1 = analysis_eval_sqlite(db_1)
+    # final_res_1 = analysis_eval_sqlite(db_1)
     final_res_2 = analysis_eval_sqlite(db_2)
 
     plot_passed_comparison(
@@ -229,5 +229,5 @@ if __name__ == "__main__":
         final_res_2["passed_ids"],
         label1=model_name_1,
         label2=model_name_2,
-        save_path=f"/mnt/petrelfs/fudaocheng/codes/G-OPD/plots/{model_name_1}_{model_name_2}_DeepMath-103K_pass@{num_samples}.png"
+        save_path=f"/mnt/petrelfs/fudaocheng/codes/H-OPD/plots/{model_name_1}_{model_name_2}_DeepMath-103K_pass@{num_samples}.png"
     )

@@ -462,6 +462,7 @@ class vLLMRollout(BaseRollout):
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
+            batch['old_log_probs'] = rollout_log_probs
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 

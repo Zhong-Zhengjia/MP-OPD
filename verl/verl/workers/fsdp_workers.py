@@ -857,10 +857,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 
         if self._is_ref:
-            ref_model_path = self.config.model.path
             ref_model = self.config.ref.get("model", None)
             if ref_model is not None:
-                ref_model_path = ref_model.get("path", self.config.model.path)
+                ref_model_path = ref_model.get("path", None)
+
+            assert ref_model_path, "Please provide the checkpoint path of teacher model: `+actor_rollout_ref.ref.model.path`."
 
             if self.rank == 0:
                 print("reference model:", ref_model_path)
@@ -886,10 +887,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.ref.use_fused_kernels = use_fused_kernels
 
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
-
-            # In heterogeneous distillation mode, ref model is treated as teacher model
-            self.teacher_module_fsdp = self.ref_module_fsdp
-            self.teacher_policy = self.ref_policy
 
         # Initialize base models for corrected reward computation
         # Actor's base model (for computing base_log_prob)
@@ -956,11 +953,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self.rank == 0:
                 print(f"Ref base model initialized successfully from {ref_base_model_path}")
 
-        if self._is_actor and self._is_ref:
-            if self.teacher_policy is None and self.ref_policy is not None:
-                self.teacher_policy = self.ref_policy
-                self.teacher_module_fsdp = self.ref_module_fsdp
-
         if self._is_actor:
             if self.student_base_policy is None and self.base_policy is not None:
                 self.student_base_policy = self.base_policy
@@ -995,10 +987,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Support all hardwares
         assert self._is_rollout
         prompts = prompts.to(get_device_id())
-
-        # ===============================
-        # input_ids = prompts.batch["input_ids"]
-        # print('[DEBUG] Student Prompts', self.tokenizer.decode(input_ids[0], skip_special_tokens=False))
 
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id
@@ -1042,75 +1030,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         get_torch_device().empty_cache()
         return output
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="orange", role="actor_update_distill")
-    def update_actor_distill(self, data: DataProto):
-        assert self._is_actor
-        assert self.actor is not None, "Student actor is not initialized."
-        assert self.teacher_policy is not None, "Teacher policy is not initialized."
-        assert self.student_base_policy is not None, "Student base policy is not initialized."
 
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+    def _set_actor_log_prob_meta_info(self, data: DataProto):
+        if data.meta_info is None:
+            data.meta_info = {}
 
-        # Load frozen teacher / student-base if needed
-        # They may use CPU offload under FSDP ref config
-        if hasattr(self, "ref_module_fsdp") and self.ref_module_fsdp is not None:
-            try:
-                load_fsdp_model_to_gpu(self.ref_module_fsdp)
-            except Exception:
-                pass
-        if hasattr(self, "base_module_fsdp") and self.base_module_fsdp is not None:
-            try:
-                load_fsdp_model_to_gpu(self.base_module_fsdp)
-            except Exception:
-                pass
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["temperature"] = data.meta_info.get(
+            "temperature",
+            self.config.rollout.temperature,
+        )
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
 
-        with self.ulysses_sharding_manager:
-            data = data.to("cpu")
-            with Timer(name="update_policy_distill", logger=None) as timer:
-                metrics = self.actor.update_policy_distill(
-                    data=data,
-                    teacher_actor=self.teacher_policy,
-                    student_base_actor=self.student_base_policy,
-                    tokenizer=self.tokenizer,
-                )
-            metrics = reduce_metrics(metrics)
-            delta_time = timer.last
-            metrics["perf/update_policy_distill_time"] = delta_time
-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
-            if self.actor_lr_scheduler is not None:
-                lr = self.actor_lr_scheduler.get_last_lr()[0]
-                metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
-                self.actor_lr_scheduler.step()
-            output = DataProto(meta_info={"metrics": metrics})
-            output = output.to("cpu")
+        return data
 
-
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            log_gpu_memory_usage("After offload actor model during update_actor_distill", logger=logger)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor_distill", logger=logger)
-
-        # Offload frozen models back if needed
-        if hasattr(self, "ref_module_fsdp") and self.ref_module_fsdp is not None:
-            try:
-                offload_fsdp_model_to_cpu(self.ref_module_fsdp)
-            except Exception:
-                pass
-        if hasattr(self, "base_module_fsdp") and self.base_module_fsdp is not None:
-            try:
-                offload_fsdp_model_to_cpu(self.base_module_fsdp)
-            except Exception:
-                pass
-
-        return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
@@ -1271,6 +1205,104 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def has_base_models(self):
         """Check if base models are available for corrected reward computation."""
         return self._has_base_model and self._has_base_ref_model
+
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="cyan", role="actor_update_grpo")
+    def update_actor_grpo(self, data: DataProto):
+        assert self._is_actor
+        assert self.actor is not None
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(
+                optimizer=self.actor_optimizer,
+                device_id=get_device_id(),
+            )
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+
+            data = self._set_actor_log_prob_meta_info(data)
+
+            with Timer(name="update_policy_grpo", logger=None) as timer:
+                metrics = self.actor.update_policy_grpo(data=data)
+
+            metrics = reduce_metrics(metrics)
+            # metrics["perf/update_policy_grpo_time"] = timer.last
+            # metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+            # metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            # metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+
+            if self.actor_lr_scheduler is not None:
+                lr = self.actor_lr_scheduler.get_last_lr()[0]
+                metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+                self.actor_lr_scheduler.step()
+
+            output = DataProto(meta_info={"metrics": metrics})
+            output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during update_actor_grpo", logger=logger)
+
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            log_gpu_memory_usage("After offload actor optimizer during update_actor_grpo", logger=logger)
+
+        return output
+
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="actor_update_opd")
+    def update_actor_opd(self, data: DataProto):
+        assert self._is_actor
+        assert self.actor is not None
+        assert self.ref_policy is not None
+        assert self.ref_module_fsdp is not None
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(
+                optimizer=self.actor_optimizer,
+                device_id=get_device_id(),
+            )
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+
+            data = self._set_actor_log_prob_meta_info(data)
+
+            with Timer(name="update_policy_opd", logger=None) as timer:
+                metrics = self.actor.update_policy_opd(data=data)
+
+            metrics = reduce_metrics(metrics)
+            # metrics["perf/update_policy_opd_time"] = timer.last
+            # metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+            # metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            # metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+
+            if self.actor_lr_scheduler is not None:
+                lr = self.actor_lr_scheduler.get_last_lr()[0]
+                metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+                self.actor_lr_scheduler.step()
+
+            output = DataProto(meta_info={"metrics": metrics})
+            output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor/ref model during update_actor_opd", logger=logger)
+
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            log_gpu_memory_usage("After offload actor optimizer during update_actor_opd", logger=logger)
+
+        return output
 
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

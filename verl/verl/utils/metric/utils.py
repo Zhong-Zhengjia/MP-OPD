@@ -20,59 +20,59 @@ from typing import Any
 import numpy as np
 
 
-# def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
-#     """
-#     Reduces a dictionary of metric lists by computing the mean, max, or min of each list.
-#     The reduce operation is determined by the key name:
-#     - If the key contains "max", np.max is used
-#     - If the key contains "min", np.min is used
-#     - Otherwise, np.mean is used
+def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
+    """
+    Reduces a dictionary of metric lists by computing the mean, max, or min of each list.
+    The reduce operation is determined by the key name:
+    - If the key contains "max", np.max is used
+    - If the key contains "min", np.min is used
+    - Otherwise, np.mean is used
 
-#     Args:
-#         metrics: A dictionary mapping metric names to lists of metric values.
+    Args:
+        metrics: A dictionary mapping metric names to lists of metric values.
 
-#     Returns:
-#         A dictionary with the same keys but with each list replaced by its reduced value.
+    Returns:
+        A dictionary with the same keys but with each list replaced by its reduced value.
 
-#     Example:
-#         >>> metrics = {
-#         ...     "loss": [1.0, 2.0, 3.0],
-#         ...     "accuracy": [0.8, 0.9, 0.7],
-#         ...     "max_reward": [5.0, 8.0, 6.0],
-#         ...     "min_error": [0.1, 0.05, 0.2]
-#         ... }
-#         >>> reduce_metrics(metrics)
-#         {"loss": 2.0, "accuracy": 0.8, "max_reward": 8.0, "min_error": 0.05}
-#     """
-#     for key, val in metrics.items():
-#         if "max" in key:
-#             metrics[key] = np.max(val)
-#         elif "min" in key:
-#             metrics[key] = np.min(val)
-#         else:
-#             metrics[key] = np.mean(val)
-#     return metrics
-
-
-def reduce_metrics(metrics_dict):
-    import numpy as np
-    import torch
-    metrics = {}
-    for key, val in metrics_dict.items():
-        try:
+    Example:
+        >>> metrics = {
+        ...     "loss": [1.0, 2.0, 3.0],
+        ...     "accuracy": [0.8, 0.9, 0.7],
+        ...     "max_reward": [5.0, 8.0, 6.0],
+        ...     "min_error": [0.1, 0.05, 0.2]
+        ... }
+        >>> reduce_metrics(metrics)
+        {"loss": 2.0, "accuracy": 0.8, "max_reward": 8.0, "min_error": 0.05}
+    """
+    for key, val in metrics.items():
+        if "max" in key:
+            metrics[key] = np.max(val)
+        elif "min" in key:
+            metrics[key] = np.min(val)
+        else:
             metrics[key] = np.mean(val)
-        except Exception as e:
-            print(f"\n[reduce_metrics] bad key: {key}")
-            print(f"[reduce_metrics] raw val type: {type(val)}")
-            print(f"[reduce_metrics] raw val len: {len(val) if hasattr(val, '__len__') else 'N/A'}")
-            for i, x in enumerate(val):
-                if torch.is_tensor(x):
-                    print(
-                        f"  idx={i}, type=tensor, shape={tuple(x.shape)}, "
-                        f"dtype={x.dtype}, device={x.device}, value={x}"
-                    )
-                else:
-                    shape = getattr(x, "shape", None)
-                    print(f"  idx={i}, type={type(x)}, shape={shape}, value={x}")
-            raise
     return metrics
+
+
+# def reduce_metrics(metrics_dict):
+#     import numpy as np
+#     import torch
+#     metrics = {}
+#     for key, val in metrics_dict.items():
+#         try:
+#             metrics[key] = np.mean(val)
+#         except Exception as e:
+#             print(f"\n[reduce_metrics] bad key: {key}")
+#             print(f"[reduce_metrics] raw val type: {type(val)}")
+#             print(f"[reduce_metrics] raw val len: {len(val) if hasattr(val, '__len__') else 'N/A'}")
+#             for i, x in enumerate(val):
+#                 if torch.is_tensor(x):
+#                     print(
+#                         f"  idx={i}, type=tensor, shape={tuple(x.shape)}, "
+#                         f"dtype={x.dtype}, device={x.device}, value={x}"
+#                     )
+#                 else:
+#                     shape = getattr(x, "shape", None)
+#                     print(f"  idx={i}, type={type(x)}, shape={shape}, value={x}")
+#             raise
+#     return metrics

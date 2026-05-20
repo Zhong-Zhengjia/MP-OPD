@@ -158,22 +158,6 @@ class TaskRunner:
 
         return actor_rollout_cls, ray_worker_group_cls
 
-    def add_teacher_rollout_worker(self, config):
-        """Add teacher rollout worker for heterogeneous distillation."""
-        from verl.single_controller.ray import RayWorkerGroup
-        from verl.trainer.ppo.ray_trainer import Role
-
-        if config.algorithm.get("train_mode", None) != "heterogeneous_distill":
-            return None, None
-
-        from verl.workers.teacher_rollout_worker import TeacherRolloutWorker
-
-        teacher_rollout_cls = TeacherRolloutWorker
-        ray_worker_group_cls = RayWorkerGroup
-
-        self.role_worker_mapping[Role.TeacherRollout] = ray.remote(teacher_rollout_cls)
-        return teacher_rollout_cls, ray_worker_group_cls
-
     def add_critic_worker(self, config):
         """Add critic worker to role mapping."""
         if config.critic.strategy in {"fsdp", "fsdp2"}:
@@ -201,49 +185,16 @@ class TaskRunner:
         """Initialize resource pool manager."""
         from verl.trainer.ppo.ray_trainer import Role, ResourcePoolManager
 
-        train_mode = config.algorithm.get("train_mode", None)
+        global_pool_id = "global_pool"
+        resource_pool_spec = {
+            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+        }
 
-        # Heterogeneous distill: isolate actor rollout and teacher rollout
-        # into different resource pools so that different vLLM engines /
-        # tensor parallel sizes do not share the same colocated worker group.
-        if train_mode == "heterogeneous_distill":
-            actor_pool_id = "actor_pool"
-            teacher_pool_id = "teacher_pool"
+        self.mapping[Role.ActorRollout] = global_pool_id
+        self.mapping[Role.Critic] = global_pool_id
 
-            total_gpus = config.trainer.n_gpus_per_node
-            if total_gpus < 2:
-                raise ValueError("heterogeneous_distill requires at least 2 GPUs to isolate actor and teacher pools")
-
-            # Simple split for single-node use case:
-            # actor gets the larger half, teacher gets the remaining GPUs.
-            actor_gpus = 6
-            teacher_gpus = total_gpus - actor_gpus
-            if teacher_gpus <= 0:
-                raise ValueError("teacher_pool must have at least 1 GPU")
-
-            resource_pool_spec = {
-                actor_pool_id: [actor_gpus] * config.trainer.nnodes,
-                teacher_pool_id: [teacher_gpus] * config.trainer.nnodes,
-            }
-
-            self.mapping[Role.ActorRollout] = actor_pool_id
-            self.mapping[Role.Critic] = actor_pool_id
-            self.mapping[Role.TeacherRollout] = teacher_pool_id
-
-            if Role.RefPolicy in self.role_worker_mapping:
-                self.mapping[Role.RefPolicy] = actor_pool_id
-
-        else:
-            global_pool_id = "global_pool"
-            resource_pool_spec = {
-                global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-            }
-
-            self.mapping[Role.ActorRollout] = global_pool_id
-            self.mapping[Role.Critic] = global_pool_id
-
-            if Role.RefPolicy in self.role_worker_mapping:
-                self.mapping[Role.RefPolicy] = global_pool_id
+        if Role.RefPolicy in self.role_worker_mapping:
+            self.mapping[Role.RefPolicy] = global_pool_id
 
         if config.reward_model.enable_resource_pool:
             if config.reward_model.n_gpus_per_node <= 0:
@@ -307,7 +258,6 @@ class TaskRunner:
         OmegaConf.resolve(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
-        self.add_teacher_rollout_worker(config)
         self.add_critic_worker(config)
         self.add_reward_model_worker(config)
         self.add_ref_policy_worker(config, actor_rollout_cls)

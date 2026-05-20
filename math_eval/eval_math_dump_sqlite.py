@@ -93,19 +93,21 @@ DEFAULT_CFG = {
     "model_path": None,          # required
     "output_file": None,         # kept for compatibility, not used for jsonl anymore
     "db_path": None,             # required: sqlite db path
-    "max_tokens": 16384,
+    "max_tokens": 9216,
     "temperature": 1.0,
     "top_p": 1.0,
-    "max_num_seqs": 256,
+    "top_k": -1,
+    "do_sample": True,
+    "max_num_seqs": 128,
     "n": 1,
     "begin_idx": -1,
     "end_idx": -1,
-    "seed": 42,
+    "seed": 8962,
     "enable_thinking": False,
     "chat_template": None,
     "gpu_memory_utilization": 0.95,
     "tensor_parallel_size": None,  # None -> torch.cuda.device_count()
-    "batch_size": 128,             # number of prompts per generation batch
+    "batch_size": 512,             # number of prompts per generation batch
 }
 
 
@@ -385,6 +387,9 @@ def main(cfg: dict):
             max_tokens=cfg["max_tokens"],
             n=1,  # important: each expanded prompt corresponds to exactly one rollout
             seed=cfg["seed"],
+            top_k=cfg['top_k'],
+            # do_sample=cfg['do_sample'],
+            # max_response_length=cfg['max_tokens']
         )
 
         generations = llm.generate(expanded_prompts, sampling_params=sampling_params)
@@ -441,11 +446,11 @@ def main(cfg: dict):
 
 
 if __name__ == "__main__":
-    model_name = 'Qwen3-1.7B'
+    model_name = 'Qwen3-4B'
     enable_thinking = 'thinking' in model_name.lower()
 
     dataset_name = 'DeepMath-103K'
-    num_outputs = 8
+    num_outputs = 16
 
     print('=' * 30)
     print(model_name, enable_thinking, num_outputs)
@@ -455,10 +460,9 @@ if __name__ == "__main__":
         "model_name": model_name,
         "input_file": f"/mnt/petrelfs/fudaocheng/datasets/G-OPD-Training-Data/{dataset_name}/train_filtered_level6.parquet",
         "model_path": f"/mnt/petrelfs/fudaocheng/checkpoints/huggingface/{model_name}",
-        "output_file": f"/mnt/petrelfs/fudaocheng/codes/G-OPD/eval_outputs/{model_name}_{dataset_name}_pass@{num_outputs}.jsonl",
         "db_path": f"/mnt/petrelfs/fudaocheng/codes/G-OPD/eval_outputs/{model_name}_{dataset_name}_pass@{num_outputs}.sqlite",
         "n": num_outputs,
         "enable_thinking": enable_thinking,
-        "batch_size": 256,
+        "batch_size": 512,
     }
     main(cfg)

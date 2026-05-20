@@ -83,8 +83,8 @@ def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0
         return 0.0
 
     try:
-        if len(answer) > 300:
-            answer = answer[:300]
+        if len(answer) > 100:
+            answer = answer[:100]
         result = verify(parse("\\boxed{" + ground_truth + "}"), parse("\\boxed{" + answer + "}"))
     except Exception:
         pass

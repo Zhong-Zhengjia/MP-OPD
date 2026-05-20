@@ -28,6 +28,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Optional
+import copy
 
 import numpy as np
 import ray
@@ -183,39 +184,25 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def union_gen_and_rollout_batch(gen_batch: DataProto, rollout_batch: DataProto) -> DataProto:
-    prefer_rollout_tensor_keys = {
-        "input_ids",
-        "attention_mask",
-        "position_ids",
-        "responses",
-        "prompts",
-    }
+def _index_dataproto(data: DataProto, idx):
+    if isinstance(idx, torch.Tensor):
+        idx_np = idx.detach().cpu().numpy()
+        idx_t = idx.detach().cpu().long()
+    else:
+        idx_np = np.asarray(idx)
+        idx_t = torch.from_numpy(idx_np).long()
 
-    gen_tensor_keys = list(gen_batch.batch.keys())
-    rollout_tensor_keys = list(rollout_batch.batch.keys())
+    batch = data.batch[idx_t]
 
-    overlap = set(gen_tensor_keys) & set(rollout_tensor_keys)
+    non_tensor_batch = {}
+    for k, v in data.non_tensor_batch.items():
+        non_tensor_batch[k] = np.asarray(v)[idx_np]
 
-    illegal_conflicts = []
-    for k in overlap:
-        if k in prefer_rollout_tensor_keys:
-            continue
-        if not gen_batch.batch[k].equal(rollout_batch.batch[k]):
-            illegal_conflicts.append(k)
-
-    assert len(illegal_conflicts) == 0, (
-        f"Unexpected conflicting keys during union: {illegal_conflicts}"
+    return DataProto(
+        batch=batch,
+        non_tensor_batch=non_tensor_batch,
+        meta_info=copy.deepcopy(data.meta_info),
     )
-
-    kept_tensor_keys = [k for k in gen_tensor_keys if k not in prefer_rollout_tensor_keys]
-
-    gen_batch_trimmed = gen_batch.select(
-        batch_keys=kept_tensor_keys,
-        non_tensor_batch_keys=list(gen_batch.non_tensor_batch.keys()),
-    )
-
-    return gen_batch_trimmed.union(rollout_batch)
 
 
 def compute_advantage(
@@ -373,6 +360,15 @@ class RayPPOTrainer:
         self.is_hetero_distill = self.train_mode == "heterogeneous_distill"
 
         hetero_cfg = self.config.algorithm.get("hetero_distill", {})
+        print(hetero_cfg)
+        self.offline_teacher_rollout_path = hetero_cfg.get(
+            "offline_teacher_rollout_path",
+            None,
+        )
+        assert self.offline_teacher_rollout_path, "Please make sure the parameter `offline_teacher_rollout_path` is correctly setted."
+        self.offline_teacher_rollout_results = self._load_offline_teacher_rollouts(
+            self.offline_teacher_rollout_path
+        )
         self.student_rollout_n = hetero_cfg.get("student_rollout_n", 1)
         self.teacher_rollout_n = hetero_cfg.get("teacher_rollout_n", 1)
         self.use_sdft = hetero_cfg.get("use_sdft", True)
@@ -426,6 +422,39 @@ class RayPPOTrainer:
         self.teacher_rollout_wg = None
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _load_offline_teacher_rollouts(self, path):
+        import json
+        import os
+
+        if path is None or path == "":
+            return {}
+
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"offline teacher rollout file not found: {path}")
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        print(f"Loaded offline teacher rollout results from {path}, size={len(data)}")
+        return data
+
+
+    def _sample_offline_teacher_rewards(self, question_id, sample_n):
+        import numpy as np
+
+        item = self.offline_teacher_rollout_results.get(str(question_id), None)
+        if item is None:
+            return None
+
+        rewards = item.get("teacher_rewards", None)
+        if rewards is None or len(rewards) == 0:
+            return None
+
+        rewards = np.asarray(rewards, dtype=np.float32)
+        replace = len(rewards) < sample_n
+        idx = np.random.choice(len(rewards), size=sample_n, replace=replace)
+        return rewards[idx]
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -771,128 +800,48 @@ class RayPPOTrainer:
                 )
         wg_kwargs["device_name"] = self.device_name
 
-        train_mode = self.config.algorithm.get("train_mode", None)
+        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
-        def _spawn_single_worker_group(role, ray_cls_with_init, prefix_name=None):
-            resource_pool = self.resource_pool_manager.get_resource_pool(role)
-            wg = self.ray_worker_group_cls(
+        if self.hybrid_engine:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            actor_rollout_role = "actor_rollout_ref"
+            ref_path = OmegaConf.select(self.config, "actor_rollout_ref.ref.model.path")
+            actor_rollout_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.ActorRollout],
+                config=self.config.actor_rollout_ref,
+                role=actor_rollout_role,
+            )
+            self.resource_pool_to_cls[resource_pool][str(Role.ActorRollout)] = actor_rollout_cls
+
+        if self.use_critic:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+            critic_cfg = omega_conf_to_dataclass(self.config.critic)
+            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
+            self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
+
+        if self.use_reference_policy:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+            ref_policy_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.RefPolicy],
+                config=self.config.actor_rollout_ref,
+                role=str(Role.RefPolicy),
+            )
+            self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
+
+        if self.use_rm:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
+            self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
+
+        for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            wg_dict = self.ray_worker_group_cls(
                 resource_pool=resource_pool,
-                ray_cls_with_init=ray_cls_with_init,
+                ray_cls_with_init=worker_dict_cls,
                 **wg_kwargs,
             )
-            key = prefix_name or str(role)
-            spawned = wg.spawn(prefix_set={key})
-            return spawned[key]
-
-        # heterogeneous_distill: do NOT colocate different roles
-        if train_mode == "heterogeneous_distill":
-            if self.hybrid_engine:
-                actor_rollout_role = "actor_rollout_ref"
-                actor_rollout_cls = RayClassWithInitArgs(
-                    cls=self.role_worker_mapping[Role.ActorRollout],
-                    config=self.config.actor_rollout_ref,
-                    role=actor_rollout_role,
-                )
-                all_wg[str(Role.ActorRollout)] = _spawn_single_worker_group(
-                    Role.ActorRollout, actor_rollout_cls, prefix_name=str(Role.ActorRollout)
-                )
-            else:
-                raise NotImplementedError
-
-            teacher_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.TeacherRollout],
-                config=self.config,
-                role=str(Role.TeacherRollout),
-            )
-            all_wg[str(Role.TeacherRollout)] = _spawn_single_worker_group(
-                Role.TeacherRollout, teacher_rollout_cls
-            )
-
-            if self.use_critic:
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-                critic_cfg = omega_conf_to_dataclass(self.config.critic)
-                critic_cls = RayClassWithInitArgs(
-                    cls=self.role_worker_mapping[Role.Critic],
-                    config=critic_cfg,
-                )
-                critic_wg = self.ray_worker_group_cls(
-                    resource_pool=resource_pool,
-                    ray_cls_with_init=critic_cls,
-                    **wg_kwargs,
-                )
-                all_wg[str(Role.Critic)] = critic_wg.spawn(prefix_set={str(Role.Critic)})[str(Role.Critic)]
-
-            if self.use_reference_policy and not self.ref_in_actor:
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
-                ref_policy_cls = RayClassWithInitArgs(
-                    self.role_worker_mapping[Role.RefPolicy],
-                    config=self.config.actor_rollout_ref,
-                    role=str(Role.RefPolicy),
-                )
-                ref_wg = self.ray_worker_group_cls(
-                    resource_pool=resource_pool,
-                    ray_cls_with_init=ref_policy_cls,
-                    **wg_kwargs,
-                )
-                all_wg[str(Role.RefPolicy)] = ref_wg.spawn(prefix_set={str(Role.RefPolicy)})[str(Role.RefPolicy)]
-
-            if self.use_rm:
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-                rm_cls = RayClassWithInitArgs(
-                    self.role_worker_mapping[Role.RewardModel],
-                    config=self.config.reward_model,
-                )
-                rm_wg = self.ray_worker_group_cls(
-                    resource_pool=resource_pool,
-                    ray_cls_with_init=rm_cls,
-                    **wg_kwargs,
-                )
-                all_wg[str(Role.RewardModel)] = rm_wg.spawn(prefix_set={str(Role.RewardModel)})[str(Role.RewardModel)]
-
-        else:
-            self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
-
-            if self.hybrid_engine:
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
-                actor_rollout_role = str(Role.ActorRollout)
-                actor_rollout_cls = RayClassWithInitArgs(
-                    cls=self.role_worker_mapping[Role.ActorRollout],
-                    config=self.config.actor_rollout_ref,
-                    role=actor_rollout_role,
-                )
-                self.resource_pool_to_cls[resource_pool][str(Role.ActorRollout)] = actor_rollout_cls
-            else:
-                raise NotImplementedError
-
-            if self.use_critic:
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-                critic_cfg = omega_conf_to_dataclass(self.config.critic)
-                critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
-                self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
-
-            if self.use_reference_policy:
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
-                ref_policy_cls = RayClassWithInitArgs(
-                    self.role_worker_mapping[Role.RefPolicy],
-                    config=self.config.actor_rollout_ref,
-                    role=str(Role.RefPolicy),
-                )
-                self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
-
-            if self.use_rm:
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-                rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
-                self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
-
-            for resource_pool, class_dict in self.resource_pool_to_cls.items():
-                worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-                wg_dict = self.ray_worker_group_cls(
-                    resource_pool=resource_pool,
-                    ray_cls_with_init=worker_dict_cls,
-                    **wg_kwargs,
-                )
-                spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
-                all_wg.update(spawn_wg)
+            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            all_wg.update(spawn_wg)
 
         if self.use_critic:
             self.critic_wg = all_wg[str(Role.Critic)]
@@ -908,9 +857,6 @@ class RayPPOTrainer:
             self.rm_wg.init_model()
 
         self.teacher_rollout_wg = None
-        if train_mode == "heterogeneous_distill":
-            self.teacher_rollout_wg = all_wg[str(Role.TeacherRollout)]
-            self.teacher_rollout_wg.init_model()
 
         self.actor_rollout_wg = all_wg[str(Role.ActorRollout)]
         self.actor_rollout_wg.init_model()
@@ -1146,283 +1092,212 @@ class RayPPOTrainer:
     def _repeat_base_batch_for_rollout_n(self, base_batch: DataProto, rollout_n: int) -> DataProto:
         return base_batch.repeat(repeat_times=rollout_n, interleave=True)
 
-    def _build_hetero_distill_batch(
-        self,
-        base_batch: DataProto,
-        student_batch: DataProto,
-        teacher_batch: DataProto,
-        student_reward_tensor: torch.Tensor,
-        teacher_reward_tensor: torch.Tensor,
-    ) -> DataProto:
-        import numpy as np
-        import torch
-        import uuid
+    def _ensure_response_mask(self, data: DataProto):
+        if "response_mask" not in data.batch:
+            response_len = data.batch["responses"].shape[-1]
+            data.batch["response_mask"] = data.batch["attention_mask"][:, -response_len:]
+        return data
 
-        if base_batch is None or student_batch is None or teacher_batch is None:
-            return None
-        if "input_ids" not in base_batch.batch:
-            return None
-        if "responses" not in student_batch.batch or "responses" not in teacher_batch.batch:
-            return None
-        if "input_ids" not in student_batch.batch:
-            return None
-        if base_batch.batch["input_ids"].shape[0] == 0:
-            return None
-        if student_batch.batch["responses"].shape[0] == 0 or teacher_batch.batch["responses"].shape[0] == 0:
-            return None
-        if student_batch.batch["input_ids"].shape[0] == 0:
-            return None
-        if student_reward_tensor is None or teacher_reward_tensor is None:
-            return None
-        if student_reward_tensor.numel() == 0 or teacher_reward_tensor.numel() == 0:
-            return None
+    def _init_hetero_train_state(self):
+        hetero_cfg = self.config.algorithm.get("hetero_distill", {})
 
-        student_correct = self._compute_binary_correctness_from_reward_tensor(student_reward_tensor).cpu()
-        teacher_correct = self._compute_binary_correctness_from_reward_tensor(teacher_reward_tensor).cpu()
+        self.student_rollout_n = hetero_cfg.get("student_rollout_n", 8)
 
-        base_bs = len(base_batch.batch["input_ids"])
-        student_n = self.student_rollout_n
-        teacher_n = self.teacher_rollout_n
-
-        if student_n <= 0 or teacher_n <= 0:
-            return None
-
-        expected_student = base_bs * student_n
-        expected_teacher = base_bs * teacher_n
-
-        if student_reward_tensor.shape[0] != expected_student:
-            return None
-        if teacher_reward_tensor.shape[0] != expected_teacher:
-            return None
-        if student_batch.batch["responses"].shape[0] != expected_student:
-            return None
-        if teacher_batch.batch["responses"].shape[0] != expected_teacher:
-            return None
-        if student_batch.batch["input_ids"].shape[0] != expected_student:
-            return None
-
-        # Optional tensor fields in student_batch
-        has_student_attention_mask = "attention_mask" in student_batch.batch
-        has_student_position_ids = "position_ids" in student_batch.batch
-        has_student_response_mask = "response_mask" in student_batch.batch
-
-        student_resp_texts = self._extract_response_texts_from_batch(student_batch)
-        teacher_resp_texts = self._extract_response_texts_from_batch(teacher_batch)
-
-        prompt_texts = [
-            self.tokenizer.decode(ids, skip_special_tokens=True)
-            for ids in base_batch.batch["input_ids"]
-        ]
-
-        if "uid" in base_batch.non_tensor_batch:
-            uids = list(base_batch.non_tensor_batch["uid"])
-        else:
-            uids = [str(uuid.uuid4()) for _ in range(base_bs)]
-
-        critic_icl_opd = getattr(self.config.trainer, "critic_icl_opd", False)
-
-        tensor_input_ids = []
-        tensor_attention_mask = []
-        tensor_position_ids = []
-        tensor_responses = []
-        tensor_response_mask = []
-
-        non_tensor_distill_type = []
-        non_tensor_demo_text = []
-        non_tensor_wrong_response_text = []
-        non_tensor_prompt_text = []
-        non_tensor_uid = []
-
-        def choose_one(items):
-            if len(items) == 0:
-                return None
-            if self.sample_demo_strategy == "random":
-                idx = np.random.randint(0, len(items))
-                return items[idx]
-            return items[0]
-
-        def build_wrong_trajectory_from_student(j):
-            """
-            Directly reuse student wrong trajectory tensors from student_batch.
-            Assumes student_batch.batch["input_ids"] already contains full prompt + response token ids.
-            """
-            input_ids = student_batch.batch["input_ids"][j]
-
-            if has_student_attention_mask:
-                attention_mask = student_batch.batch["attention_mask"][j]
-            else:
-                attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-
-            if has_student_position_ids:
-                position_ids = student_batch.batch["position_ids"][j]
-            else:
-                position_ids = torch.arange(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
-
-            responses = student_batch.batch["responses"][j]
-
-            if has_student_response_mask:
-                response_mask = student_batch.batch["response_mask"][j]
-            else:
-                response_mask = torch.ones_like(responses, dtype=torch.long)
-
-            if response_mask.numel() == 0 or response_mask.sum().item() == 0:
-                return None
-
-            return {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "responses": responses,
-                "response_mask": response_mask,
-            }
-
-        def append_sample(encoded_item, distill_type, demo_text, wrong_text, prompt_text, uid):
-            tensor_input_ids.append(encoded_item["input_ids"])
-            tensor_attention_mask.append(encoded_item["attention_mask"])
-            tensor_position_ids.append(encoded_item["position_ids"])
-            tensor_responses.append(encoded_item["responses"])
-            tensor_response_mask.append(encoded_item["response_mask"])
-
-            non_tensor_distill_type.append(distill_type)
-            non_tensor_demo_text.append(demo_text)
-            non_tensor_wrong_response_text.append(wrong_text)
-            non_tensor_prompt_text.append(prompt_text)
-            non_tensor_uid.append(uid)
-
-        for i in range(base_bs):
-            s_l = i * student_n
-            s_r = (i + 1) * student_n
-            t_l = i * teacher_n
-            t_r = (i + 1) * teacher_n
-
-            student_correct_texts = [
-                student_resp_texts[j] for j in range(s_l, s_r) if bool(student_correct[j].item())
-            ]
-            student_wrong_items = [
-                (j, student_resp_texts[j]) for j in range(s_l, s_r) if not bool(student_correct[j].item())
-            ]
-            teacher_correct_texts = [
-                teacher_resp_texts[j] for j in range(t_l, t_r) if bool(teacher_correct[j].item())
-            ]
-
-            student_has_correct = len(student_correct_texts) > 0
-            student_has_wrong = len(student_wrong_items) > 0
-            teacher_has_correct = len(teacher_correct_texts) > 0
-
-            # 1) student 全对：跳过
-            if not student_has_wrong:
-                continue
-
-            # 2) student 和 teacher 全错：跳过
-            if (not student_has_correct) and (not teacher_has_correct):
-                continue
-
-            prompt_text = prompt_texts[i]
-            uid = uids[i]
-
-            # Directly build all wrong student trajectories once, then reuse for sdft / icl_opd
-            encoded_wrong_items = []
-            for j, wrong_text in student_wrong_items:
-                encoded_item = build_wrong_trajectory_from_student(j)
-                if encoded_item is None:
-                    continue
-                encoded_wrong_items.append((wrong_text, encoded_item))
-
-            if len(encoded_wrong_items) == 0:
-                continue
-
-            # SDFT samples: use student correct demonstration on student wrong trajectories
-            if self.use_sdft and len(student_correct_texts) > 0:
-                demo_text = choose_one(student_correct_texts)
-                for wrong_text, encoded_item in encoded_wrong_items:
-                    append_sample(
-                        encoded_item=encoded_item,
-                        distill_type="sdft",
-                        demo_text=demo_text,
-                        wrong_text=wrong_text,
-                        prompt_text=prompt_text,
-                        uid=uid,
-                    )
-
-            # ICL-OPD samples: use teacher correct demonstration on student wrong trajectories
-            # If critic_icl_opd=True, teacher only guides when student is all wrong.
-            allow_teacher_guide = False
-            if self.use_icl_opd and len(teacher_correct_texts) > 0:
-                if critic_icl_opd:
-                    allow_teacher_guide = not student_has_correct
-                else:
-                    allow_teacher_guide = True
-
-            if allow_teacher_guide:
-                demo_text = choose_one(teacher_correct_texts)
-                for wrong_text, encoded_item in encoded_wrong_items:
-                    append_sample(
-                        encoded_item=encoded_item,
-                        distill_type="icl_opd",
-                        demo_text=demo_text,
-                        wrong_text=wrong_text,
-                        prompt_text=prompt_text,
-                        uid=uid,
-                    )
-
-        if len(tensor_input_ids) == 0:
-            return None
-
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        max_input_len = max(x.shape[0] for x in tensor_input_ids)
-        max_resp_len = max(x.shape[0] for x in tensor_responses)
-
-        def pad_1d(x, max_len, pad_value=0):
-            if x.shape[0] == max_len:
-                return x
-            pad = torch.full((max_len - x.shape[0],), pad_value, dtype=x.dtype, device=x.device)
-            return torch.cat([x, pad], dim=0)
-
-        input_ids = torch.stack([pad_1d(x, max_input_len, pad_id) for x in tensor_input_ids], dim=0)
-        attention_mask = torch.stack([pad_1d(x, max_input_len, 0) for x in tensor_attention_mask], dim=0)
-        position_ids = torch.stack([pad_1d(x, max_input_len, 0) for x in tensor_position_ids], dim=0)
-        responses = torch.stack([pad_1d(x, max_resp_len, pad_id) for x in tensor_responses], dim=0)
-        response_mask = torch.stack([pad_1d(x, max_resp_len, 0) for x in tensor_response_mask], dim=0)
-
-        distill_batch = DataProto.from_dict(
-            tensors={
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "responses": responses,
-                "response_mask": response_mask,
-            },
-            non_tensors={
-                "distill_type": np.array(non_tensor_distill_type, dtype=object),
-                "demo_text": np.array(non_tensor_demo_text, dtype=object),
-                "wrong_response_text": np.array(non_tensor_wrong_response_text, dtype=object),
-                "prompt_text": np.array(non_tensor_prompt_text, dtype=object),
-                "uid": np.array(non_tensor_uid, dtype=object),
-            },
-            meta_info={
-                "distill_mode": "heterogeneous_distill",
-                "sdft_weight": self.sdft_weight,
-                "icl_opd_weight": self.icl_opd_weight,
-                "critic_icl_opd": critic_icl_opd,
-            },
+        self.grpo_update_batch_size = hetero_cfg.get(
+            "grpo_update_batch_size",
+            self.config.actor_rollout_ref.actor.ppo_mini_batch_size,
+        )
+        self.opd_update_batch_size = hetero_cfg.get(
+            "opd_update_batch_size",
+            self.config.actor_rollout_ref.actor.ppo_mini_batch_size,
         )
 
-        multiple = 6
-        bsz = len(distill_batch)
-        keep = (bsz // multiple) * multiple
-        if keep == 0:
-            return None
-        if keep != bsz:
-            distill_batch = distill_batch[:keep]
+        assert self.grpo_update_batch_size % self.student_rollout_n == 0
+        assert self.opd_update_batch_size % self.student_rollout_n == 0
 
-        print(f'[DEBUG] Hetero_distill_batch_size: {len(distill_batch)}')
-        return distill_batch
+        self.actor_update_steps = 0
+        self.grpo_update_steps = 0
+        self.opd_update_steps = 0
 
-    def fit_heterogeneous_distill(self):
+    def _build_hetero_train_batches(
+        self,
+        student_batch: DataProto,
+        student_reward_tensor: torch.Tensor,
+    ):
+        import numpy as np
+        import torch
+
+        n_s = self.student_rollout_n
+        n_t = self.teacher_rollout_n
+
+        student_batch = self._ensure_response_mask(student_batch)
+
+        s_bsz = len(student_batch)
+        assert s_bsz % n_s == 0
+
+        num_groups = s_bsz // n_s
+
+        if "uid" not in student_batch.non_tensor_batch:
+            student_batch.non_tensor_batch["uid"] = np.repeat(
+                np.arange(num_groups).astype(str),
+                n_s,
+            )
+
+        if "data_source" not in student_batch.non_tensor_batch:
+            raise KeyError("student_batch.non_tensor_batch must contain data_source")
+
+        if "index" not in student_batch.non_tensor_batch:
+            raise KeyError("student_batch.non_tensor_batch must contain index")
+
+        if student_reward_tensor.dim() > 1:
+            s_score_flat = student_reward_tensor.detach().float().sum(dim=-1)
+        else:
+            s_score_flat = student_reward_tensor.detach().float()
+
+        s_score = s_score_flat.view(num_groups, n_s)
+        s_correct = s_score > 0
+
+        data_sources = student_batch.non_tensor_batch["data_source"]
+        indices = student_batch.non_tensor_batch["index"]
+
+        teacher_has_correct = []
+        teacher_missing_count = 0
+        teacher_sampled_correct_count = 0
+        teacher_sampled_total_count = 0
+
+        for g in range(num_groups):
+            base_idx = g * n_s
+            data_source = data_sources[base_idx]
+            index = indices[base_idx]
+            question_id = f"{data_source}_{index}"
+
+            sampled_rewards = self._sample_offline_teacher_rewards(question_id, n_t)
+
+            if sampled_rewards is None:
+                teacher_missing_count += 1
+                teacher_has_correct.append(False)
+                continue
+
+            sampled_correct = sampled_rewards > 0
+            teacher_has_correct.append(bool(sampled_correct.any()))
+
+            teacher_sampled_correct_count += int(sampled_correct.sum())
+            teacher_sampled_total_count += int(len(sampled_correct))
+
+        teacher_has_correct = torch.tensor(
+            teacher_has_correct,
+            dtype=torch.bool,
+            device=s_correct.device,
+        )
+
+        s_all_correct = s_correct.all(dim=-1)
+        s_all_wrong = (~s_correct).all(dim=-1)
+        s_mixed = ~(s_all_correct | s_all_wrong)
+
+        grpo_group_mask = s_mixed
+        opd_group_mask = s_all_wrong & teacher_has_correct
+        skip_teacher_all_wrong_mask = s_all_wrong & (~teacher_has_correct)
+
+        grpo_groups = torch.nonzero(grpo_group_mask, as_tuple=False).flatten()
+        opd_groups = torch.nonzero(opd_group_mask, as_tuple=False).flatten()
+
+        def expand_student_indices(groups):
+            if groups.numel() == 0:
+                return torch.empty(0, dtype=torch.long)
+            offsets = torch.arange(n_s, device=groups.device).view(1, n_s)
+            return (groups.view(-1, 1) * n_s + offsets).reshape(-1).long()
+
+        grpo_idx = expand_student_indices(grpo_groups).cpu()
+        opd_idx = expand_student_indices(opd_groups).cpu()
+
+        grpo_batch = None
+        opd_batch = None
+
+        if grpo_idx.numel() > 0:
+            grpo_batch = _index_dataproto(student_batch, grpo_idx)
+            grpo_reward = student_reward_tensor.detach().cpu()[grpo_idx]
+            grpo_batch.batch["token_level_rewards"] = grpo_reward
+            grpo_batch.batch["token_level_scores"] = grpo_reward
+
+            if "old_log_probs" not in grpo_batch.batch and "rollout_log_probs" in grpo_batch.batch:
+                grpo_batch.batch["old_log_probs"] = grpo_batch.batch["rollout_log_probs"]
+
+        if opd_idx.numel() > 0:
+            opd_batch = _index_dataproto(student_batch, opd_idx)
+
+        teacher_sampled_correct_rate = (
+            teacher_sampled_correct_count / teacher_sampled_total_count
+            if teacher_sampled_total_count > 0
+            else 0.0
+        )
+
+        stats = {
+            "hetero/student_all_correct_group_count": int(s_all_correct.sum().item()),
+            "hetero/student_mixed_group_count": int(s_mixed.sum().item()),
+            "hetero/student_all_wrong_teacher_has_correct_group_count": int(opd_group_mask.sum().item()),
+            "hetero/student_all_wrong_teacher_no_correct_group_count": int(skip_teacher_all_wrong_mask.sum().item()),
+            "hetero/grpo_candidate_group_count": int(grpo_groups.numel()),
+            "hetero/opd_candidate_group_count": int(opd_groups.numel()),
+            "hetero/offline_teacher_missing_group_count": int(teacher_missing_count),
+            "hetero/offline_teacher_sampled_correct_rate": float(teacher_sampled_correct_rate),
+        }
+
+        return grpo_batch, opd_batch, stats
+
+    def _make_fixed_size_grouped_batch(
+        self,
+        data: DataProto,
+        rollout_n: int,
+        update_batch_size: int,
+        prefix: str,
+    ):
+        import numpy as np
+
+        if data is None or len(data) == 0:
+            return None, {
+                f"{prefix}/candidate_rows": 0,
+                f"{prefix}/candidate_groups": 0,
+                f"{prefix}/used_rows": 0,
+                f"{prefix}/used_groups": 0,
+                f"{prefix}/repeat_groups": 0,
+            }
+
+        assert len(data) % rollout_n == 0
+        assert update_batch_size % rollout_n == 0
+
+        num_groups = len(data) // rollout_n
+        target_groups = update_batch_size // rollout_n
+
+        if num_groups >= target_groups:
+            group_ids = np.random.choice(num_groups, size=target_groups, replace=False)
+            repeated_group_count = 0
+        else:
+            group_ids = np.random.choice(num_groups, size=target_groups, replace=True)
+            repeated_group_count = target_groups - num_groups
+
+        row_offsets = np.arange(rollout_n)
+        row_indices = (group_ids[:, None] * rollout_n + row_offsets[None, :]).reshape(-1)
+
+        fixed_batch = _index_dataproto(data, row_indices)
+
+        stats = {
+            f"{prefix}/candidate_rows": int(len(data)),
+            f"{prefix}/candidate_groups": int(num_groups),
+            f"{prefix}/used_rows": int(len(fixed_batch)),
+            f"{prefix}/used_groups": int(target_groups),
+            f"{prefix}/repeat_groups": int(max(0, repeated_group_count)),
+        }
+
+        return fixed_batch, stats
+
+    def fit_heterogeneous(self):
         from omegaconf import OmegaConf
         from pprint import pprint
         from tqdm import tqdm
         from verl.utils.tracking import Tracking
+
+        if not hasattr(self, "grpo_buffer"):
+            self._init_hetero_train_state()
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -1432,9 +1307,6 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
-
-        # load checkpoint first
-        # self._load_checkpoint()
 
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
@@ -1477,11 +1349,6 @@ class RayPPOTrainer:
                         [str(uuid.uuid4()) for _ in range(len(batch.batch["input_ids"]))], dtype=object
                     )
 
-                
-
-                # =========================
-                # 1) student and teacher rollout
-                # =========================
                 student_gen_batch = self._repeat_base_batch_for_rollout_n(batch, self.student_rollout_n)
                 if self._is_empty_dataproto(student_gen_batch):
                     metrics["hetero/skip_empty_student_gen_batch"] = 1
@@ -1520,68 +1387,22 @@ class RayPPOTrainer:
                 }
 
 
-                teacher_gen_batch = self._repeat_base_batch_for_rollout_n(batch, self.teacher_rollout_n)
-                if self._is_empty_dataproto(teacher_gen_batch):
-                    metrics["hetero/skip_empty_teacher_gen_batch"] = 1
-
-                    if (
-                        self.val_reward_fn is not None
-                        and self.config.trainer.test_freq > 0
-                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                    ):
-                        val_metrics = self._validate()
-                        if is_last_step:
-                            last_val_metrics = val_metrics
-                        metrics.update(val_metrics)
-
-                    metrics.update(
-                        {
-                            "training/global_step": self.global_steps,
-                            "training/epoch": epoch,
-                        }
-                    )
-                    logger.log(data=metrics, step=self.global_steps)
-                    progress_bar.update(1)
-                    self.global_steps += 1
-
-                    if is_last_step:
-                        pprint(f"Final validation metrics: {last_val_metrics}")
-                        progress_bar.close()
-                        return
-                    continue
-                teacher_gen_batch.meta_info = {
-                    "eos_token_id": self.tokenizer.eos_token_id,
-                    "pad_token_id": self.tokenizer.pad_token_id,
-                    "do_sample": True,
-                    "validate": False,
-                    "global_steps": self.global_steps,
-                }
-
-
                 rollout_start = time.time()
-                student_future = self.actor_rollout_wg.generate_sequences_async(student_gen_batch)
-                teacher_future = self.teacher_rollout_wg.generate_sequences_async(teacher_gen_batch)
-                
-                student_rollout_batch, teacher_rollout_batch = RayAsyncCollectHandle.gather(
-                    [student_future, teacher_future]
-                )
+                student_rollout_batch = self.actor_rollout_wg.generate_sequences(student_gen_batch)
                 rollout_end = time.time()
 
-                print(f"[DEBUG] Parallel student+teacher rollout time cost: {rollout_end-rollout_start} s")
+                print(f"[DEBUG] Student rollout time cost: {rollout_end-rollout_start} s")
 
-                student_batch = union_gen_and_rollout_batch(student_gen_batch, student_rollout_batch)
+                student_batch = student_rollout_batch
+                student_batch = self._ensure_response_mask(student_batch)
 
-                # =====================================
-                student_average_response_length = 0 
+                student_response_len = student_batch.batch["response_mask"].sum(dim=-1).float().mean().item()
+                metrics["hetero/student_response_length_mean"] = student_response_len
+
+                # ======Rollout Debug Start ======
                 student_batch_size = len(student_batch.batch["prompts"])
                 print(f'[DEBUG] Student rollout batch size: {student_batch_size}')
-                for i in range(student_batch_size):
-                    prompt_ids = student_batch.batch["prompts"][i]
-                    prompt_length = prompt_ids.shape[0]
-                    attention_mask = student_batch.batch["attention_mask"][i]
-                    valid_response_length = attention_mask[prompt_length:].sum().item()
-                    student_average_response_length += valid_response_length
-                print(f'[DEBUG] Student average response length: {student_average_response_length/student_batch_size}')
+                print(f'[DEBUG] Student average response length: {student_response_len}')
 
                 i= 0
                 prompt_ids = student_batch.batch["prompts"][i]
@@ -1593,99 +1414,99 @@ class RayPPOTrainer:
                 response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
                 print("[DEBUG] Student response_text:")
                 print(repr(response_text))
-                # =====================================
+                # ======Rollout Debug End ======
 
-                if "response_mask" not in student_batch.batch:
-                    student_batch.batch["response_mask"] = compute_response_mask(student_batch)
-
-                teacher_batch = union_gen_and_rollout_batch(teacher_gen_batch, teacher_rollout_batch)
-
-                # ===================================== 
-                teacher_average_response_length = 0
-                teacher_batch_size = len(teacher_batch.batch["prompts"])
-                print(f'[DEBUG] Teacher rollout batch size: {teacher_batch_size}')
-                for i in range(teacher_batch_size):
-                    prompt_ids = teacher_batch.batch["prompts"][i]
-                    prompt_length = prompt_ids.shape[0]
-                    attention_mask = teacher_batch.batch["attention_mask"][i]
-                    valid_response_length = attention_mask[prompt_length:].sum().item()
-                    teacher_average_response_length += valid_response_length
-                print(f'[DEBUG] Teacher average response length: {teacher_average_response_length/teacher_batch_size}')
-
-                i= 0
-                prompt_ids = teacher_batch.batch["prompts"][i]
-                prompt_length = prompt_ids.shape[0]
-                attention_mask = teacher_batch.batch["attention_mask"][i]
-                response_ids = teacher_batch.batch["responses"][i]
-                valid_response_length = attention_mask[prompt_length:].sum().item()
-                valid_response_ids = response_ids[:valid_response_length]
-                response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
-                print("[DEBUG] Teacher response_text:")
-                print(repr(response_text))
-                # =====================================
-
-                if "response_mask" not in teacher_batch.batch:
-                    teacher_batch.batch["response_mask"] = compute_response_mask(teacher_batch)
 
                 # =========================
                 # 3) reward / correctness
                 # =========================
                 student_reward_tensor, student_reward_extra_infos = compute_reward(student_batch, self.reward_fn)
-                teacher_reward_tensor, teacher_reward_extra_infos = compute_reward(teacher_batch, self.reward_fn)
+                student_correct = self._compute_binary_correctness_from_reward_tensor(student_reward_tensor)
+
+                metrics["hetero/student_rollout_correct_rate"] = student_correct.float().mean().item()
 
                 # =========================
                 # 4) build distillation batch
                 # =========================
-                distill_batch = self._build_hetero_distill_batch(
-                    base_batch=batch,
+                grpo_batch, opd_batch, build_stats = self._build_hetero_train_batches(
                     student_batch=student_batch,
-                    teacher_batch=teacher_batch,
                     student_reward_tensor=student_reward_tensor,
-                    teacher_reward_tensor=teacher_reward_tensor,
                 )
+                metrics.update(build_stats)
 
-                student_correct = self._compute_binary_correctness_from_reward_tensor(student_reward_tensor)
-                teacher_correct = self._compute_binary_correctness_from_reward_tensor(teacher_reward_tensor)
-
-                metrics["hetero/student_rollout_correct_rate"] = student_correct.float().mean().item()
-                metrics["hetero/teacher_rollout_correct_rate"] = teacher_correct.float().mean().item()
-                metrics["hetero/student_rollout_count"] = int(student_correct.numel())
-                metrics["hetero/teacher_rollout_count"] = int(teacher_correct.numel())
-
-                if distill_batch is None or len(distill_batch.batch["input_ids"]) == 0:
-                    metrics["hetero/distill_sample_count"] = 0
-
-                    if (
-                        self.val_reward_fn is not None
-                        and self.config.trainer.test_freq > 0
-                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                    ):
-                        val_metrics = self._validate()
-                        if is_last_step:
-                            last_val_metrics = val_metrics
-                        metrics.update(val_metrics)
-
-                    logger.log(data=metrics, step=self.global_steps)
-                    progress_bar.update(1)
-                    self.global_steps += 1
-
-                    if is_last_step:
-                        pprint(f"Final validation metrics: {last_val_metrics}")
-                        progress_bar.close()
-                        return
-                    continue
-
-                metrics["hetero/distill_sample_count"] = len(distill_batch.batch["input_ids"])
-                distill_types = list(distill_batch.non_tensor_batch["distill_type"])
-                metrics["hetero/sdft_sample_count"] = sum(1 for x in distill_types if x == "sdft")
-                metrics["hetero/icl_opd_sample_count"] = sum(1 for x in distill_types if x == "icl_opd")
+                use_grpo = self.config.algorithm.hetero_distill.get("use_grpo", True)
+                use_opd = self.config.algorithm.hetero_distill.get("use_opd", True)
 
                 # =========================
-                # 5) update student by distillation
+                # GRPO update
                 # =========================
-                actor_output = self.actor_rollout_wg.update_actor_distill(distill_batch)
-                actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                metrics.update(actor_output_metrics)
+                if use_grpo and grpo_batch is not None and len(grpo_batch) > 0:
+                    grpo_batch = compute_advantage(
+                        data=grpo_batch,
+                        adv_estimator=AdvantageEstimator.GRPO,
+                        gamma=self.config.algorithm.get("gamma", 1.0),
+                        lam=self.config.algorithm.get("lam", 1.0),
+                        num_repeat=self.student_rollout_n,
+                        norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                        config=self.config.algorithm,
+                    )
+
+                    update_batch, fix_stats = self._make_fixed_size_grouped_batch(
+                        data=grpo_batch,
+                        rollout_n=self.student_rollout_n,
+                        update_batch_size=self.grpo_update_batch_size,
+                        prefix="hetero/grpo",
+                    )
+                    metrics.update(fix_stats)
+
+                    # ========= Debug Start ============
+                    
+                    # =========  Debug End  ============
+
+                    if update_batch is not None and len(update_batch) > 0:
+                        print("[DEBUG] GRPO UPDATE START.")
+                        old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
+                        update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
+                        actor_output = self.actor_rollout_wg.update_actor_grpo(update_batch)
+                        actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update({f"grpo/{k}": v for k, v in actor_metrics.items()})
+
+                        self.grpo_update_steps += 1
+                        self.actor_update_steps += 1
+                else:
+                    metrics["hetero/grpo_skip_no_candidate"] = 1
+
+
+                # =========================
+                # OPD update
+                # =========================
+                if use_opd and opd_batch is not None and len(opd_batch) > 0:
+                    update_batch, fix_stats = self._make_fixed_size_grouped_batch(
+                        data=opd_batch,
+                        rollout_n=self.student_rollout_n,
+                        update_batch_size=self.opd_update_batch_size,
+                        prefix="hetero/opd",
+                    )
+                    metrics.update(fix_stats)
+
+                    if update_batch is not None and len(update_batch) > 0:
+                        print("[DEBUG] OPD UPDATE START.")
+                        old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
+                        update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
+                        teacher_log_probs = self.actor_rollout_wg.compute_ref_log_prob(update_batch)
+                        update_batch.batch["teacher_log_probs"] = teacher_log_probs.batch["ref_log_prob"]
+                        actor_output = self.actor_rollout_wg.update_actor_opd(update_batch)
+                        actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update({f"opd/{k}": v for k, v in actor_metrics.items()})
+
+                        self.opd_update_steps += 1
+                        self.actor_update_steps += 1
+                else:
+                    metrics["hetero/opd_skip_no_candidate"] = 1
+
+                metrics["training/grpo_update_steps"] = self.grpo_update_steps
+                metrics["training/opd_update_steps"] = self.opd_update_steps
+                metrics["training/actor_update_steps"] = self.actor_update_steps
 
                 # =========================
                 # 6) validate / save / log
@@ -1696,6 +1517,7 @@ class RayPPOTrainer:
                     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
                 ):
                     val_metrics = self._validate()
+                    pprint(f"Validation metrics: {val_metrics}")
                     if is_last_step:
                         last_val_metrics = val_metrics
                     metrics.update(val_metrics)
@@ -1729,7 +1551,7 @@ class RayPPOTrainer:
         The light-weight advantage computation is done on the driver process.
         """
         if self.is_hetero_distill:
-            return self.fit_heterogeneous_distill()
+            return self.fit_heterogeneous()
 
         from omegaconf import OmegaConf
 
