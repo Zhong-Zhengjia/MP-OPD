@@ -14,12 +14,12 @@ teacher_model_name="Qwen3-${teacher_model_subfix}"
 ability=Math
 
 
-test_files=/mnt/petrelfs/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/val_union_mini_1000.parquet
-train_files=/mnt/petrelfs/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_union_passed_70.parquet
-teacher_offline_rollout_results_path="/mnt/petrelfs/fudaocheng/datasets/G-OPD-Training-Data/offline_rollout_results/${teacher_model_name}_DeepMath-103K_pass@16.json"
+test_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/DeepMath-103K/val_union_mini_1000.parquet
+train_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_union_passed_70.parquet
+teacher_offline_rollout_results_path="/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/offline_rollout_results/${teacher_model_name}_DeepMath-103K_pass@16.json"
 
-student_model_path="/mnt/petrelfs/fudaocheng/checkpoints/huggingface/Qwen3-${student_model_subfix}"
-teacher_model_path="/mnt/petrelfs/fudaocheng/checkpoints/huggingface/Qwen3-${teacher_model_subfix}"
+student_model_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/huggingface/Qwen3-${student_model_subfix}"
+teacher_model_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/huggingface/Qwen3-${teacher_model_subfix}"
 
 today=$(date +%Y%m%d)
 grpo_batch_size=1024
@@ -43,7 +43,7 @@ use_grpo=$(batch_size_to_bool grpo "$grpo_batch_size")
 use_opd=$(batch_size_to_bool opd "$opd_batch_size")
 output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${ability}"
 method=LP
-output_path="/mnt/petrelfs/fudaocheng/checkpoints/trained/learn_and_play/${method}_${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}"
+output_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/learn_and_play/${method}_${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}"
 
 n_node=1
 n_gpu=8
