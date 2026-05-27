@@ -301,33 +301,82 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
             return entropy, log_probs
-
             
-    def _optimizer_step(self):
+    # def _optimizer_step(self):
+    #     assert self.config.grad_clip is not None
+    #     if self.scaler is not None:
+    #         self.scaler.unscale_(self.actor_optimizer)
+
+    #     if isinstance(self.actor_module, FSDP):
+    #         grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
+    #     elif isinstance(self.actor_module, FSDPModule):
+    #         grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+    #     else:
+    #         grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+
+    #     if isinstance(grad_norm, DTensor):
+    #         grad_norm = grad_norm.full_tensor()
+
+    #     if self.scaler is not None:
+    #         self.scaler.step(self.actor_optimizer)
+    #         self.scaler.update()
+    #     else:
+    #         if not torch.isfinite(grad_norm):
+    #             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
+    #             self.actor_optimizer.zero_grad()
+    #         else:
+    #             self.actor_optimizer.step()
+    #     return grad_norm
+
+    def _optimizer_step(self, lr: float | None = None, lr_scale: float | None = None):
         assert self.config.grad_clip is not None
-        if self.scaler is not None:
-            self.scaler.unscale_(self.actor_optimizer)
+        assert not (lr is not None and lr_scale is not None), "lr and lr_scale cannot be set at the same time"
 
-        if isinstance(self.actor_module, FSDP):
-            grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
-        elif isinstance(self.actor_module, FSDPModule):
-            grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+        old_lrs = [group["lr"] for group in self.actor_optimizer.param_groups]
 
-        if isinstance(grad_norm, DTensor):
-            grad_norm = grad_norm.full_tensor()
+        if lr is not None:
+            for group in self.actor_optimizer.param_groups:
+                group["lr"] = lr
+        elif lr_scale is not None:
+            for group in self.actor_optimizer.param_groups:
+                group["lr"] = group["lr"] * lr_scale
 
-        if self.scaler is not None:
-            self.scaler.step(self.actor_optimizer)
-            self.scaler.update()
-        else:
-            if not torch.isfinite(grad_norm):
-                print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
-                self.actor_optimizer.zero_grad()
+        try:
+            if self.scaler is not None:
+                self.scaler.unscale_(self.actor_optimizer)
+
+            if isinstance(self.actor_module, FSDP):
+                grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
+            elif isinstance(self.actor_module, FSDPModule):
+                grad_norm = fsdp2_clip_grad_norm_(
+                    self.actor_module.parameters(),
+                    max_norm=self.config.grad_clip,
+                )
             else:
-                self.actor_optimizer.step()
-        return grad_norm
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.actor_module.parameters(),
+                    max_norm=self.config.grad_clip,
+                )
+
+            if isinstance(grad_norm, DTensor):
+                grad_norm = grad_norm.full_tensor()
+
+            if self.scaler is not None:
+                self.scaler.step(self.actor_optimizer)
+                self.scaler.update()
+            else:
+                if not torch.isfinite(grad_norm):
+                    print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
+                    self.actor_optimizer.zero_grad()
+                else:
+                    self.actor_optimizer.step()
+
+            return grad_norm
+
+        finally:
+            for group, old_lr in zip(self.actor_optimizer.param_groups, old_lrs):
+                group["lr"] = old_lr
+
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
@@ -409,6 +458,16 @@ class DataParallelPPOActor(BasePPOActor):
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
+        # ================ algorithm config ================
+        entropy_coeff = self.config.entropy_coeff
+        loss_agg_mode = self.config.loss_agg_mode
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+        policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+        grpo_lr_scale = self.config.get('grpo_lr_scale', 1.0)
+        print('[DEBUG] grpo_lr_scale: ', grpo_lr_scale)
+        # ================ algorithm config ================
+
         metrics = {}
 
         for epoch_i in range(self.config.ppo_epochs):
@@ -443,9 +502,6 @@ class DataParallelPPOActor(BasePPOActor):
                         prefix="actor/grpo_advantages",
                     )
 
-                    entropy_coeff = self.config.entropy_coeff
-                    loss_agg_mode = self.config.loss_agg_mode
-
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
@@ -453,42 +509,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                     calculate_entropy = entropy_coeff != 0
 
+                    rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs,
                         temperature=temperature,
                         calculate_entropy=calculate_entropy,
                     )
-
-                    # ================= DEBUG START ===================
-                    with torch.no_grad():
-                        delta_logp = log_prob - old_log_prob
-
-                        pos_mask = ((advantages > 0).float() * response_mask)
-                        neg_mask = ((advantages < 0).float() * response_mask)
-
-                        if pos_mask.sum() > 0:
-                            pos_delta = (delta_logp * pos_mask).sum() / pos_mask.sum()
-                            pos_ratio = (torch.exp(torch.clamp(delta_logp, -20, 20)) * pos_mask).sum() / pos_mask.sum()
-                        else:
-                            pos_delta = torch.tensor(0.0, device=log_prob.device)
-                            pos_ratio = torch.tensor(0.0, device=log_prob.device)
-
-                        if neg_mask.sum() > 0:
-                            neg_delta = (delta_logp * neg_mask).sum() / neg_mask.sum()
-                            neg_ratio = (torch.exp(torch.clamp(delta_logp, -20, 20)) * neg_mask).sum() / neg_mask.sum()
-                        else:
-                            neg_delta = torch.tensor(0.0, device=log_prob.device)
-                            neg_ratio = torch.tensor(0.0, device=log_prob.device)
-
-                        micro_batch_metrics["debug/grpo_delta_logp_pos_adv"] = pos_delta.detach().item()
-                        micro_batch_metrics["debug/grpo_delta_logp_neg_adv"] = neg_delta.detach().item()
-                        micro_batch_metrics["debug/grpo_ratio_pos_adv"] = pos_ratio.detach().item()
-                        micro_batch_metrics["debug/grpo_ratio_neg_adv"] = neg_ratio.detach().item()
-                    # ================= DEBUG END ===================
-
-                    rollout_is_weights = model_inputs.get("rollout_is_weights", None)
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     pg_loss, pg_metrics = policy_loss_fn(
                         old_log_prob=old_log_prob,
@@ -548,7 +575,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics["actor/grpo_pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
+                grad_norm = self._optimizer_step(lr_scale=grpo_lr_scale)
                 append_to_dict(metrics, {"actor/grpo_grad_norm": grad_norm.detach().item()})
 
         self.actor_optimizer.zero_grad()
@@ -568,7 +595,8 @@ class DataParallelPPOActor(BasePPOActor):
             "attention_mask",
             "position_ids",
             "teacher_log_probs",
-            "old_log_probs"
+            "old_log_probs",
+            "base_log_probs",
         ]
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -577,8 +605,17 @@ class DataParallelPPOActor(BasePPOActor):
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
+        # ================ algorithm config ================
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+        entropy_coeff = self.config.entropy_coeff
+        loss_agg_mode = self.config.loss_agg_mode
         policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+        use_pos_delta_logp_mask = self.config.get("use_pos_delta_logp_mask", False)
+        print('[DEBUG] use_pos_delta_logp_mask: ', use_pos_delta_logp_mask, type(use_pos_delta_logp_mask))
+        opd_lr_scale = self.config.get('opd_lr_scale', 0.2)
+        print('[DEBUG] opd_lr_scale: ', opd_lr_scale)
+        # ================ algorithm config ================
 
         metrics = {}
         opd_weight = 1.0
@@ -598,6 +635,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                did_backward = False
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -606,11 +644,8 @@ class DataParallelPPOActor(BasePPOActor):
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
                     teacher_log_probs = model_inputs["teacher_log_probs"].detach()
-                    old_log_prob = model_inputs["old_log_probs"]
-
-                    entropy_coeff = self.config.entropy_coeff
-                    loss_agg_mode = self.config.loss_agg_mode
-                    
+                    old_log_prob = model_inputs["old_log_probs"].detach()
+                    base_log_prob = model_inputs['base_log_probs'].detach()
 
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -625,34 +660,44 @@ class DataParallelPPOActor(BasePPOActor):
                         calculate_entropy=calculate_entropy,
                     )
 
-                    # opd_loss_mat = old_log_prob - teacher_log_probs
-                    reverse_kl = old_log_prob - teacher_log_probs
-                    advantages = (-(reverse_kl))
+                    # reverse_kl = old_log_prob - base_log_prob
+                    # reward_correction = teacher_log_probs - base_log_prob
+                    # reverse_kl = reverse_kl - reward_correction * 1.25
+                    # advantage = (-(reverse_kl))
+                    delta_log_prob = teacher_log_probs - old_log_prob
+                    advantages = delta_log_prob
 
+                    if use_pos_delta_logp_mask:
+                        policy_mask = response_mask * (delta_log_prob > 0).to(response_mask.dtype)
+                    else:
+                        policy_mask = response_mask
+                    if policy_mask.sum() == 0:
+                        continue
 
                     add_masked_advantage_metrics(
                         micro_batch_metrics,
                         advantages=advantages,
-                        response_mask=response_mask,
+                        response_mask=policy_mask,
                         prefix="actor/opd_advantages",
                     )
-                    
+
                     opd_loss, pg_metrics = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
-                        response_mask=response_mask,
+                        response_mask=policy_mask,
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=None,
                     )
-
+                    micro_batch_metrics.update(pg_metrics)
+                    
                     policy_loss = opd_loss * opd_weight
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(
                             loss_mat=entropy,
-                            loss_mask=response_mask,
+                            loss_mask=policy_mask,
                             loss_agg_mode=loss_agg_mode,
                         )
                         policy_loss = policy_loss - entropy_loss * entropy_coeff
@@ -665,14 +710,17 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss.backward()
 
+                    did_backward = True
+
+                    # ============== log metrics =============
                     student_logp = agg_loss(
                         loss_mat=log_prob,
-                        loss_mask=response_mask,
+                        loss_mask=policy_mask,
                         loss_agg_mode=loss_agg_mode,
                     )
                     teacher_logp = agg_loss(
                         loss_mat=teacher_log_probs,
-                        loss_mask=response_mask,
+                        loss_mask=policy_mask,
                         loss_agg_mode=loss_agg_mode,
                     )
 
@@ -680,11 +728,15 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics["actor/opd_weighted_loss"] = policy_loss.detach().item() * loss_scale_factor
                     micro_batch_metrics["actor/opd_student_log_prob"] = student_logp.detach().item() * loss_scale_factor
                     micro_batch_metrics["actor/opd_teacher_log_prob"] = teacher_logp.detach().item() * loss_scale_factor
+                    # =======================================
 
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
-                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+                if did_backward:
+                    grad_norm = self._optimizer_step(lr_scale=opd_lr_scale)
+                    append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+                else:
+                    append_to_dict(metrics, {"actor/grad_norm": 0.0})
 
         self.actor_optimizer.zero_grad()
         return metrics

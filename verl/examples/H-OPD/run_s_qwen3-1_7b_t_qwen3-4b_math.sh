@@ -7,23 +7,46 @@ export WANDB_MODE=online
 export USED_MODEL="no_api"
 
 
-student_model_subfix=4B
-teacher_model_subfix=1.7B
+student_model_subfix=1.7B
+teacher_model_subfix=4B
 student_model_name="Qwen3-${student_model_subfix}"
 teacher_model_name="Qwen3-${teacher_model_subfix}"
 ability=Math
 
 
-test_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/DeepMath-103K/val_union_mini_1000.parquet
+test_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/val_union_mini_1000.parquet
 train_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_union_passed_70.parquet
 teacher_offline_rollout_results_path="/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/offline_rollout_results/${teacher_model_name}_DeepMath-103K_pass@16.json"
 
 student_model_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/huggingface/Qwen3-${student_model_subfix}"
 teacher_model_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/huggingface/Qwen3-${teacher_model_subfix}"
 
-today=$(date +%Y%m%d)
+today=$(date +%m%d_%H)
+
+# grpo configs
 grpo_batch_size=1024
-opd_batch_size=128
+use_hetero_adv=false
+grpo_lr_scale=1.0
+
+# opd configs
+opd_batch_size=1024
+strict_opd=false   # dosen't matter, opd is relative to distribution, not correctness
+opd_lr_scale=1.0
+use_pos_delta_logp_mask=true
+
+# update mode config
+update_mode=warmup   # in [alt, both, warmup]
+    # alt update configs
+opd_steps=10
+grpo_steps=50
+    # warmup update configs
+warmup_steps=20
+
+
+n_node=1
+n_gpu=8
+lr=1e-6
+val_n=2
 
 batch_size_to_bool() {
     local name="$1"
@@ -45,10 +68,6 @@ output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${abil
 method=LP
 output_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/learn_and_play/${method}_${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}"
 
-n_node=1
-n_gpu=8
-lr=1e-6
-
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
 
@@ -68,7 +87,13 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.student_rollout_n=8 \
     +algorithm.hetero_distill.teacher_rollout_n=8 \
     +algorithm.hetero_distill.use_grpo=$use_grpo \
+    +algorithm.hetero_distill.use_hetero_adv=$use_hetero_adv \
     +algorithm.hetero_distill.use_opd=$use_opd \
+    +algorithm.hetero_distill.strict_opd=$strict_opd \
+    +algorithm.hetero_distill.update_mode=$update_mode \
+    +algorithm.hetero_distill.opd_steps=$opd_steps \
+    +algorithm.hetero_distill.grpo_steps=$grpo_steps \
+    +algorithm.hetero_distill.warmup_steps=$warmup_steps \
     +algorithm.hetero_distill.offline_teacher_rollout_path=$teacher_offline_rollout_results_path \
     +algorithm.hetero_distill.grpo_update_batch_size=$grpo_batch_size \
     +algorithm.hetero_distill.opd_update_batch_size=$opd_batch_size \
@@ -80,7 +105,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=True \
-    data.seed=1234 \
+    data.seed=56 \
     data.return_raw_chat=True \
     +data.apply_chat_template_kwargs.enable_thinking=false \
     actor_rollout_ref.model.path=$student_model_path \
@@ -106,7 +131,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
-    actor_rollout_ref.rollout.val_kwargs.n=2 \
+    actor_rollout_ref.rollout.val_kwargs.n=$val_n \
     actor_rollout_ref.rollout.calculate_log_probs=false \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
@@ -114,27 +139,24 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     actor_rollout_ref.actor.loss_agg_mode="seq-mean-token-mean" \
-    actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=false \
-    actor_rollout_ref.actor.policy_loss.multi_teacher_distill=false \
+    +actor_rollout_ref.actor.grpo_lr_scale=$grpo_lr_scale \
+    +actor_rollout_ref.actor.opd_lr_scale=$opd_lr_scale \
+    +actor_rollout_ref.actor.use_pos_delta_logp_mask=$use_pos_delta_logp_mask \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=false \
-    algorithm.rollout_correction.rollout_is=null \
-    algorithm.rollout_correction.rollout_is_threshold=null \
-    algorithm.rollout_correction.rollout_rs=null \
-    algorithm.rollout_correction.bypass_mode=false \
     reward_model.reward_manager=naive \
     trainer.critic_warmup=0 \
-    trainer.val_before_train=false \
+    trainer.val_before_train=true \
     trainer.logger='["console","wandb"]' \
     trainer.log_val_generations=10 \
-    trainer.project_name='learn_and_play_offline' \
+    trainer.project_name="LP_strong2weak" \
     trainer.experiment_name="${method}_${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}" \
     trainer.n_gpus_per_node=$n_gpu \
     trainer.nnodes=$n_node \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.max_critic_ckpt_to_keep=1 \
     trainer.save_freq=10 \
-    +trainer.best_metric_name="val-core/DeepMath-103K/reward/mean@2" \
+    +trainer.best_metric_name="val-core/DeepMath-103K/reward/mean@${val_n}" \
     +trainer.best_metric_mode="max" \
     trainer.default_local_dir=$output_path \
     trainer.test_freq=10 \

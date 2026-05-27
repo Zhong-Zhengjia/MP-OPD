@@ -19,10 +19,12 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import time
+from datetime import datetime
 import json
 import os
 import uuid
 import random
+import sqlite3
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -639,7 +641,111 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _prepare_validation_db(self):
+        base_dir = self.config.trainer.default_local_dir
+        os.makedirs(base_dir, exist_ok=True)
+
+        db_path = os.path.join(base_dir, "validation_results.db")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS validation_results (
+                    question_id TEXT NOT NULL,
+                    rollout_id INTEGER NOT NULL,
+                    reward INTEGER NOT NULL,
+                    data_source TEXT NOT NULL,
+                    sample_index TEXT NOT NULL,
+                    prompt TEXT,
+                    response TEXT NOT NULL,
+                    ground_truth TEXT,
+                    global_step INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (question_id, rollout_id)
+                )
+                """
+            )
+            conn.execute("DELETE FROM validation_results")
+
+        return db_path
+
+    def _to_db_scalar(self, x):
+        if isinstance(x, np.generic):
+            return x.item()
+        return x
+
+    def _to_json_str(self, x):
+        x = self._to_db_scalar(x)
+        if isinstance(x, np.ndarray):
+            x = x.tolist()
+        return json.dumps(x, ensure_ascii=False)
+
+    def _save_validation_rollouts_to_db(
+        self,
+        db_path,
+        data_batch,
+        input_texts,
+        output_texts,
+        ground_truths,
+        rewards,
+    ):
+        data_sources = data_batch.non_tensor_batch["data_source"]
+        indices = data_batch.non_tensor_batch["index"]
+
+        rollout_counter = defaultdict(int)
+        rows = []
+
+        for data_source, index, prompt, response, gt, reward in zip(
+            data_sources,
+            indices,
+            input_texts,
+            output_texts,
+            ground_truths,
+            rewards,
+        ):
+            data_source = str(self._to_db_scalar(data_source))
+            index = str(self._to_db_scalar(index))
+            question_id = f"{data_source}_{index}"
+
+            rollout_id = rollout_counter[question_id]
+            rollout_counter[question_id] += 1
+
+            rows.append(
+                (
+                    question_id,
+                    rollout_id,
+                    int(round(float(reward))),
+                    data_source,
+                    index,
+                    prompt,
+                    response,
+                    self._to_json_str(gt),
+                    int(self.global_steps),
+                )
+            )
+
+        with sqlite3.connect(db_path) as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO validation_results (
+                    question_id,
+                    rollout_id,
+                    reward,
+                    data_source,
+                    sample_index,
+                    prompt,
+                    response,
+                    ground_truth,
+                    global_step
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
     def _validate(self):
+        validation_db_path = self._prepare_validation_db()
+
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -723,6 +829,15 @@ class RayPPOTrainer:
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
+
+            self._save_validation_rollouts_to_db(
+                db_path=validation_db_path,
+                data_batch=test_batch,
+                input_texts=input_texts,
+                output_texts=output_texts,
+                ground_truths=ground_truths,
+                rewards=scores,
+            )
 
             reward_extra_infos_dict["reward"].extend(scores)
             if "reward_extra_info" in result:
@@ -1119,6 +1234,77 @@ class RayPPOTrainer:
         self.grpo_update_steps = 0
         self.opd_update_steps = 0
 
+    def _concat_dataproto_list(self, batches):
+        batches = [x for x in batches if x is not None and len(x) > 0]
+        if len(batches) == 0:
+            return None
+        if len(batches) == 1:
+            return batches[0]
+        return DataProto.concat(batches)
+
+    def _drop_grpo_transient_fields(self, data: DataProto):
+        if data is None:
+            return data
+        for k in ("old_log_probs", "teacher_log_probs", "base_log_probs"):
+            if k in data.batch:
+                data.batch.pop(k)
+        return data
+
+    def _compute_hetero_grpo_advantage(
+        self,
+        data: DataProto,
+        rollout_n: int,
+    ):
+        import numpy as np
+        import torch
+
+        assert data is not None and len(data) > 0
+        assert len(data) % rollout_n == 0
+
+        if "uid" not in data.non_tensor_batch:
+            raise KeyError("hetero_grpo_batch must contain uid")
+
+        uids = np.asarray(data.non_tensor_batch["uid"], dtype=object).reshape(-1, rollout_n)
+        if not np.all(uids == uids[:, :1]):
+            raise ValueError("hetero_grpo_batch is not strictly grouped by uid")
+
+        old_log_prob_output = self.actor_rollout_wg.compute_log_prob(data)
+        teacher_log_probs_output = self.actor_rollout_wg.compute_ref_log_prob(data)
+
+        old_log_probs = old_log_prob_output.batch["old_log_probs"]
+        teacher_log_probs = teacher_log_probs_output.batch["ref_log_prob"]
+
+        response_mask = data.batch["response_mask"].to(old_log_probs.device).float()
+
+        delta_log_probs = (teacher_log_probs - old_log_probs) * response_mask
+        seq_scores = delta_log_probs.sum(dim=-1) / response_mask.sum(dim=-1).clamp_min(1.0)
+
+        group_scores = seq_scores.view(-1, rollout_n)
+        group_mean = group_scores.mean(dim=-1, keepdim=True)
+        group_adv = group_scores - group_mean
+
+        if self.config.algorithm.get("norm_adv_by_std_in_grpo", True):
+            group_std = group_scores.std(
+                dim=-1,
+                keepdim=True,
+                unbiased=(rollout_n > 1),
+            )
+            group_adv = group_adv / (group_std + 1e-6)
+
+        seq_adv = group_adv.reshape(-1)
+        token_adv = seq_adv.unsqueeze(-1) * response_mask
+
+        target_device = data.batch["responses"].device
+        data.batch["advantages"] = token_adv.to(target_device)
+        data.batch["returns"] = token_adv.to(target_device)
+
+        stats = {
+            "hetero/hetero_grpo_delta_log_prob_mean": float(seq_scores.mean().item()),
+            "hetero/hetero_grpo_delta_log_prob_std": float(seq_scores.std(unbiased=False).item()),
+        }
+
+        return data, stats
+
     def _build_hetero_train_batches(
         self,
         student_batch: DataProto,
@@ -1129,6 +1315,11 @@ class RayPPOTrainer:
 
         n_s = self.student_rollout_n
         n_t = self.teacher_rollout_n
+
+        strict_opd = self.config.algorithm.hetero_distill.get("strict_opd", False)
+        use_hetero_adv = self.config.algorithm.hetero_distill.get("use_hetero_adv", False)
+        print('[DEBUG] strict_opd: ', strict_opd, type(strict_opd))
+        print('[DEBUG] use_hetero_adv: ', use_hetero_adv, type(use_hetero_adv))
 
         student_batch = self._ensure_response_mask(student_batch)
 
@@ -1149,13 +1340,17 @@ class RayPPOTrainer:
         if "index" not in student_batch.non_tensor_batch:
             raise KeyError("student_batch.non_tensor_batch must contain index")
 
-        if student_reward_tensor.dim() > 1:
-            s_score_flat = student_reward_tensor.detach().float().sum(dim=-1)
-        else:
-            s_score_flat = student_reward_tensor.detach().float()
+        if "reward" not in student_batch.batch:
+            student_reward = self._compute_binary_correctness_from_reward_tensor(student_reward_tensor).float()
+            student_batch.batch["reward"] = student_reward
 
-        s_score = s_score_flat.view(num_groups, n_s)
-        s_correct = s_score > 0
+        s_reward_flat = student_batch.batch["reward"].detach().float()
+
+        if s_reward_flat.dim() > 1:
+            s_reward_flat = s_reward_flat.view(s_reward_flat.shape[0], -1).max(dim=-1).values
+
+        s_reward = s_reward_flat.view(num_groups, n_s)
+        s_correct = s_reward > 0
 
         data_sources = student_batch.non_tensor_batch["data_source"]
         indices = student_batch.non_tensor_batch["index"]
@@ -1195,10 +1390,25 @@ class RayPPOTrainer:
         s_mixed = ~(s_all_correct | s_all_wrong)
 
         grpo_group_mask = s_mixed
-        opd_group_mask = s_all_wrong & teacher_has_correct
-        skip_teacher_all_wrong_mask = s_all_wrong & (~teacher_has_correct)
+
+        hetero_grpo_group_mask = (
+            s_all_wrong & teacher_has_correct
+            if use_hetero_adv
+            else torch.zeros_like(s_all_wrong, dtype=torch.bool)
+        )
+
+        if strict_opd:
+            opd_group_mask = s_all_wrong & teacher_has_correct
+        else:
+            opd_group_mask = (~s_all_correct) & teacher_has_correct
+
+        if use_hetero_adv:
+            opd_group_mask = opd_group_mask & (~hetero_grpo_group_mask)
+
+        skip_teacher_no_correct_mask = (~s_all_correct) & (~teacher_has_correct)
 
         grpo_groups = torch.nonzero(grpo_group_mask, as_tuple=False).flatten()
+        hetero_grpo_groups = torch.nonzero(hetero_grpo_group_mask, as_tuple=False).flatten()
         opd_groups = torch.nonzero(opd_group_mask, as_tuple=False).flatten()
 
         def expand_student_indices(groups):
@@ -1208,9 +1418,11 @@ class RayPPOTrainer:
             return (groups.view(-1, 1) * n_s + offsets).reshape(-1).long()
 
         grpo_idx = expand_student_indices(grpo_groups).cpu()
+        hetero_grpo_idx = expand_student_indices(hetero_grpo_groups).cpu()
         opd_idx = expand_student_indices(opd_groups).cpu()
 
         grpo_batch = None
+        hetero_grpo_batch = None
         opd_batch = None
 
         if grpo_idx.numel() > 0:
@@ -1222,6 +1434,12 @@ class RayPPOTrainer:
             if "old_log_probs" not in grpo_batch.batch and "rollout_log_probs" in grpo_batch.batch:
                 grpo_batch.batch["old_log_probs"] = grpo_batch.batch["rollout_log_probs"]
 
+        if hetero_grpo_idx.numel() > 0:
+            hetero_grpo_batch = _index_dataproto(student_batch, hetero_grpo_idx)
+            hetero_grpo_reward = student_reward_tensor.detach().cpu()[hetero_grpo_idx]
+            hetero_grpo_batch.batch["token_level_rewards"] = hetero_grpo_reward
+            hetero_grpo_batch.batch["token_level_scores"] = hetero_grpo_reward
+
         if opd_idx.numel() > 0:
             opd_batch = _index_dataproto(student_batch, opd_idx)
 
@@ -1231,18 +1449,31 @@ class RayPPOTrainer:
             else 0.0
         )
 
+        # strict_opd_filtered_mixed_teacher_correct_mask = s_mixed & teacher_has_correct
+
         stats = {
             "hetero/student_all_correct_group_count": int(s_all_correct.sum().item()),
             "hetero/student_mixed_group_count": int(s_mixed.sum().item()),
-            "hetero/student_all_wrong_teacher_has_correct_group_count": int(opd_group_mask.sum().item()),
-            "hetero/student_all_wrong_teacher_no_correct_group_count": int(skip_teacher_all_wrong_mask.sum().item()),
+            "hetero/student_all_wrong_group_count": int(s_all_wrong.sum().item()),
+
             "hetero/grpo_candidate_group_count": int(grpo_groups.numel()),
             "hetero/opd_candidate_group_count": int(opd_groups.numel()),
+            "hetero/hetero_grpo_candidate_group_count": int(hetero_grpo_groups.numel()),
+            "hetero/hetero_grpo_candidate_row_count": int(hetero_grpo_idx.numel()),
+            "hetero/opd_candidate_row_count": int(opd_idx.numel()),
+
+            "hetero/student_not_all_correct_teacher_no_correct_group_count": int(
+                skip_teacher_no_correct_mask.sum().item()
+            ),
+
             "hetero/offline_teacher_missing_group_count": int(teacher_missing_count),
             "hetero/offline_teacher_sampled_correct_rate": float(teacher_sampled_correct_rate),
+            # "hetero/strict_opd_filtered_mixed_teacher_correct_group_count": int(
+            #     strict_opd_filtered_mixed_teacher_correct_mask.sum().item()
+            # ) if strict_opd else 0,
         }
 
-        return grpo_batch, opd_batch, stats
+        return grpo_batch, hetero_grpo_batch, opd_batch, stats
 
     def _make_fixed_size_grouped_batch(
         self,
@@ -1289,6 +1520,80 @@ class RayPPOTrainer:
         }
 
         return fixed_batch, stats
+
+    def _make_fixed_size_batch(
+        self,
+        data: DataProto,
+        update_batch_size: int,
+        prefix: str,
+    ):
+        import numpy as np
+
+        if data is None or len(data) == 0:
+            return None, {
+                f"{prefix}/candidate_rows": 0,
+                f"{prefix}/used_rows": 0,
+                f"{prefix}/repeat_rows": 0,
+            }
+
+        num_rows = len(data)
+
+        if num_rows >= update_batch_size:
+            row_indices = np.random.choice(num_rows, size=update_batch_size, replace=False)
+            repeated_row_count = 0
+        else:
+            row_indices = np.random.choice(num_rows, size=update_batch_size, replace=True)
+            repeated_row_count = update_batch_size - num_rows
+
+        fixed_batch = _index_dataproto(data, row_indices)
+
+        stats = {
+            f"{prefix}/candidate_rows": int(num_rows),
+            f"{prefix}/used_rows": int(len(fixed_batch)),
+            f"{prefix}/repeat_rows": int(max(0, repeated_row_count)),
+        }
+
+        return fixed_batch, stats
+
+    def _get_hetero_update_mode(self):
+        hd_cfg = self.config.algorithm.hetero_distill
+
+        use_grpo = bool(hd_cfg.get("use_grpo", True))
+        use_opd = bool(hd_cfg.get("use_opd", True))
+        update_mode = hd_cfg.get("update_mode", "both")
+        print('[DEBUG] update_mode: ', update_mode, type(update_mode))
+
+        counter = max(self.global_steps - 1, 0)
+
+        if update_mode == "both":
+            return use_grpo, use_opd, "both"
+
+        if update_mode == "alt":
+            assert use_grpo and use_opd
+
+            opd_steps = int(hd_cfg.get("opd_steps", 10))
+            grpo_steps = int(hd_cfg.get("grpo_steps", 50))
+
+            assert opd_steps > 0
+            assert grpo_steps > 0
+
+            cycle = opd_steps + grpo_steps
+            pos = counter % cycle
+            phase = "opd" if pos < opd_steps else "grpo"
+
+            return phase == "grpo", phase == "opd", phase
+
+        if update_mode == "warmup":
+            assert use_grpo and use_opd
+
+            warmup_steps = int(hd_cfg.get("warmup_steps", 10))
+            assert warmup_steps > 0
+
+            phase = "opd" if counter < warmup_steps else "grpo"
+
+            return phase == "grpo", phase == "opd", phase
+
+        raise ValueError(f"Unknown hetero update_mode: {update_mode}")
 
     def fit_heterogeneous(self):
         from omegaconf import OmegaConf
@@ -1414,6 +1719,9 @@ class RayPPOTrainer:
                 response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
                 print("[DEBUG] Student response_text:")
                 print(repr(response_text))
+
+                now = datetime.now()
+                print('[DEBUG] current time: ', now.strftime('%Y-%m-%d %H:%M:%S'))
                 # ======Rollout Debug End ======
 
 
@@ -1421,88 +1729,124 @@ class RayPPOTrainer:
                 # 3) reward / correctness
                 # =========================
                 student_reward_tensor, student_reward_extra_infos = compute_reward(student_batch, self.reward_fn)
-                student_correct = self._compute_binary_correctness_from_reward_tensor(student_reward_tensor)
+                student_reward = self._compute_binary_correctness_from_reward_tensor(student_reward_tensor).float()
+                student_batch.batch["reward"] = student_reward
 
-                metrics["hetero/student_rollout_correct_rate"] = student_correct.float().mean().item()
+                metrics["hetero/student_rollout_correct_rate"] = student_reward.mean().item()
 
                 # =========================
                 # 4) build distillation batch
                 # =========================
-                grpo_batch, opd_batch, build_stats = self._build_hetero_train_batches(
+                grpo_batch, hetero_grpo_batch, opd_batch, build_stats = self._build_hetero_train_batches(
                     student_batch=student_batch,
                     student_reward_tensor=student_reward_tensor,
                 )
                 metrics.update(build_stats)
 
-                use_grpo = self.config.algorithm.hetero_distill.get("use_grpo", True)
-                use_opd = self.config.algorithm.hetero_distill.get("use_opd", True)
+                use_hetero_adv = self.config.algorithm.hetero_distill.get("use_hetero_adv", False)
+
+                do_grpo, do_opd, update_phase = self._get_hetero_update_mode()
+                metrics["hetero/update_phase_is_grpo"] = int(update_phase == "grpo")
+                metrics["hetero/update_phase_is_opd"] = int(update_phase == "opd")
 
                 # =========================
                 # GRPO update
                 # =========================
-                if use_grpo and grpo_batch is not None and len(grpo_batch) > 0:
-                    grpo_batch = compute_advantage(
-                        data=grpo_batch,
-                        adv_estimator=AdvantageEstimator.GRPO,
-                        gamma=self.config.algorithm.get("gamma", 1.0),
-                        lam=self.config.algorithm.get("lam", 1.0),
-                        num_repeat=self.student_rollout_n,
-                        norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
-                        config=self.config.algorithm,
-                    )
+                grpo_has_candidate = grpo_batch is not None and len(grpo_batch) > 0
+                hetero_grpo_has_candidate = (
+                    use_hetero_adv
+                    and hetero_grpo_batch is not None
+                    and len(hetero_grpo_batch) > 0
+                )
 
-                    update_batch, fix_stats = self._make_fixed_size_grouped_batch(
-                        data=grpo_batch,
-                        rollout_n=self.student_rollout_n,
-                        update_batch_size=self.grpo_update_batch_size,
-                        prefix="hetero/grpo",
-                    )
-                    metrics.update(fix_stats)
+                if do_grpo:
+                    if grpo_has_candidate or hetero_grpo_has_candidate:
+                        grpo_parts = []
 
-                    # ========= Debug Start ============
-                    
-                    # =========  Debug End  ============
+                        if grpo_has_candidate:
+                            grpo_batch = compute_advantage(
+                                data=grpo_batch,
+                                adv_estimator=AdvantageEstimator.GRPO,
+                                gamma=self.config.algorithm.get("gamma", 1.0),
+                                lam=self.config.algorithm.get("lam", 1.0),
+                                num_repeat=self.student_rollout_n,
+                                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                                config=self.config.algorithm,
+                            )
+                            grpo_batch = self._drop_grpo_transient_fields(grpo_batch)
+                            grpo_parts.append(grpo_batch)
 
-                    if update_batch is not None and len(update_batch) > 0:
-                        print("[DEBUG] GRPO UPDATE START.")
-                        old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
-                        update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
-                        actor_output = self.actor_rollout_wg.update_actor_grpo(update_batch)
-                        actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update({f"grpo/{k}": v for k, v in actor_metrics.items()})
+                        if hetero_grpo_has_candidate:
+                            hetero_grpo_batch, hetero_adv_stats = self._compute_hetero_grpo_advantage(
+                                data=hetero_grpo_batch,
+                                rollout_n=self.student_rollout_n,
+                            )
+                            metrics.update(hetero_adv_stats)
+                            hetero_grpo_batch = self._drop_grpo_transient_fields(hetero_grpo_batch)
+                            grpo_parts.append(hetero_grpo_batch)
 
-                        self.grpo_update_steps += 1
-                        self.actor_update_steps += 1
+                        mixed_grpo_batch = self._concat_dataproto_list(grpo_parts)
+
+                        update_batch, fix_stats = self._make_fixed_size_grouped_batch(
+                            data=mixed_grpo_batch,
+                            rollout_n=self.student_rollout_n,
+                            update_batch_size=self.grpo_update_batch_size,
+                            prefix="hetero/grpo",
+                        )
+                        metrics.update(fix_stats)
+
+                        if update_batch is not None and len(update_batch) > 0:
+                            print("[DEBUG] GRPO UPDATE START.")
+
+                            old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
+                            update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
+
+                            actor_output = self.actor_rollout_wg.update_actor_grpo(update_batch)
+                            actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update({f"grpo/{k}": v for k, v in actor_metrics.items()})
+
+                            self.grpo_update_steps += 1
+                            self.actor_update_steps += 1
+                    else:
+                        metrics["hetero/grpo_skip_no_candidate"] = 1
                 else:
-                    metrics["hetero/grpo_skip_no_candidate"] = 1
+                    metrics["hetero/grpo_skip_by_schedule"] = 1
 
 
                 # =========================
                 # OPD update
                 # =========================
-                if use_opd and opd_batch is not None and len(opd_batch) > 0:
-                    update_batch, fix_stats = self._make_fixed_size_grouped_batch(
-                        data=opd_batch,
-                        rollout_n=self.student_rollout_n,
-                        update_batch_size=self.opd_update_batch_size,
-                        prefix="hetero/opd",
-                    )
-                    metrics.update(fix_stats)
+                if do_opd:
+                    if opd_batch is not None and len(opd_batch) > 0:
+                        update_batch, fix_stats = self._make_fixed_size_batch(
+                            data=opd_batch,
+                            update_batch_size=self.opd_update_batch_size,
+                            prefix="hetero/opd",
+                        )
+                        metrics.update(fix_stats)
 
-                    if update_batch is not None and len(update_batch) > 0:
-                        print("[DEBUG] OPD UPDATE START.")
-                        old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
-                        update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
-                        teacher_log_probs = self.actor_rollout_wg.compute_ref_log_prob(update_batch)
-                        update_batch.batch["teacher_log_probs"] = teacher_log_probs.batch["ref_log_prob"]
-                        actor_output = self.actor_rollout_wg.update_actor_opd(update_batch)
-                        actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update({f"opd/{k}": v for k, v in actor_metrics.items()})
+                        if update_batch is not None and len(update_batch) > 0:
+                            print("[DEBUG] OPD UPDATE START.")
 
-                        self.opd_update_steps += 1
-                        self.actor_update_steps += 1
+                            old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
+                            update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
+
+                            teacher_log_probs_output = self.actor_rollout_wg.compute_ref_log_prob(update_batch)
+                            update_batch.batch["teacher_log_probs"] = teacher_log_probs_output.batch["ref_log_prob"]
+
+                            base_log_probs_output = self.actor_rollout_wg.compute_base_log_prob(update_batch)
+                            update_batch.batch["base_log_probs"] = base_log_probs_output.batch["base_log_prob"]
+
+                            actor_output = self.actor_rollout_wg.update_actor_opd(update_batch)
+                            actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update({f"opd/{k}": v for k, v in actor_metrics.items()})
+
+                            self.opd_update_steps += 1
+                            self.actor_update_steps += 1
+                    else:
+                        metrics["hetero/opd_skip_no_candidate"] = 1
                 else:
-                    metrics["hetero/opd_skip_no_candidate"] = 1
+                    metrics["hetero/opd_skip_by_schedule"] = 1
 
                 metrics["training/grpo_update_steps"] = self.grpo_update_steps
                 metrics["training/opd_update_steps"] = self.opd_update_steps

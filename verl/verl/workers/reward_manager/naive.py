@@ -94,20 +94,37 @@ class NaiveRewardManager(AbstractRewardManager):
             extra_info["num_turns"] = num_turns
             extra_info["rollout_reward_scores"] = rollout_reward_scores
 
-            score = self.compute_score(
-                data_source=data_source,
-                solution_str=response_str,
-                ground_truth=ground_truth,
-                extra_info=extra_info,
-            )
+            try:
+                score = self.compute_score(
+                    data_source=data_source,
+                    solution_str=response_str,
+                    ground_truth=ground_truth,
+                    extra_info=extra_info,
+                )
+            except Exception as e:
+                import traceback
+                print("[WARN] compute_score failed, set reward=0.")
+                print(traceback.format_exc())
+                score = {
+                    "score": 0.0,
+                    "verify_error": repr(e),
+                }
 
             if isinstance(score, dict):
-                reward = score["score"]
-                # Store the information including original reward
+                reward = score.get("score", 0.0)
                 for key, value in score.items():
                     reward_extra_info[key].append(value)
+            elif score is None:
+                reward = 0.0
             else:
-                reward = score
+                reward = float(score)
+
+            valid_response_length = int(data_item.batch["attention_mask"][prompt_length:].sum().item())
+            
+            if valid_response_length <= 0:
+                reward = 0.0
+                reward_tensor[i, 0] = reward
+                continue
 
             reward_tensor[i, valid_response_length - 1] = reward
 

@@ -182,8 +182,8 @@ def compute_reward(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[t
         reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
     except Exception as e:
         print(f"Error in reward_fn: {e}")
-        reward_tensor = reward_fn(data)
-        reward_extra_infos_dict = {}
+        reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        return reward_tensor, {"reward_fn_error": str(e)}
 
     return reward_tensor, reward_extra_infos_dict
 

@@ -126,6 +126,9 @@ class ActorConfig(BaseConfig):
     data_loader_seed = 1
     rollout_n: int = 1  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
+    grpo_lr_scale: float = 1.0
+    opd_lr_scale: float = 0.2
+    use_pos_delta_logp_mask: bool = False
 
     def __post_init__(self):
         """Validate actor configuration parameters."""
