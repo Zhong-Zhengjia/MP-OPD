@@ -60,27 +60,13 @@ def remove_boxed(s):
 
 # reward model
 def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0) -> bool:
-    # verify_func = math_metric(
-    #     gold_extraction_target=(LatexExtractionConfig(),),
-    #     pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig()),
-    # )
-    # ret_score = 0.0
-
-    # # Wrap the ground truth in \boxed{} format for verification
-    # ground_truth_boxed = "\\boxed{" + ground_truth + "}"
-    # try:
-    #     ret_score, _ = verify_func([ground_truth_boxed], [model_output])
-    # except Exception:
-    #     pass
-    # except TimeoutException:
-    #     ret_score = timeout_score
-
-    # return ret_score
-
     result = False
     answer = remove_boxed(last_boxed_only_string(model_output))
     if answer is None:
         return 0.0
+
+    if answer == ground_truth:
+        return 1.0
 
     try:
         if len(answer) > 100:

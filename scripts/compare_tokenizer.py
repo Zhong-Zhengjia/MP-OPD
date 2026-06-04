@@ -1,7 +1,7 @@
 from transformers import AutoTokenizer
 
-path1 = "/mnt/petrelfs/fudaocheng/checkpoints/huggingface/Qwen3-4B"
-path2 = "/mnt/petrelfs/fudaocheng/checkpoints/huggingface/Qwen3-4B-Thinking"
+path1 = "/mnt/phwfile/datafrontier/public_models/Skywork-OR1-Math-7B"
+path2 = "/mnt/phwfile/datafrontier/public_models/DeepSeek-R1-Distill-Qwen-1.5B"
 
 tok1 = AutoTokenizer.from_pretrained(path1, trust_remote_code=True, local_files_only=True)
 tok2 = AutoTokenizer.from_pretrained(path2, trust_remote_code=True, local_files_only=True)

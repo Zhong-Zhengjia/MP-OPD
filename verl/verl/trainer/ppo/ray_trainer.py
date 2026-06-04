@@ -651,6 +651,7 @@ class RayPPOTrainer:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS validation_results (
+                    global_step INTEGER NOT NULL,
                     question_id TEXT NOT NULL,
                     rollout_id INTEGER NOT NULL,
                     reward INTEGER NOT NULL,
@@ -659,13 +660,11 @@ class RayPPOTrainer:
                     prompt TEXT,
                     response TEXT NOT NULL,
                     ground_truth TEXT,
-                    global_step INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (question_id, rollout_id)
+                    PRIMARY KEY (global_step, question_id, rollout_id)
                 )
                 """
             )
-            conn.execute("DELETE FROM validation_results")
 
         return db_path
 
@@ -682,17 +681,17 @@ class RayPPOTrainer:
 
     def _save_validation_rollouts_to_db(
         self,
-        db_path,
+        conn,
         data_batch,
         input_texts,
         output_texts,
         ground_truths,
         rewards,
+        rollout_counter,
     ):
         data_sources = data_batch.non_tensor_batch["data_source"]
         indices = data_batch.non_tensor_batch["index"]
 
-        rollout_counter = defaultdict(int)
         rows = []
 
         for data_source, index, prompt, response, gt, reward in zip(
@@ -702,6 +701,7 @@ class RayPPOTrainer:
             output_texts,
             ground_truths,
             rewards,
+            strict=True,
         ):
             data_source = str(self._to_db_scalar(data_source))
             index = str(self._to_db_scalar(index))
@@ -712,6 +712,7 @@ class RayPPOTrainer:
 
             rows.append(
                 (
+                    int(self.global_steps),
                     question_id,
                     rollout_id,
                     int(round(float(reward))),
@@ -720,14 +721,14 @@ class RayPPOTrainer:
                     prompt,
                     response,
                     self._to_json_str(gt),
-                    int(self.global_steps),
                 )
             )
 
-        with sqlite3.connect(db_path) as conn:
+        if rows:
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO validation_results (
+                    global_step,
                     question_id,
                     rollout_id,
                     reward,
@@ -735,13 +736,17 @@ class RayPPOTrainer:
                     sample_index,
                     prompt,
                     response,
-                    ground_truth,
-                    global_step
+                    ground_truth
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
+
+        return len(rows)
+
+    def _topk_overlap_ratio(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return a.unsqueeze(-1).eq(b.unsqueeze(-2)).any(dim=-1).float().sum(dim=-1) / a.shape[-1]
 
     def _validate(self):
         validation_db_path = self._prepare_validation_db()
@@ -749,132 +754,276 @@ class RayPPOTrainer:
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
-        # Lists to collect samples for the table
-        sample_inputs = []
-        sample_outputs = []
-        sample_gts = []
         sample_scores = []
         sample_turns = []
         sample_uids = []
 
-        for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
+        val_n = int(self.config.actor_rollout_ref.rollout.val_kwargs.n)
+        if val_n <= 0:
+            raise ValueError(f"val_kwargs.n must be positive, got {val_n}")
 
-            if "uid" not in test_batch.non_tensor_batch:
-                test_batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
-                )
-
-            # repeat test batch
-            test_batch = test_batch.repeat(
-                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+        validation_rollout_batch_size = int(
+            self.config.trainer.get("validation_rollout_batch_size", 1024)
+        )
+        if validation_rollout_batch_size <= 0:
+            raise ValueError(
+                f"trainer.validation_rollout_batch_size must be positive, "
+                f"got {validation_rollout_batch_size}"
             )
 
-            # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-                return {}
+        validation_db_commit_batch_size = int(
+            self.config.trainer.get("validation_db_commit_batch_size", 8192)
+        )
+        validation_db_commit_batch_size = max(1, validation_db_commit_batch_size)
 
-            # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+        repeat_chunk_size = min(val_n, validation_rollout_batch_size)
+        prompt_chunk_size = max(1, validation_rollout_batch_size // repeat_chunk_size)
 
-            ground_truths = [
-                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-            ]
-            sample_gts.extend(ground_truths)
+        rollout_counter = defaultdict(int)
 
-            test_gen_batch = self._get_gen_batch(test_batch)
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-                "global_steps": self.global_steps,
-            }
-            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+        expected_rollout_counter = defaultdict(int)
 
-            # pad to be divisible by dp_size
-            size_divisor = (
-                self.actor_rollout_wg.world_size
-                if not self.async_rollout_mode
-                else self.config.actor_rollout_ref.rollout.agent.num_workers
-            )
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+        expected_total_rollouts = 0
+        saved_total_rollouts = 0
+        processed_prompts = 0
 
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+        total_prompts = len(self.val_dataloader.dataset)
 
-            print("validation generation end")
+        conn = sqlite3.connect(validation_db_path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
 
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
+            conn.execute("BEGIN")
+            pending_db_rows = 0
 
-            test_batch = test_batch.union(test_output_gen_batch)
-            test_batch.meta_info["validate"] = True
+            for test_data in self.val_dataloader:
+                base_test_batch = DataProto.from_single_dict(test_data)
+                base_batch_size = len(base_test_batch.batch["input_ids"])
 
-            # evaluate using reward_function
-            if self.val_reward_fn is None:
-                raise ValueError("val_reward_fn must be provided for validation.")
-            result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
+                if "uid" not in base_test_batch.non_tensor_batch:
+                    base_test_batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(base_batch_size)],
+                        dtype=object,
+                    )
 
-            self._save_validation_rollouts_to_db(
-                db_path=validation_db_path,
-                data_batch=test_batch,
-                input_texts=input_texts,
-                output_texts=output_texts,
-                ground_truths=ground_truths,
-                rewards=scores,
-            )
+                if (
+                    self.config.reward_model.enable
+                    and base_test_batch[0].non_tensor_batch["reward_model"]["style"] == "model"
+                ):
+                    conn.commit()
+                    return {}
 
-            reward_extra_infos_dict["reward"].extend(scores)
-            if "reward_extra_info" in result:
-                for key, lst in result["reward_extra_info"].items():
-                    reward_extra_infos_dict[key].extend(lst)
+                base_data_sources = base_test_batch.non_tensor_batch["data_source"]
+                base_indices = base_test_batch.non_tensor_batch["index"]
 
-            # collect num_turns of each prompt
-            if "__num_turns__" in test_batch.non_tensor_batch:
-                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+                for data_source, index in zip(base_data_sources, base_indices, strict=True):
+                    data_source = str(self._to_db_scalar(data_source))
+                    index = str(self._to_db_scalar(index))
+                    question_id = f"{data_source}_{index}"
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+                    expected_rollout_counter[question_id] += val_n
+                    expected_total_rollouts += val_n
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+                for prompt_start in range(0, base_batch_size, prompt_chunk_size):
+                    prompt_end = min(prompt_start + prompt_chunk_size, base_batch_size)
 
-        # dump generations
-        val_data_dir = self.config.trainer.get("validation_data_dir", None)
-        if val_data_dir:
-            self._dump_generations(
-                inputs=sample_inputs,
-                outputs=sample_outputs,
-                gts=sample_gts,
-                scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
-                dump_path=val_data_dir,
+                    base_prompt_batch = base_test_batch[prompt_start:prompt_end]
+
+                    for repeat_start in range(0, val_n, repeat_chunk_size):
+                        cur_repeat = min(repeat_chunk_size, val_n - repeat_start)
+
+                        test_batch = base_prompt_batch.repeat(
+                            repeat_times=cur_repeat,
+                            interleave=True,
+                        )
+
+                        current_batch_size = len(test_batch.batch["input_ids"])
+                        expected_current_batch_size = (prompt_end - prompt_start) * cur_repeat
+                        assert current_batch_size == expected_current_batch_size, (
+                            f"Unexpected repeated batch size: "
+                            f"{current_batch_size=} vs {expected_current_batch_size=}, "
+                            f"{prompt_start=}, {prompt_end=}, "
+                            f"{repeat_start=}, {cur_repeat=}"
+                        )
+
+                        input_ids = test_batch.batch["input_ids"]
+                        input_texts = [
+                            self.tokenizer.decode(ids, skip_special_tokens=True)
+                            for ids in input_ids
+                        ]
+
+                        sample_uids.extend(test_batch.non_tensor_batch["uid"])
+
+                        ground_truths = [
+                            item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+                            for item in test_batch
+                        ]
+
+                        test_gen_batch = self._get_gen_batch(test_batch)
+                        test_gen_batch.meta_info = {
+                            "eos_token_id": self.tokenizer.eos_token_id,
+                            "pad_token_id": self.tokenizer.pad_token_id,
+                            "recompute_log_prob": False,
+                            "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                            "validate": True,
+                            "global_steps": self.global_steps,
+                        }
+
+                        size_divisor = (
+                            self.actor_rollout_wg.world_size
+                            if not self.async_rollout_mode
+                            else self.config.actor_rollout_ref.rollout.agent.num_workers
+                        )
+
+                        test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(
+                            test_gen_batch,
+                            size_divisor,
+                        )
+
+                        if not self.async_rollout_mode:
+                            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(
+                                test_gen_batch_padded
+                            )
+                        else:
+                            test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(
+                                test_gen_batch_padded
+                            )
+
+                        test_output_gen_batch = unpad_dataproto(
+                            test_output_gen_batch_padded,
+                            pad_size=pad_size,
+                        )
+
+                        output_ids = test_output_gen_batch.batch["responses"]
+                        output_texts = [
+                            self.tokenizer.decode(ids, skip_special_tokens=True)
+                            for ids in output_ids
+                        ]
+
+                        assert len(output_texts) == current_batch_size, (
+                            f"Generated output size mismatch: "
+                            f"{len(output_texts)=}, {current_batch_size=}"
+                        )
+
+                        test_batch.meta_info.pop("timing", None)
+                        test_output_gen_batch.meta_info.pop("timing", None)
+
+                        test_batch = test_batch.union(test_output_gen_batch)
+                        test_batch = self._ensure_response_mask(test_batch)
+                        test_batch.meta_info["validate"] = True
+
+                        if self.val_reward_fn is None:
+                            raise ValueError("val_reward_fn must be provided for validation.")
+
+                        result = self.val_reward_fn(test_batch, return_dict=True)
+                        reward_tensor = result["reward_tensor"]
+                        scores = reward_tensor.sum(-1).cpu().tolist()
+
+                        assert len(scores) == current_batch_size, (
+                            f"Reward size mismatch: {len(scores)=}, {current_batch_size=}"
+                        )
+
+                        sample_scores.extend(scores)
+
+                        inserted_rows = self._save_validation_rollouts_to_db(
+                            conn=conn,
+                            data_batch=test_batch,
+                            input_texts=input_texts,
+                            output_texts=output_texts,
+                            ground_truths=ground_truths,
+                            rewards=scores,
+                            rollout_counter=rollout_counter,
+                        )
+
+                        assert inserted_rows == current_batch_size, (
+                            f"Inserted rows mismatch: "
+                            f"{inserted_rows=}, {current_batch_size=}"
+                        )
+
+                        saved_total_rollouts += inserted_rows
+                        pending_db_rows += inserted_rows
+
+                        response_lengths = test_batch.batch["response_mask"].sum(dim=-1).float()
+                        batch_avg_response_len = response_lengths.mean().item()
+
+                        now = datetime.now()
+                        print(
+                            f"[validation] {now.strftime('%Y-%m-%d %H:%M:%S')} | inserted_rows={inserted_rows}, "
+                            f"saved_rollouts={saved_total_rollouts}, "
+                            f"avg_response_len={batch_avg_response_len:.2f}",
+                            flush=True,
+                        )
+
+                        if pending_db_rows >= validation_db_commit_batch_size:
+                            conn.commit()
+                            conn.execute("BEGIN")
+                            pending_db_rows = 0
+
+                        reward_extra_infos_dict["reward"].extend(scores)
+
+                        if "reward_extra_info" in result:
+                            for key, lst in result["reward_extra_info"].items():
+                                assert len(lst) == current_batch_size, (
+                                    f"reward_extra_info size mismatch for key={key}: "
+                                    f"{len(lst)=}, {current_batch_size=}"
+                                )
+                                reward_extra_infos_dict[key].extend(lst)
+
+                        if "__num_turns__" in test_batch.non_tensor_batch:
+                            sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+
+                        data_source_lst.append(
+                            test_batch.non_tensor_batch.get(
+                                "data_source",
+                                ["unknown"] * reward_tensor.shape[0],
+                            )
+                        )
+
+            conn.commit()
+
+        except Exception:
+            conn.rollback()
+            raise
+
+        finally:
+            conn.close()
+
+        assert saved_total_rollouts == expected_total_rollouts, (
+            f"Validation rollout count mismatch: "
+            f"{saved_total_rollouts=} vs {expected_total_rollouts=}"
+        )
+
+        for question_id, expected_count in expected_rollout_counter.items():
+            actual_count = rollout_counter[question_id]
+            assert actual_count == expected_count, (
+                f"Question rollout count mismatch for {question_id}: "
+                f"{actual_count=} vs {expected_count=}"
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
-            assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+            assert len(lst) == 0 or len(lst) == len(sample_scores), (
+                f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+            )
+
+        if len(sample_scores) == 0:
+            return {}
 
         data_sources = np.concatenate(data_source_lst, axis=0)
 
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        data_src2var2metric2val = process_validation_metrics(
+            data_sources,
+            sample_uids,
+            reward_extra_infos_dict,
+        )
+
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                n_max = max(
+                    [int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()]
+                )
                 for metric_name, metric_val in metric2val.items():
                     if (
                         (var_name == core_var)
@@ -884,6 +1033,7 @@ class RayPPOTrainer:
                         metric_sec = "val-core"
                     else:
                         metric_sec = "val-aux"
+
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
 
@@ -894,6 +1044,7 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
         return metric_dict
+
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend."""
@@ -1316,9 +1467,7 @@ class RayPPOTrainer:
         n_s = self.student_rollout_n
         n_t = self.teacher_rollout_n
 
-        strict_opd = self.config.algorithm.hetero_distill.get("strict_opd", False)
         use_hetero_adv = self.config.algorithm.hetero_distill.get("use_hetero_adv", False)
-        print('[DEBUG] strict_opd: ', strict_opd, type(strict_opd))
         print('[DEBUG] use_hetero_adv: ', use_hetero_adv, type(use_hetero_adv))
 
         student_batch = self._ensure_response_mask(student_batch)
@@ -1397,10 +1546,7 @@ class RayPPOTrainer:
             else torch.zeros_like(s_all_wrong, dtype=torch.bool)
         )
 
-        if strict_opd:
-            opd_group_mask = s_all_wrong & teacher_has_correct
-        else:
-            opd_group_mask = (~s_all_correct) & teacher_has_correct
+        opd_group_mask = (~s_all_correct) & teacher_has_correct
 
         if use_hetero_adv:
             opd_group_mask = opd_group_mask & (~hetero_grpo_group_mask)
@@ -1449,8 +1595,6 @@ class RayPPOTrainer:
             else 0.0
         )
 
-        # strict_opd_filtered_mixed_teacher_correct_mask = s_mixed & teacher_has_correct
-
         stats = {
             "hetero/student_all_correct_group_count": int(s_all_correct.sum().item()),
             "hetero/student_mixed_group_count": int(s_mixed.sum().item()),
@@ -1468,9 +1612,6 @@ class RayPPOTrainer:
 
             "hetero/offline_teacher_missing_group_count": int(teacher_missing_count),
             "hetero/offline_teacher_sampled_correct_rate": float(teacher_sampled_correct_rate),
-            # "hetero/strict_opd_filtered_mixed_teacher_correct_group_count": int(
-            #     strict_opd_filtered_mixed_teacher_correct_mask.sum().item()
-            # ) if strict_opd else 0,
         }
 
         return grpo_batch, hetero_grpo_batch, opd_batch, stats
@@ -1594,6 +1735,38 @@ class RayPPOTrainer:
             return phase == "grpo", phase == "opd", phase
 
         raise ValueError(f"Unknown hetero update_mode: {update_mode}")
+
+
+    def _add_entropy_metrics(self, metrics, batch, entropys, prefix: str):
+        import torch
+        with torch.no_grad():
+            ent = entropys.detach().float()
+            mask = None
+            for mask_key in ["response_mask", "loss_mask", "attention_mask"]:
+                if mask_key in batch.batch:
+                    mask = batch.batch[mask_key]
+                    break
+            if mask is not None:
+                mask = mask.to(ent.device)
+                if mask.shape != ent.shape:
+                    if mask.dim() == ent.dim() and mask.shape[0] == ent.shape[0]:
+                        mask = mask[:, -ent.shape[-1]:]
+                    else:
+                        mask = None
+            if mask is not None:
+                mask = mask.bool()
+                valid_ent = ent[mask]
+            else:
+                valid_ent = ent.reshape(-1)
+            if valid_ent.numel() == 0:
+                metrics[f"{prefix}/entropy_valid_tokens"] = 0
+                return
+            metrics[f"{prefix}/entropy_mean"] = valid_ent.mean().item()
+            # metrics[f"{prefix}/entropy_std"] = valid_ent.std(unbiased=False).item()
+            # metrics[f"{prefix}/entropy_min"] = valid_ent.min().item()
+            # metrics[f"{prefix}/entropy_max"] = valid_ent.max().item()
+            # metrics[f"{prefix}/entropy_valid_tokens"] = int(valid_ent.numel())
+
 
     def fit_heterogeneous(self):
         from omegaconf import OmegaConf
@@ -1800,6 +1973,13 @@ class RayPPOTrainer:
 
                             old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
                             update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
+                            update_batch.batch['entropys'] = old_log_prob_output.batch["entropys"]
+                            self._add_entropy_metrics(
+                                metrics=metrics,
+                                batch=update_batch,
+                                entropys=old_log_prob_output.batch["entropys"],
+                                prefix="grpo",
+                            )
 
                             actor_output = self.actor_rollout_wg.update_actor_grpo(update_batch)
                             actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
@@ -1830,6 +2010,13 @@ class RayPPOTrainer:
 
                             old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
                             update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
+                            update_batch.batch['entropys'] = old_log_prob_output.batch["entropys"]
+                            self._add_entropy_metrics(
+                                metrics=metrics,
+                                batch=update_batch,
+                                entropys=old_log_prob_output.batch["entropys"],
+                                prefix="opd",
+                            )
 
                             teacher_log_probs_output = self.actor_rollout_wg.compute_ref_log_prob(update_batch)
                             update_batch.batch["teacher_log_probs"] = teacher_log_probs_output.batch["ref_log_prob"]

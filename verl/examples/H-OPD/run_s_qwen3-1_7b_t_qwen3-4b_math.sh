@@ -13,15 +13,14 @@ student_model_name="Qwen3-${student_model_subfix}"
 teacher_model_name="Qwen3-${teacher_model_subfix}"
 ability=Math
 
-
-test_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/val_union_mini_1000.parquet
-train_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_union_passed_70.parquet
+test_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/val_1000.parquet
+train_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_80_percent.parquet
 teacher_offline_rollout_results_path="/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/offline_rollout_results/${teacher_model_name}_DeepMath-103K_pass@16.json"
 
-student_model_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/huggingface/Qwen3-${student_model_subfix}"
-teacher_model_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/huggingface/Qwen3-${teacher_model_subfix}"
+student_model_path="/mnt/phwfile/datafrontier/public_models/Qwen3-${student_model_subfix}"
+teacher_model_path="/mnt/phwfile/datafrontier/public_models/Qwen3-${teacher_model_subfix}"
 
-today=$(date +%m%d_%H)
+today=$(date +%m%d_%H%M)
 
 # grpo configs
 grpo_batch_size=1024
@@ -29,24 +28,27 @@ use_hetero_adv=false
 grpo_lr_scale=1.0
 
 # opd configs
-opd_batch_size=1024
-strict_opd=false   # dosen't matter, opd is relative to distribution, not correctness
+opd_batch_size=0
 opd_lr_scale=1.0
-use_pos_delta_logp_mask=true
+use_pos_delta_logp_mask=false
 
 # update mode config
-update_mode=warmup   # in [alt, both, warmup]
+update_mode=both   # in [alt, both, warmup]
     # alt update configs
 opd_steps=10
 grpo_steps=50
     # warmup update configs
 warmup_steps=20
 
+# validation config
+val_n=16
+
+# base learning rate
+lr=1e-6
 
 n_node=1
 n_gpu=8
-lr=1e-6
-val_n=2
+
 
 batch_size_to_bool() {
     local name="$1"
@@ -64,9 +66,8 @@ batch_size_to_bool() {
 
 use_grpo=$(batch_size_to_bool grpo "$grpo_batch_size")
 use_opd=$(batch_size_to_bool opd "$opd_batch_size")
-output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${ability}"
-method=LP
-output_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/learn_and_play/${method}_${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}"
+output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${warmup_mode}"
+output_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/TRA_strong2weak@${val_n}/${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}"
 
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
@@ -89,7 +90,6 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.use_grpo=$use_grpo \
     +algorithm.hetero_distill.use_hetero_adv=$use_hetero_adv \
     +algorithm.hetero_distill.use_opd=$use_opd \
-    +algorithm.hetero_distill.strict_opd=$strict_opd \
     +algorithm.hetero_distill.update_mode=$update_mode \
     +algorithm.hetero_distill.opd_steps=$opd_steps \
     +algorithm.hetero_distill.grpo_steps=$grpo_steps \
@@ -105,7 +105,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=True \
-    data.seed=56 \
+    data.seed=3412 \
     data.return_raw_chat=True \
     +data.apply_chat_template_kwargs.enable_thinking=false \
     actor_rollout_ref.model.path=$student_model_path \
@@ -148,9 +148,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.val_before_train=true \
     trainer.logger='["console","wandb"]' \
-    trainer.log_val_generations=10 \
-    trainer.project_name="LP_strong2weak" \
-    trainer.experiment_name="${method}_${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}" \
+    trainer.log_val_generations=0 \
+    trainer.project_name="TRA_strong2weak@${val_n}" \
+    trainer.experiment_name="${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}" \
     trainer.n_gpus_per_node=$n_gpu \
     trainer.nnodes=$n_node \
     trainer.max_actor_ckpt_to_keep=1 \
@@ -160,4 +160,4 @@ python3 -m verl.trainer.main_ppo \
     +trainer.best_metric_mode="max" \
     trainer.default_local_dir=$output_path \
     trainer.test_freq=10 \
-    trainer.total_epochs=2 $@
+    trainer.total_epochs=3 $@

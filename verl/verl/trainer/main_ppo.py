@@ -297,7 +297,7 @@ class TaskRunner:
         val_reward_fn = load_reward_manager(
             config,
             tokenizer,
-            num_examine=1,
+            num_examine=0,
             **config.reward_model.get("reward_kwargs", {}),
         )
 

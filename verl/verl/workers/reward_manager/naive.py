@@ -81,12 +81,6 @@ class NaiveRewardManager(AbstractRewardManager):
 
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
 
-            # print('='*20, ' DEBUG START ', '='*20)    
-            # print('prompt string: ', prompt_str)
-            # print('response string: ', response_str)
-            # print('ground_truth: ', ground_truth)
-            # print('='*20, ' DEBUG END ', '='*20)
-
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
             extra_info = data_item.non_tensor_batch.get("extra_info", {})
             num_turns = data_item.non_tensor_batch.get("__num_turns__", None)

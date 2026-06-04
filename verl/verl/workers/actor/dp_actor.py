@@ -107,13 +107,13 @@ class DataParallelPPOActor(BasePPOActor):
             self.scaler = None
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            entropy: # (bs, response_len)
-            log_probs: # (bs, response_len)
-        """
+        self,
+        micro_batch,
+        temperature,
+        calculate_entropy=False,
+        return_topk=False,
+        top_k=None,
+    ):
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -134,6 +134,7 @@ class DataParallelPPOActor(BasePPOActor):
                 batch_size, seqlen = input_ids.shape
 
             entropy = None
+            topk_ids = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
@@ -193,7 +194,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
                 extra_args = {}
-                if self.use_fused_kernels:
+                use_fused = self.use_fused_kernels and not return_topk
+                if use_fused:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
@@ -206,24 +208,23 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
 
-                if self.use_fused_kernels:
+                if use_fused:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
 
                 else:
-                    logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                    logits_rmpad = output.logits.squeeze(0)
                     logits_rmpad.div_(temperature)
 
-                    # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    inplace_backward = True
-                    if calculate_entropy:
-                        inplace_backward = False
+                    if return_topk:
+                        topk_ids_rmpad = torch.topk(logits_rmpad, k=top_k, dim=-1).indices
+
+                    inplace_backward = not calculate_entropy and not return_topk
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
                         labels=input_ids_rmpad_rolled,
                         inplace_backward=inplace_backward,
                     )
-
                     # compute entropy
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
@@ -235,13 +236,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
-                    # gather and unpad for the ulysses sp
                     log_probs = gather_outputs_and_unpad(
                         log_probs,
                         gather_dim=0,
                         unpad_dim=0,
                         padding_size=pad_size,
                     )
+
                     if calculate_entropy:
                         entropy_rmpad = gather_outputs_and_unpad(
                             entropy_rmpad,
@@ -249,7 +250,15 @@ class DataParallelPPOActor(BasePPOActor):
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
-                # pad back to (bsz, seqlen)
+
+                    if return_topk:
+                        topk_ids_rmpad = gather_outputs_and_unpad(
+                            topk_ids_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+
                 if calculate_entropy:
                     full_entropy = pad_input(
                         hidden_states=entropy_rmpad.unsqueeze(-1),
@@ -257,6 +266,7 @@ class DataParallelPPOActor(BasePPOActor):
                         batch=batch_size,
                         seqlen=seqlen,
                     )
+
                 full_log_probs = pad_input(
                     hidden_states=log_probs.unsqueeze(-1),
                     indices=indices,
@@ -264,14 +274,26 @@ class DataParallelPPOActor(BasePPOActor):
                     seqlen=seqlen,
                 )
 
-                # only return response part:
+                if return_topk:
+                    full_topk_ids = pad_input(
+                        hidden_states=topk_ids_rmpad,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+
                 if calculate_entropy:
-                    entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
-                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                    entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]
+
+                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]
+
+                if return_topk:
+                    topk_ids = full_topk_ids[:, -response_length - 1 : -1, :]
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
-                if self.use_fused_kernels:
+                use_fused = self.use_fused_kernels and not return_topk
+                if use_fused:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
@@ -284,15 +306,18 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
 
-                if self.use_fused_kernels:
+                if use_fused:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
 
                 else:
                     logits = output.logits
-
                     logits.div_(temperature)
-                    logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    logits = logits[:, -response_length - 1 : -1, :]
+
+                    if return_topk:
+                        topk_ids = torch.topk(logits, k=top_k, dim=-1).indices
+
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
@@ -300,33 +325,9 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
+            if return_topk:
+                return entropy, log_probs, topk_ids
             return entropy, log_probs
-            
-    # def _optimizer_step(self):
-    #     assert self.config.grad_clip is not None
-    #     if self.scaler is not None:
-    #         self.scaler.unscale_(self.actor_optimizer)
-
-    #     if isinstance(self.actor_module, FSDP):
-    #         grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
-    #     elif isinstance(self.actor_module, FSDPModule):
-    #         grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
-    #     else:
-    #         grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
-
-    #     if isinstance(grad_norm, DTensor):
-    #         grad_norm = grad_norm.full_tensor()
-
-    #     if self.scaler is not None:
-    #         self.scaler.step(self.actor_optimizer)
-    #         self.scaler.update()
-    #     else:
-    #         if not torch.isfinite(grad_norm):
-    #             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
-    #             self.actor_optimizer.zero_grad()
-    #         else:
-    #             self.actor_optimizer.step()
-    #     return grad_norm
 
     def _optimizer_step(self, lr: float | None = None, lr_scale: float | None = None):
         assert self.config.grad_clip is not None
@@ -425,6 +426,56 @@ class DataParallelPPOActor(BasePPOActor):
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
 
         return log_probs, entropys
+
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def compute_topk_ids(self, data: DataProto, top_k: int) -> torch.Tensor:
+        self.actor_module.eval()
+
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]
+        use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        has_ref_input_ids = "ref_input_ids" in data.batch.keys()
+
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+
+        if has_ref_input_ids:
+            select_keys.extend(["ref_input_ids", "ref_attention_mask", "ref_position_ids"])
+
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        if use_dynamic_bsz:
+            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+        else:
+            micro_batches = data.split(micro_batch_size)
+
+        topk_lst = []
+
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+
+            with torch.no_grad():
+                _, _, topk_ids = self._forward_micro_batch(
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=False,
+                    return_topk=True,
+                    top_k=top_k,
+                )
+
+            topk_lst.append(topk_ids)
+
+        topk_ids = torch.concat(topk_lst, dim=0)
+
+        if use_dynamic_bsz:
+            topk_ids = restore_dynamic_batch(topk_ids, batch_idx_list)
+
+        return topk_ids
 
 
     @GPUMemoryLogger(role="dp actor", logger=logger)

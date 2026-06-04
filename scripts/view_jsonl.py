@@ -1,4 +1,5 @@
 import json
+from rich import print
 
 
 def read_jsonl(file_path: str):

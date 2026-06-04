@@ -4,10 +4,10 @@ import json
 from collections import defaultdict
 from rich import print
 
-model_name = 'Qwen3-4B'
+model_name = 'Qwen3-1.7B'
 sample_nums = 16
 
-db_path = f"/mnt/petrelfs/fudaocheng/codes/G-OPD/eval_outputs/{model_name}_DeepMath-103K_pass@{sample_nums}.sqlite"
+db_path = f"/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_filtered_level6_{model_name}_pass@{sample_nums}.sqlite"
 output_path = f"/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/offline_rollout_results/{model_name}_DeepMath-103K_pass@{sample_nums}.json"
 
 os.makedirs(os.path.dirname(output_path), exist_ok=True)

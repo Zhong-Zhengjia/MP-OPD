@@ -211,3 +211,6 @@ outputs
 eval_outputs/
 plots/
 verl/debug_data/
+
+plots/
+plots_distribution/

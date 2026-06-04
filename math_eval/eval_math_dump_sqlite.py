@@ -102,7 +102,7 @@ DEFAULT_CFG = {
     "n": 1,
     "begin_idx": -1,
     "end_idx": -1,
-    "seed": 8962,
+    "seed": 42,
     "enable_thinking": False,
     "chat_template": None,
     "gpu_memory_utilization": 0.95,
@@ -209,38 +209,41 @@ def get_existing_rollouts(conn, question_id):
     return {row[0] for row in cur.fetchall()}
 
 
-def insert_generation(
-    conn,
-    question_id,
-    rollout_id,
-    prompt,
-    ground_truth,
-    reward_style,
-    response,
-    pred_ans,
-    acc,
-    model,
-):
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO generations (
-            question_id, rollout_id, prompt, ground_truth, reward_style,
-            response, pred_ans, acc, model
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            question_id,
-            rollout_id,
-            json.dumps(ensure_obj(prompt), ensure_ascii=False),
-            None if ground_truth is None else str(ground_truth),
-            None if reward_style is None else str(reward_style),
-            response,
-            pred_ans,
-            None if acc is None else int(bool(acc)),
-            model,
-        ),
-    )
-    conn.commit()
+def insert_generations(conn, rows):
+    if not rows:
+        return 0
+
+    values = []
+    for r in rows:
+        values.append(
+            (
+                r["question_id"],
+                r["rollout_id"],
+                json.dumps(ensure_obj(r["prompt"]), ensure_ascii=False),
+                None if r["ground_truth"] is None else str(r["ground_truth"]),
+                None if r["reward_style"] is None else str(r["reward_style"]),
+                r["response"],
+                r["pred_ans"],
+                None if r["acc"] is None else int(bool(r["acc"])),
+                r["model"],
+            )
+        )
+
+    before_changes = conn.total_changes
+
+    with conn:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO generations (
+                question_id, rollout_id, prompt, ground_truth, reward_style,
+                response, pred_ans, acc, model
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+
+    inserted = conn.total_changes - before_changes
+    return inserted
 
 
 def compute_metrics_from_db(conn, model_name=None):
@@ -335,11 +338,26 @@ def main(cfg: dict):
         item_copy["_missing_rollouts"] = missing_rollouts
         processed_items.append(item_copy)
 
+    pending_rollout_keys = set()
+    for item in processed_items:
+        for rollout_id in item["_missing_rollouts"]:
+            pending_rollout_keys.add((item["_question_id"], rollout_id))
+
     print(f"Total input questions: {len(input_data)}")
     print(f"Questions needing generation: {len(processed_items)}")
+    print(f"Rollout prompts needing generation: {len(pending_rollout_keys)}")
     print(f"Database path: {cfg['db_path']}")
 
     batch_size = cfg["batch_size"]
+
+    sampling_params = SamplingParams(
+        temperature=cfg["temperature"],
+        top_p=cfg["top_p"],
+        max_tokens=cfg["max_tokens"],
+        n=1,
+        seed=cfg["seed"],
+        top_k=cfg["top_k"],
+    )
 
     for batch_start in range(0, len(processed_items), batch_size):
         batch_items = processed_items[batch_start: batch_start + batch_size]
@@ -381,18 +399,12 @@ def main(cfg: dict):
             f"questions={len(batch_items)}, generations={len(expanded_prompts)}"
         )
 
-        sampling_params = SamplingParams(
-            temperature=cfg["temperature"],
-            top_p=cfg["top_p"],
-            max_tokens=cfg["max_tokens"],
-            n=1,  # important: each expanded prompt corresponds to exactly one rollout
-            seed=cfg["seed"],
-            top_k=cfg['top_k'],
-            # do_sample=cfg['do_sample'],
-            # max_response_length=cfg['max_tokens']
-        )
-
         generations = llm.generate(expanded_prompts, sampling_params=sampling_params)
+
+        batch_rows = []
+        batch_rollout_keys = []
+        batch_correct = 0
+        batch_no_answer = 0
 
         for meta, gen in zip(expanded_meta, generations):
             if len(gen.outputs) != 1:
@@ -405,6 +417,7 @@ def main(cfg: dict):
 
             if boxed_answer is None:
                 acc = False
+                batch_no_answer += 1
             else:
                 try:
                     acc = verify(
@@ -414,23 +427,47 @@ def main(cfg: dict):
                 except Exception:
                     acc = False
 
-            insert_generation(
-                conn=conn,
-                question_id=meta["question_id"],
-                rollout_id=meta["rollout_id"],
-                prompt=meta["prompt"],
-                ground_truth=meta["ground_truth"],
-                reward_style=meta["reward_style"],
-                response=response,
-                pred_ans=boxed_answer,
-                acc=acc,
-                model=model_name,
+            if acc:
+                batch_correct += 1
+
+            batch_rows.append(
+                {
+                    "question_id": meta["question_id"],
+                    "rollout_id": meta["rollout_id"],
+                    "prompt": meta["prompt"],
+                    "ground_truth": meta["ground_truth"],
+                    "reward_style": meta["reward_style"],
+                    "response": response,
+                    "pred_ans": boxed_answer,
+                    "acc": acc,
+                    "model": model_name,
+                }
             )
 
-            print(
-                f"[Saved] question_id={meta['question_id']} "
-                f"rollout_id={meta['rollout_id']} acc={acc}"
-            )
+            batch_rollout_keys.append((meta["question_id"], meta["rollout_id"]))
+
+        inserted = insert_generations(conn, batch_rows)
+
+        for key in batch_rollout_keys:
+            pending_rollout_keys.discard(key)
+
+        remaining_rollouts = len(pending_rollout_keys)
+        remaining_questions = len({qid for qid, _ in pending_rollout_keys})
+
+        batch_total = len(batch_rows)
+        batch_acc = batch_correct / batch_total if batch_total > 0 else 0.0
+
+        print(
+            f"[Inserted Batch {batch_start // batch_size + 1}] "
+            f"attempted={batch_total}, "
+            f"inserted={inserted}, "
+            f"correct={batch_correct}, "
+            f"acc={batch_acc:.4f}, "
+            f"no_boxed_answer={batch_no_answer}, "
+            f"remaining_rollout_prompts={remaining_rollouts}, "
+            f"remaining_questions={remaining_questions}, "
+            f"model={cfg['model_name']}"
+        )
 
     metrics = compute_metrics_from_db(conn, model_name=model_name)
 
@@ -446,10 +483,17 @@ def main(cfg: dict):
 
 
 if __name__ == "__main__":
-    model_name = 'Qwen3-4B'
-    enable_thinking = 'thinking' in model_name.lower()
+    model_name = 'Skywork-OR1-Math-7B'  # Skywork-OR1-Math-7B, DeepSeek-R1-Distill-Qwen-7B
+    if 'deepseek' in model_name.lower():
+        enable_thinking = 'r1' in model_name.lower()
+    elif 'skywork' in model_name.lower():
+        enable_thinking = 'r1' in model_name.lower()
+    else:
+        enable_thinking = 'thinking' in model_name.lower()
+    
 
     dataset_name = 'DeepMath-103K'
+    split_name = 'train_80_percent'   # train_filtered_level6, val_1000
     num_outputs = 16
 
     print('=' * 30)
@@ -458,11 +502,11 @@ if __name__ == "__main__":
 
     cfg = {
         "model_name": model_name,
-        "input_file": f"/mnt/petrelfs/fudaocheng/datasets/G-OPD-Training-Data/{dataset_name}/train_filtered_level6.parquet",
-        "model_path": f"/mnt/petrelfs/fudaocheng/checkpoints/huggingface/{model_name}",
-        "db_path": f"/mnt/petrelfs/fudaocheng/codes/G-OPD/eval_outputs/{model_name}_{dataset_name}_pass@{num_outputs}.sqlite",
+        "input_file": f"/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/{dataset_name}/{split_name}.parquet",
+        "model_path": f"/mnt/phwfile/datafrontier/public_models/{model_name}",
+        "db_path": f"/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/{split_name}_{model_name}_pass@{num_outputs}.sqlite",
         "n": num_outputs,
         "enable_thinking": enable_thinking,
-        "batch_size": 512,
+        "batch_size": 128,
     }
     main(cfg)
