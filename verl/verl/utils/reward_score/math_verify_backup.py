@@ -21,49 +21,6 @@ except ImportError:
     print("To use Math-Verify, please install it first by running `pip install math-verify`.")
 
 
-import os
-import requests
-
-
-MATH_VERIFY_SERVER_URL = os.getenv(
-    "MATH_VERIFY_SERVER_URL",
-    "http://10.140.37.27:8008/verify",
-)
-
-MATH_VERIFY_HTTP_CONNECT_TIMEOUT = float(
-    os.getenv("MATH_VERIFY_HTTP_CONNECT_TIMEOUT", "0.5") 
-)
-
-MATH_VERIFY_HTTP_READ_TIMEOUT = float(
-    os.getenv("MATH_VERIFY_HTTP_READ_TIMEOUT", "8")
-)
-
-
-def remote_math_verify(ground_truth: str, answer: str) -> bool:
-    try:
-        resp = requests.post(
-            MATH_VERIFY_SERVER_URL,
-            json={
-                "ground_truth": ground_truth,
-                "answer": answer,
-                "strict": True,
-            },
-            timeout=(
-                MATH_VERIFY_HTTP_CONNECT_TIMEOUT,
-                MATH_VERIFY_HTTP_READ_TIMEOUT,
-            ),
-        )
-
-        if resp.status_code != 200:
-            return False
-
-        data = resp.json()
-        return bool(data.get("result", False))
-
-    except Exception:
-        return False
-
-
 def last_boxed_only_string(string):
     idx = string.rfind("\\boxed")
     if idx < 0:
@@ -114,7 +71,7 @@ def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0
     try:
         if len(answer) > 100:
             answer = answer[:100]
-        result = remote_math_verify(ground_truth, answer)
+        result = verify(parse("\\boxed{" + ground_truth + "}"), parse("\\boxed{" + answer + "}"))
     except Exception:
         pass
 
