@@ -49,6 +49,30 @@ lr=1e-6
 n_node=1
 n_gpu=8
 
+resume_path=""
+extra_args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --resume_path)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --resume_path requires a path argument" >&2
+                exit 1
+            fi
+            resume_path="$2"
+            shift 2
+            ;;
+        --resume_path=*)
+            resume_path="${1#--resume_path=}"
+            shift
+            ;;
+        *)
+            extra_args+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${extra_args[@]}"
+
 
 batch_size_to_bool() {
     local name="$1"
@@ -67,7 +91,19 @@ batch_size_to_bool() {
 use_grpo=$(batch_size_to_bool grpo "$grpo_batch_size")
 use_opd=$(batch_size_to_bool opd "$opd_batch_size")
 output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${warmup_mode}"
-output_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/TRA_strong2weak@${val_n}/${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}"
+
+resume_args=()
+if [[ -n "$resume_path" ]]; then
+    output_path="$resume_path"
+    experiment_name="$(basename "$output_path")"
+    resume_args=(
+        trainer.resume_mode=resume_path
+        trainer.resume_from_path="$resume_path"
+    )
+else
+    experiment_name="${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}"
+    output_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/TRA_strong2weak@${val_n}/${experiment_name}"
+fi
 
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
@@ -150,7 +186,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger='["console","wandb"]' \
     trainer.log_val_generations=0 \
     trainer.project_name="TRA_strong2weak@${val_n}" \
-    trainer.experiment_name="${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}" \
+    trainer.experiment_name="$experiment_name" \
     trainer.n_gpus_per_node=$n_gpu \
     trainer.nnodes=$n_node \
     trainer.max_actor_ckpt_to_keep=1 \
@@ -158,6 +194,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=10 \
     +trainer.best_metric_name="val-core/DeepMath-103K/reward/mean@${val_n}" \
     +trainer.best_metric_mode="max" \
-    trainer.default_local_dir=$output_path \
+    trainer.default_local_dir="$output_path" \
+    "${resume_args[@]}" \
     trainer.test_freq=10 \
-    trainer.total_epochs=3 $@
+    trainer.total_epochs=3 "$@"
