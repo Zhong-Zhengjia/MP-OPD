@@ -30,7 +30,7 @@ grpo_lr_scale=1.0
 # opd configs
 opd_batch_size=0
 opd_lr_scale=1.0
-use_pos_delta_logp_mask=false
+use_pos_delta_logp_mask=false     
 
 # update mode config
 update_mode=both   # in [alt, both, warmup]

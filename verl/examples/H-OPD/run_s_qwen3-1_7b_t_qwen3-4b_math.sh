@@ -23,12 +23,12 @@ teacher_model_path="/mnt/phwfile/datafrontier/public_models/Qwen3-${teacher_mode
 today=$(date +%m%d_%H%M)
 
 # grpo configs
-grpo_batch_size=1024
+grpo_batch_size=0
 use_hetero_adv=false
 grpo_lr_scale=1.0
 
 # opd configs
-opd_batch_size=0
+opd_batch_size=1024
 opd_lr_scale=1.0
 use_pos_delta_logp_mask=false
 

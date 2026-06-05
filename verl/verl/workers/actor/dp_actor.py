@@ -374,7 +374,7 @@ class DataParallelPPOActor(BasePPOActor):
 
             return grad_norm
 
-        finally:
+        finally:    
             for group, old_lr in zip(self.actor_optimizer.param_groups, old_lrs):
                 group["lr"] = old_lr
 
