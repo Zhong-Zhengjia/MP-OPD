@@ -1263,6 +1263,111 @@ class RayPPOTrainer:
         else:
             print(f"Updated LAST checkpoint: step={self.global_steps}")
 
+    def _checkpoint_root_dir(self):
+        base_dir = self.config.trainer.default_local_dir
+        if not os.path.isabs(base_dir):
+            base_dir = os.path.join(os.getcwd(), base_dir)
+        return base_dir
+
+    def _is_checkpoint_dir(self, path):
+        return path is not None and os.path.isdir(path) and os.path.isdir(os.path.join(path, "actor"))
+
+    def _resolve_resume_path(self):
+        resume_mode = self.config.trainer.get("resume_mode", "auto")
+        resume_from_path = self.config.trainer.get("resume_from_path", None)
+        base_dir = self._checkpoint_root_dir()
+
+        if resume_mode == "disable":
+            return None
+
+        if resume_mode not in ["auto", "resume_path"]:
+            raise ValueError(f"Invalid resume_mode: {resume_mode}. Must be 'auto', 'disable', or 'resume_path'")
+
+        if resume_mode == "resume_path" and resume_from_path is None:
+            raise ValueError("trainer.resume_from_path must be set when resume_mode='resume_path'")
+
+        search_root = resume_from_path if resume_from_path is not None else base_dir
+        if search_root is not None and not os.path.isabs(search_root):
+            search_root = os.path.join(os.getcwd(), search_root)
+
+        if self._is_checkpoint_dir(search_root):
+            return search_root
+
+        if search_root is not None and os.path.isdir(search_root):
+            last_path = os.path.join(search_root, "last")
+            if self._is_checkpoint_dir(last_path):
+                return last_path
+
+            latest_path = find_latest_ckpt_path(search_root)
+            if self._is_checkpoint_dir(latest_path):
+                return latest_path
+
+        if resume_mode == "resume_path":
+            raise FileNotFoundError(f"Could not find a resumable checkpoint under {search_root}")
+
+        return None
+
+    def _load_best_checkpoint_state(self):
+        import torch
+
+        base_dir = self._checkpoint_root_dir()
+        best_meta_path = os.path.join(base_dir, "best_valid", "meta.pt")
+        if not os.path.exists(best_meta_path):
+            self._best_valid_metric = None
+            self._best_valid_step = None
+            return
+
+        best_meta = torch.load(best_meta_path, map_location="cpu", weights_only=False)
+        self._best_valid_metric = best_meta.get("metric_value", None)
+        self._best_valid_step = best_meta.get("global_steps", None)
+
+    def _load_checkpoint(self):
+        import torch
+
+        checkpoint_path = self._resolve_resume_path()
+        self._load_best_checkpoint_state()
+
+        if checkpoint_path is None:
+            print("No checkpoint found. Starting from scratch.")
+            return
+
+        print(f"Loading checkpoint from {checkpoint_path}")
+
+        actor_local_path = os.path.join(checkpoint_path, "actor")
+        actor_remote_path = None
+        self.actor_rollout_wg.load_checkpoint(
+            actor_local_path,
+            actor_remote_path,
+            del_local_after_load=self.config.trainer.get("del_local_ckpt_after_load", False),
+        )
+
+        if self.use_critic:
+            critic_local_path = os.path.join(checkpoint_path, str(Role.Critic))
+            if os.path.isdir(critic_local_path):
+                self.critic_wg.load_checkpoint(
+                    critic_local_path,
+                    None,
+                    del_local_after_load=self.config.trainer.get("del_local_ckpt_after_load", False),
+                )
+            else:
+                print(f"Warning: critic checkpoint not found at {critic_local_path}; critic will start from init state.")
+
+        dataloader_path = os.path.join(checkpoint_path, "data.pt")
+        if os.path.exists(dataloader_path):
+            dataloader_state_dict = torch.load(dataloader_path, map_location="cpu", weights_only=False)
+            self.train_dataloader.load_state_dict(dataloader_state_dict)
+            print(f"Loaded dataloader state from {dataloader_path}")
+        else:
+            print(f"Warning: dataloader state not found at {dataloader_path}; dataloader will start from scratch.")
+
+        meta_path = os.path.join(checkpoint_path, "meta.pt")
+        if os.path.exists(meta_path):
+            meta = torch.load(meta_path, map_location="cpu", weights_only=False)
+            self.global_steps = int(meta.get("global_steps", self.global_steps))
+            print(f"Loaded trainer state: global_steps={self.global_steps}")
+        else:
+            print(f"Warning: trainer meta not found at {meta_path}; global_steps remains {self.global_steps}.")
+
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:

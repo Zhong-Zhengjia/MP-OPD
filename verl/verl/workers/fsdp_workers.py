@@ -1454,6 +1454,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         import torch.distributed as dist
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+        from verl.utils.torch_dtypes import PrecisionType
         from transformers import (
             AutoConfig,
             AutoModel,
@@ -1465,17 +1466,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
+        self.checkpoint_manager.save_checkpoint(
+            local_path=local_path,
+            hdfs_path=hdfs_path,
+            global_step=global_step,
+            max_ckpt_to_keep=max_ckpt_to_keep,
+        )
+
         cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT, cfg):
             state_dict = self.actor_module_fsdp.state_dict()
 
         if self.rank == 0:
-            print(f"Saving actor checkpoint to HF format: {local_path}")
-            os.makedirs(local_path, exist_ok=True)
+            hf_local_path = os.path.join(local_path, "hf_model")
+            print(f"Exporting actor checkpoint to HF safetensors: {hf_local_path}")
+            os.makedirs(hf_local_path, exist_ok=True)
 
             model_path = self.config.model.path
             trust_remote_code = self.config.model.get("trust_remote_code", False)
             attn_implementation = self.config.model.get("override_config", {}).get("attn_implementation", "flash_attention_2")
+            export_dtype = self.config.actor.fsdp_config.get("hf_export_dtype", None)
+            if export_dtype is None:
+                export_dtype = self.config.actor.fsdp_config.get("dtype", "bfloat16")
+            export_dtype = PrecisionType.to_dtype(export_dtype)
 
             model_config = AutoConfig.from_pretrained(
                 model_path,
@@ -1510,6 +1523,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             save_model = model_class.from_config(
                 model_config,
+                torch_dtype=export_dtype,
                 trust_remote_code=trust_remote_code,
             ).cpu()
 
@@ -1523,26 +1537,47 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 except Exception as e:
                     print(f"[WARN] merge_and_unload failed: {e}")
 
-            save_model.save_pretrained(local_path, safe_serialization=True)
+            save_model.save_pretrained(hf_local_path, safe_serialization=True)
 
             if self.processor is not None:
-                self.processor.save_pretrained(local_path)
+                self.processor.save_pretrained(hf_local_path)
             if self.tokenizer is not None:
-                self.tokenizer.save_pretrained(local_path)
+                self.tokenizer.save_pretrained(hf_local_path)
             if getattr(self, "generation_config", None) is not None:
                 try:
-                    self.generation_config.save_pretrained(local_path)
+                    self.generation_config.save_pretrained(hf_local_path)
                 except Exception as e:
                     print(f"[WARN] save generation config failed: {e}")
 
             if hdfs_path is not None:
-                hdfs_io.makedirs(hdfs_path, exist_ok=True)
-                hdfs_io.copy(src=local_path, dst=hdfs_path)
+                hf_hdfs_path = os.path.join(hdfs_path, "hf_model")
+                hdfs_io.makedirs(hf_hdfs_path, exist_ok=True)
+                hdfs_io.copy(src=hf_local_path, dst=hf_hdfs_path)
 
         dist.barrier()
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=True):
+        assert self._is_actor
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        self.checkpoint_manager.load_checkpoint(
+            local_path=local_path,
+            hdfs_path=hdfs_path,
+            del_local_after_load=del_local_after_load,
+        )
+
+        torch.distributed.barrier()
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def start_profile(self, **kwargs) -> None:
