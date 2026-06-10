@@ -573,8 +573,8 @@ if __name__ == '__main__':
     num_samples = 16
 
     model_name_list = ['DeepSeek-R1-Distill-Qwen-1.5B', 'Qwen3-4B', 'Skywork-OR1-Math-7B']
-    model_name_1 = 'DeepSeek-R1-Distill-Qwen-1.5B'
-    model_name_2 = 'DeepSeek-R1-Distill-Qwen-7B'
+    model_name_1 = 'Qwen3-1.7B'
+    model_name_2 = 'Qwen3-4B'
 
     val_1000_db_1 = Path(
         "/mnt/phwfile/datafrontier/fudaocheng/datasets/"
@@ -601,39 +601,39 @@ if __name__ == '__main__':
         sort_mode="mean",   # minmax, mean, dominant
      )
 
-    # train_model_name = "Qwen3-1.7B-T4B-Math_GB1024_OB0"
-    # date_time = "0602_10"
+    train_model_name = "Qwen3-1.7B-T4B-_GB1024_OB1024"
+    date_time = "0604_1353"
 
-    # train_model_db = Path(
-    #     "/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/LP_offline_distribution/"
-    #     f"LP_{train_model_name}_{date_time}/"
-    #     "validation_results.db"
-    # )
+    train_model_db = Path(
+        "/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/TRA_strong2weak@16//"
+        f"{train_model_name}_{date_time}/"
+        "validation_results.db"
+    )
 
-    # output_folder = f"plots_distribution/question_distribution/{train_model_name}_{date_time}/"
+    output_folder = f"plots_distribution/question_distribution/{train_model_name}_{date_time}/"
 
-    # ordered_bins, left_end, center_end = build_ordered_bins(
-    #     acc_dict_1,
-    #     acc_dict_2,
-    #     shared_threshold=0.75,
-    #     shared_ratio=0.25,
-    #     left_side="model2",
-    #     bin_size=10,
-    #     sort_mode="mean",
-    # )
+    ordered_bins, left_end, center_end = build_ordered_bins(
+        acc_dict_1,
+        acc_dict_2,
+        shared_threshold=0.75,
+        shared_ratio=0.25,
+        left_side="model2",
+        bin_size=10,
+        sort_mode="mean",
+    )
 
-    # train_step_acc_dict = get_accuracy_dict_steps_train_model_sqlite(train_model_db)
+    train_step_acc_dict = get_accuracy_dict_steps_train_model_sqlite(train_model_db)
 
-    # plot_train_model_step_distribution(
-    #     train_step_acc_dict,
-    #     ordered_bins,
-    #     left_end,
-    #     center_end,
-    #     output_folder=output_folder,
-    #     train_label=train_model_name,
-    #     base_acc_dict_1=acc_dict_1,
-    #     base_acc_dict_2=acc_dict_2,
-    #     base_label_1="Qwen3-4B",
-    #     base_label_2="Qwen3-1.7B",
-    #     save_prefix=train_model_name,
-    # )
+    plot_train_model_step_distribution(
+        train_step_acc_dict,
+        ordered_bins,
+        left_end,
+        center_end,
+        output_folder=output_folder,
+        train_label=train_model_name,
+        base_acc_dict_1=acc_dict_1,
+        base_acc_dict_2=acc_dict_2,
+        base_label_1=model_name_1,
+        base_label_2=model_name_2,
+        save_prefix=train_model_name,
+    )

@@ -291,8 +291,8 @@ def compare_two_jsonl_distributions(
     return acc_dict_1, acc_dict_2, ordered_ids
 
 if __name__ == '__main__':
-    file_path_1 = "../G-OPD/eval_outputs/Qwen3-1.7B_MathTestTotal_pass@64.jsonl"
-    file_path_2 = "../G-OPD/eval_outputs/Qwen3-4B_MathTestTotal_pass@64.jsonl"
+    file_path_1 = "../G-OPD/eval_outputs/Qwen3-1.7B_MathTestTotal_pass@16.jsonl"
+    file_path_2 = "../G-OPD/eval_outputs/Qwen3-4B_MathTestTotal_pass@16.jsonl"
 
     acc_dict_1, acc_dict_2, ordered_ids = compare_two_jsonl_distributions(
         file_path_1,

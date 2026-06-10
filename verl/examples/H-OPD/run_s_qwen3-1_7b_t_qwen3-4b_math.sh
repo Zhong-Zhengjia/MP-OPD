@@ -8,14 +8,13 @@ export USED_MODEL="no_api"
 
 
 student_model_subfix=1.7B
-teacher_model_subfix=4B
+teacher_model_subfix=4B-M-RL
 student_model_name="Qwen3-${student_model_subfix}"
 teacher_model_name="Qwen3-${teacher_model_subfix}"
 ability=Math
 
-test_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/val_1000.parquet
+test_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/MathTestTotal/test.parquet
 train_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_80_percent.parquet
-teacher_offline_rollout_results_path="/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/offline_rollout_results/${teacher_model_name}_DeepMath-103K_pass@16.json"
 
 student_model_path="/mnt/phwfile/datafrontier/public_models/Qwen3-${student_model_subfix}"
 teacher_model_path="/mnt/phwfile/datafrontier/public_models/Qwen3-${teacher_model_subfix}"
@@ -23,14 +22,12 @@ teacher_model_path="/mnt/phwfile/datafrontier/public_models/Qwen3-${teacher_mode
 today=$(date +%m%d_%H%M)
 
 # grpo configs
-grpo_batch_size=0
-use_hetero_adv=false
+use_grpo=false
 grpo_lr_scale=1.0
 
 # opd configs
-opd_batch_size=1024
-opd_lr_scale=1.0
-use_pos_delta_logp_mask=false
+use_opd=true
+opd_lr_scale=1.0 
 
 # update mode config
 update_mode=both   # in [alt, both, warmup]
@@ -49,6 +46,10 @@ lr=1e-6
 n_node=1
 n_gpu=8
 
+
+project_name=MathArena_LB_strong2weak@${val_n}
+
+# resume_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/TRA_strong2weak@16/Qwen3-1.7B-T4B-_GB1024_OB0_0606_0711/"
 resume_path=""
 extra_args=()
 while [[ $# -gt 0 ]]; do
@@ -88,9 +89,7 @@ batch_size_to_bool() {
     fi
 }
 
-use_grpo=$(batch_size_to_bool grpo "$grpo_batch_size")
-use_opd=$(batch_size_to_bool opd "$opd_batch_size")
-output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${warmup_mode}"
+output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${update_mode}"
 
 resume_args=()
 if [[ -n "$resume_path" ]]; then
@@ -101,8 +100,8 @@ if [[ -n "$resume_path" ]]; then
         trainer.resume_from_path="$resume_path"
     )
 else
-    experiment_name="${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}"
-    output_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/TRA_strong2weak@${val_n}/${experiment_name}"
+    experiment_name="${output_model_name}_G${use_grpo}_O${use_opd}_${today}"
+    output_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/${project_name}/${experiment_name}"
 fi
 
 unset ROCR_VISIBLE_DEVICES
@@ -122,20 +121,15 @@ mkdir -p "${RAY_TMPDIR}"
 python3 -m verl.trainer.main_ppo \
     +algorithm.train_mode=heterogeneous_distill \
     +algorithm.hetero_distill.student_rollout_n=8 \
-    +algorithm.hetero_distill.teacher_rollout_n=8 \
     +algorithm.hetero_distill.use_grpo=$use_grpo \
-    +algorithm.hetero_distill.use_hetero_adv=$use_hetero_adv \
     +algorithm.hetero_distill.use_opd=$use_opd \
     +algorithm.hetero_distill.update_mode=$update_mode \
     +algorithm.hetero_distill.opd_steps=$opd_steps \
     +algorithm.hetero_distill.grpo_steps=$grpo_steps \
     +algorithm.hetero_distill.warmup_steps=$warmup_steps \
-    +algorithm.hetero_distill.offline_teacher_rollout_path=$teacher_offline_rollout_results_path \
-    +algorithm.hetero_distill.grpo_update_batch_size=$grpo_batch_size \
-    +algorithm.hetero_distill.opd_update_batch_size=$opd_batch_size \
     data.train_files=$train_files \
     data.val_files=$test_files \
-    data.train_batch_size=256 \
+    data.train_batch_size=1024 \
     data.max_prompt_length=1024 \
     data.max_response_length=8192 \
     data.filter_overlong_prompts=True \
@@ -177,7 +171,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.loss_agg_mode="seq-mean-token-mean" \
     +actor_rollout_ref.actor.grpo_lr_scale=$grpo_lr_scale \
     +actor_rollout_ref.actor.opd_lr_scale=$opd_lr_scale \
-    +actor_rollout_ref.actor.use_pos_delta_logp_mask=$use_pos_delta_logp_mask \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=false \
     reward_model.reward_manager=naive \
@@ -185,7 +178,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=true \
     trainer.logger='["console","wandb"]' \
     trainer.log_val_generations=0 \
-    trainer.project_name="TRA_strong2weak@${val_n}" \
+    trainer.project_name=$project_name \
     trainer.experiment_name="$experiment_name" \
     trainer.n_gpus_per_node=$n_gpu \
     trainer.nnodes=$n_node \

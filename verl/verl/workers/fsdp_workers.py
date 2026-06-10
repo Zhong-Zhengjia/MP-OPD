@@ -1149,7 +1149,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch
             output, _ = self.base_policy.compute_log_prob(data=data, calculate_entropy=False)
-            output = DataProto.from_dict(tensors={"base_log_prob": output})
+            output = DataProto.from_dict(tensors={"base_log_probs": output})
 
         output = output.to("cpu")
 

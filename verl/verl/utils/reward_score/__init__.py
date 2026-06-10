@@ -60,7 +60,13 @@ def default_compute_score(
         from . import math_dapo
 
         res = math_dapo.compute_score(solution_str, ground_truth)
-    elif "DeepMath" in data_source or any(dataset_name in data_source for dataset_name in ["Math-500", "MATH500", "AMC2023", "OlympiadBench", "Minerva", "TheoremQA", "AIME2024", "AIME2025", "MMLUPro"]):
+    elif "DeepMath" in data_source or any(
+        dataset_name in data_source for dataset_name in [
+            "Math-500", "MATH500", "AMC2023", "OlympiadBench", 
+            "Minerva", "TheoremQA", "AIME2024", "AIME2025", "MMLUPro", "AIME2026",
+            "CMIMC2025", "HMMT2025FEB", "HMMT2026FEB", "HMMT2025NOV", "SMT2025"
+        ]
+    ):
         from . import math_verify
 
         res = math_verify.compute_score(solution_str, ground_truth)

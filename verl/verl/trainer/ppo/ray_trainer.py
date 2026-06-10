@@ -363,21 +363,7 @@ class RayPPOTrainer:
 
         hetero_cfg = self.config.algorithm.get("hetero_distill", {})
         print(hetero_cfg)
-        self.offline_teacher_rollout_path = hetero_cfg.get(
-            "offline_teacher_rollout_path",
-            None,
-        )
-        assert self.offline_teacher_rollout_path, "Please make sure the parameter `offline_teacher_rollout_path` is correctly setted."
-        self.offline_teacher_rollout_results = self._load_offline_teacher_rollouts(
-            self.offline_teacher_rollout_path
-        )
         self.student_rollout_n = hetero_cfg.get("student_rollout_n", 1)
-        self.teacher_rollout_n = hetero_cfg.get("teacher_rollout_n", 1)
-        self.use_sdft = hetero_cfg.get("use_sdft", True)
-        self.use_icl_opd = hetero_cfg.get("use_icl_opd", True)
-        self.sdft_weight = hetero_cfg.get("sdft_weight", 1.0)
-        self.icl_opd_weight = hetero_cfg.get("icl_opd_weight", 1.0)
-        self.sample_demo_strategy = hetero_cfg.get("sample_demo_strategy", "random")
 
         # Store base model paths for corrected reward computation
         self.base_model_path = config.actor_rollout_ref.model.get("base_model_path", None)
@@ -424,39 +410,6 @@ class RayPPOTrainer:
         self.teacher_rollout_wg = None
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
-
-    def _load_offline_teacher_rollouts(self, path):
-        import json
-        import os
-
-        if path is None or path == "":
-            return {}
-
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"offline teacher rollout file not found: {path}")
-
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        print(f"Loaded offline teacher rollout results from {path}, size={len(data)}")
-        return data
-
-
-    def _sample_offline_teacher_rewards(self, question_id, sample_n):
-        import numpy as np
-
-        item = self.offline_teacher_rollout_results.get(str(question_id), None)
-        if item is None:
-            return None
-
-        rewards = item.get("teacher_rewards", None)
-        if rewards is None or len(rewards) == 0:
-            return None
-
-        rewards = np.asarray(rewards, dtype=np.float32)
-        replace = len(rewards) < sample_n
-        idx = np.random.choice(len(rewards), size=sample_n, replace=replace)
-        return rewards[idx]
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -785,9 +738,6 @@ class RayPPOTrainer:
 
         expected_total_rollouts = 0
         saved_total_rollouts = 0
-        processed_prompts = 0
-
-        total_prompts = len(self.val_dataloader.dataset)
 
         conn = sqlite3.connect(validation_db_path)
         try:
@@ -1490,76 +1440,6 @@ class RayPPOTrainer:
         self.grpo_update_steps = 0
         self.opd_update_steps = 0
 
-    def _concat_dataproto_list(self, batches):
-        batches = [x for x in batches if x is not None and len(x) > 0]
-        if len(batches) == 0:
-            return None
-        if len(batches) == 1:
-            return batches[0]
-        return DataProto.concat(batches)
-
-    def _drop_grpo_transient_fields(self, data: DataProto):
-        if data is None:
-            return data
-        for k in ("old_log_probs", "teacher_log_probs", "base_log_probs"):
-            if k in data.batch:
-                data.batch.pop(k)
-        return data
-
-    def _compute_hetero_grpo_advantage(
-        self,
-        data: DataProto,
-        rollout_n: int,
-    ):
-        import numpy as np
-        import torch
-
-        assert data is not None and len(data) > 0
-        assert len(data) % rollout_n == 0
-
-        if "uid" not in data.non_tensor_batch:
-            raise KeyError("hetero_grpo_batch must contain uid")
-
-        uids = np.asarray(data.non_tensor_batch["uid"], dtype=object).reshape(-1, rollout_n)
-        if not np.all(uids == uids[:, :1]):
-            raise ValueError("hetero_grpo_batch is not strictly grouped by uid")
-
-        old_log_prob_output = self.actor_rollout_wg.compute_log_prob(data)
-        teacher_log_probs_output = self.actor_rollout_wg.compute_ref_log_prob(data)
-
-        old_log_probs = old_log_prob_output.batch["old_log_probs"]
-        teacher_log_probs = teacher_log_probs_output.batch["ref_log_prob"]
-
-        response_mask = data.batch["response_mask"].to(old_log_probs.device).float()
-
-        delta_log_probs = (teacher_log_probs - old_log_probs) * response_mask
-        seq_scores = delta_log_probs.sum(dim=-1) / response_mask.sum(dim=-1).clamp_min(1.0)
-
-        group_scores = seq_scores.view(-1, rollout_n)
-        group_mean = group_scores.mean(dim=-1, keepdim=True)
-        group_adv = group_scores - group_mean
-
-        if self.config.algorithm.get("norm_adv_by_std_in_grpo", True):
-            group_std = group_scores.std(
-                dim=-1,
-                keepdim=True,
-                unbiased=(rollout_n > 1),
-            )
-            group_adv = group_adv / (group_std + 1e-6)
-
-        seq_adv = group_adv.reshape(-1)
-        token_adv = seq_adv.unsqueeze(-1) * response_mask
-
-        target_device = data.batch["responses"].device
-        data.batch["advantages"] = token_adv.to(target_device)
-        data.batch["returns"] = token_adv.to(target_device)
-
-        stats = {
-            "hetero/hetero_grpo_delta_log_prob_mean": float(seq_scores.mean().item()),
-            "hetero/hetero_grpo_delta_log_prob_std": float(seq_scores.std(unbiased=False).item()),
-        }
-
-        return data, stats
 
     def _build_hetero_train_batches(
         self,
@@ -1570,10 +1450,6 @@ class RayPPOTrainer:
         import torch
 
         n_s = self.student_rollout_n
-        n_t = self.teacher_rollout_n
-
-        use_hetero_adv = self.config.algorithm.hetero_distill.get("use_hetero_adv", False)
-        print('[DEBUG] use_hetero_adv: ', use_hetero_adv, type(use_hetero_adv))
 
         student_batch = self._ensure_response_mask(student_batch)
 
@@ -1588,12 +1464,6 @@ class RayPPOTrainer:
                 n_s,
             )
 
-        if "data_source" not in student_batch.non_tensor_batch:
-            raise KeyError("student_batch.non_tensor_batch must contain data_source")
-
-        if "index" not in student_batch.non_tensor_batch:
-            raise KeyError("student_batch.non_tensor_batch must contain index")
-
         if "reward" not in student_batch.batch:
             student_reward = self._compute_binary_correctness_from_reward_tensor(student_reward_tensor).float()
             student_batch.batch["reward"] = student_reward
@@ -1606,61 +1476,16 @@ class RayPPOTrainer:
         s_reward = s_reward_flat.view(num_groups, n_s)
         s_correct = s_reward > 0
 
-        data_sources = student_batch.non_tensor_batch["data_source"]
-        indices = student_batch.non_tensor_batch["index"]
-
-        teacher_has_correct = []
-        teacher_missing_count = 0
-        teacher_sampled_correct_count = 0
-        teacher_sampled_total_count = 0
-
-        for g in range(num_groups):
-            base_idx = g * n_s
-            data_source = data_sources[base_idx]
-            index = indices[base_idx]
-            question_id = f"{data_source}_{index}"
-
-            sampled_rewards = self._sample_offline_teacher_rewards(question_id, n_t)
-
-            if sampled_rewards is None:
-                teacher_missing_count += 1
-                teacher_has_correct.append(False)
-                continue
-
-            sampled_correct = sampled_rewards > 0
-            teacher_has_correct.append(bool(sampled_correct.any()))
-
-            teacher_sampled_correct_count += int(sampled_correct.sum())
-            teacher_sampled_total_count += int(len(sampled_correct))
-
-        teacher_has_correct = torch.tensor(
-            teacher_has_correct,
-            dtype=torch.bool,
-            device=s_correct.device,
-        )
-
         s_all_correct = s_correct.all(dim=-1)
         s_all_wrong = (~s_correct).all(dim=-1)
         s_mixed = ~(s_all_correct | s_all_wrong)
 
         grpo_group_mask = s_mixed
 
-        hetero_grpo_group_mask = (
-            s_all_wrong & teacher_has_correct
-            if use_hetero_adv
-            else torch.zeros_like(s_all_wrong, dtype=torch.bool)
-        )
-
-        opd_group_mask = (~s_all_correct) & teacher_has_correct
-
-        if use_hetero_adv:
-            opd_group_mask = opd_group_mask & (~hetero_grpo_group_mask)
-
-        skip_teacher_no_correct_mask = (~s_all_correct) & (~teacher_has_correct)
+        # opd_group_mask = (~s_all_correct)
 
         grpo_groups = torch.nonzero(grpo_group_mask, as_tuple=False).flatten()
-        hetero_grpo_groups = torch.nonzero(hetero_grpo_group_mask, as_tuple=False).flatten()
-        opd_groups = torch.nonzero(opd_group_mask, as_tuple=False).flatten()
+        # opd_groups = torch.nonzero(opd_group_mask, as_tuple=False).flatten()
 
         def expand_student_indices(groups):
             if groups.numel() == 0:
@@ -1669,11 +1494,10 @@ class RayPPOTrainer:
             return (groups.view(-1, 1) * n_s + offsets).reshape(-1).long()
 
         grpo_idx = expand_student_indices(grpo_groups).cpu()
-        hetero_grpo_idx = expand_student_indices(hetero_grpo_groups).cpu()
-        opd_idx = expand_student_indices(opd_groups).cpu()
+        # opd_idx = expand_student_indices(opd_groups).cpu()
+        opd_idx = torch.arange(s_bsz, dtype=torch.long)
 
         grpo_batch = None
-        hetero_grpo_batch = None
         opd_batch = None
 
         if grpo_idx.numel() > 0:
@@ -1685,20 +1509,8 @@ class RayPPOTrainer:
             if "old_log_probs" not in grpo_batch.batch and "rollout_log_probs" in grpo_batch.batch:
                 grpo_batch.batch["old_log_probs"] = grpo_batch.batch["rollout_log_probs"]
 
-        if hetero_grpo_idx.numel() > 0:
-            hetero_grpo_batch = _index_dataproto(student_batch, hetero_grpo_idx)
-            hetero_grpo_reward = student_reward_tensor.detach().cpu()[hetero_grpo_idx]
-            hetero_grpo_batch.batch["token_level_rewards"] = hetero_grpo_reward
-            hetero_grpo_batch.batch["token_level_scores"] = hetero_grpo_reward
-
         if opd_idx.numel() > 0:
             opd_batch = _index_dataproto(student_batch, opd_idx)
-
-        teacher_sampled_correct_rate = (
-            teacher_sampled_correct_count / teacher_sampled_total_count
-            if teacher_sampled_total_count > 0
-            else 0.0
-        )
 
         stats = {
             "hetero/student_all_correct_group_count": int(s_all_correct.sum().item()),
@@ -1706,100 +1518,12 @@ class RayPPOTrainer:
             "hetero/student_all_wrong_group_count": int(s_all_wrong.sum().item()),
 
             "hetero/grpo_candidate_group_count": int(grpo_groups.numel()),
-            "hetero/opd_candidate_group_count": int(opd_groups.numel()),
-            "hetero/hetero_grpo_candidate_group_count": int(hetero_grpo_groups.numel()),
-            "hetero/hetero_grpo_candidate_row_count": int(hetero_grpo_idx.numel()),
-            "hetero/opd_candidate_row_count": int(opd_idx.numel()),
-
-            "hetero/student_not_all_correct_teacher_no_correct_group_count": int(
-                skip_teacher_no_correct_mask.sum().item()
-            ),
-
-            "hetero/offline_teacher_missing_group_count": int(teacher_missing_count),
-            "hetero/offline_teacher_sampled_correct_rate": float(teacher_sampled_correct_rate),
+            "hetero/opd_candidate_group_count": int(num_groups),
+            "hetero/opd_candidate_row_count": int(opd_idx.numel())
         }
 
-        return grpo_batch, hetero_grpo_batch, opd_batch, stats
+        return grpo_batch, opd_batch, stats
 
-    def _make_fixed_size_grouped_batch(
-        self,
-        data: DataProto,
-        rollout_n: int,
-        update_batch_size: int,
-        prefix: str,
-    ):
-        import numpy as np
-
-        if data is None or len(data) == 0:
-            return None, {
-                f"{prefix}/candidate_rows": 0,
-                f"{prefix}/candidate_groups": 0,
-                f"{prefix}/used_rows": 0,
-                f"{prefix}/used_groups": 0,
-                f"{prefix}/repeat_groups": 0,
-            }
-
-        assert len(data) % rollout_n == 0
-        assert update_batch_size % rollout_n == 0
-
-        num_groups = len(data) // rollout_n
-        target_groups = update_batch_size // rollout_n
-
-        if num_groups >= target_groups:
-            group_ids = np.random.choice(num_groups, size=target_groups, replace=False)
-            repeated_group_count = 0
-        else:
-            group_ids = np.random.choice(num_groups, size=target_groups, replace=True)
-            repeated_group_count = target_groups - num_groups
-
-        row_offsets = np.arange(rollout_n)
-        row_indices = (group_ids[:, None] * rollout_n + row_offsets[None, :]).reshape(-1)
-
-        fixed_batch = _index_dataproto(data, row_indices)
-
-        stats = {
-            f"{prefix}/candidate_rows": int(len(data)),
-            f"{prefix}/candidate_groups": int(num_groups),
-            f"{prefix}/used_rows": int(len(fixed_batch)),
-            f"{prefix}/used_groups": int(target_groups),
-            f"{prefix}/repeat_groups": int(max(0, repeated_group_count)),
-        }
-
-        return fixed_batch, stats
-
-    def _make_fixed_size_batch(
-        self,
-        data: DataProto,
-        update_batch_size: int,
-        prefix: str,
-    ):
-        import numpy as np
-
-        if data is None or len(data) == 0:
-            return None, {
-                f"{prefix}/candidate_rows": 0,
-                f"{prefix}/used_rows": 0,
-                f"{prefix}/repeat_rows": 0,
-            }
-
-        num_rows = len(data)
-
-        if num_rows >= update_batch_size:
-            row_indices = np.random.choice(num_rows, size=update_batch_size, replace=False)
-            repeated_row_count = 0
-        else:
-            row_indices = np.random.choice(num_rows, size=update_batch_size, replace=True)
-            repeated_row_count = update_batch_size - num_rows
-
-        fixed_batch = _index_dataproto(data, row_indices)
-
-        stats = {
-            f"{prefix}/candidate_rows": int(num_rows),
-            f"{prefix}/used_rows": int(len(fixed_batch)),
-            f"{prefix}/repeat_rows": int(max(0, repeated_row_count)),
-        }
-
-        return fixed_batch, stats
 
     def _get_hetero_update_mode(self):
         hd_cfg = self.config.algorithm.hetero_distill
@@ -2010,18 +1734,38 @@ class RayPPOTrainer:
                 student_reward = self._compute_binary_correctness_from_reward_tensor(student_reward_tensor).float()
                 student_batch.batch["reward"] = student_reward
 
-                metrics["hetero/student_rollout_correct_rate"] = student_reward.mean().item()
+
+                from collections import defaultdict
+
+                student_reward_flat = student_reward.detach().float().view(-1).cpu()
+                uids = student_batch.non_tensor_batch["uid"]
+
+                uid_to_indices = defaultdict(list)
+                for idx, uid in enumerate(uids):
+                    uid_to_indices[str(uid)].append(idx)
+
+                group_stds = []
+                for indices in uid_to_indices.values():
+                    group_rewards = student_reward_flat[indices]
+                    group_stds.append(group_rewards.std(unbiased=False))
+
+                if len(group_stds) > 0:
+                    student_rollout_correct_group_mean_std = torch.stack(group_stds).mean().item()
+                else:
+                    student_rollout_correct_group_mean_std = 0.0
+
+                metrics["hetero/student_rollout_correct_mean"] = student_reward_flat.mean().item()
+                metrics["hetero/student_rollout_correct_std"] = student_reward.std(unbiased=False).item()
+                metrics["hetero/student_rollout_correct_group_mean_std"] = student_rollout_correct_group_mean_std
 
                 # =========================
                 # 4) build distillation batch
                 # =========================
-                grpo_batch, hetero_grpo_batch, opd_batch, build_stats = self._build_hetero_train_batches(
+                grpo_batch, opd_batch, build_stats = self._build_hetero_train_batches(
                     student_batch=student_batch,
                     student_reward_tensor=student_reward_tensor,
                 )
                 metrics.update(build_stats)
-
-                use_hetero_adv = self.config.algorithm.hetero_distill.get("use_hetero_adv", False)
 
                 do_grpo, do_opd, update_phase = self._get_hetero_update_mode()
                 metrics["hetero/update_phase_is_grpo"] = int(update_phase == "grpo")
@@ -2031,15 +1775,9 @@ class RayPPOTrainer:
                 # GRPO update
                 # =========================
                 grpo_has_candidate = grpo_batch is not None and len(grpo_batch) > 0
-                hetero_grpo_has_candidate = (
-                    use_hetero_adv
-                    and hetero_grpo_batch is not None
-                    and len(hetero_grpo_batch) > 0
-                )
 
                 if do_grpo:
-                    if grpo_has_candidate or hetero_grpo_has_candidate:
-                        grpo_parts = []
+                    if grpo_has_candidate:
 
                         if grpo_has_candidate:
                             grpo_batch = compute_advantage(
@@ -2051,27 +1789,8 @@ class RayPPOTrainer:
                                 norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
                                 config=self.config.algorithm,
                             )
-                            grpo_batch = self._drop_grpo_transient_fields(grpo_batch)
-                            grpo_parts.append(grpo_batch)
 
-                        if hetero_grpo_has_candidate:
-                            hetero_grpo_batch, hetero_adv_stats = self._compute_hetero_grpo_advantage(
-                                data=hetero_grpo_batch,
-                                rollout_n=self.student_rollout_n,
-                            )
-                            metrics.update(hetero_adv_stats)
-                            hetero_grpo_batch = self._drop_grpo_transient_fields(hetero_grpo_batch)
-                            grpo_parts.append(hetero_grpo_batch)
-
-                        mixed_grpo_batch = self._concat_dataproto_list(grpo_parts)
-
-                        update_batch, fix_stats = self._make_fixed_size_grouped_batch(
-                            data=mixed_grpo_batch,
-                            rollout_n=self.student_rollout_n,
-                            update_batch_size=self.grpo_update_batch_size,
-                            prefix="hetero/grpo",
-                        )
-                        metrics.update(fix_stats)
+                        update_batch = grpo_batch
 
                         if update_batch is not None and len(update_batch) > 0:
                             print("[DEBUG] GRPO UPDATE START.")
@@ -2079,6 +1798,10 @@ class RayPPOTrainer:
                             old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
                             update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
                             update_batch.batch['entropys'] = old_log_prob_output.batch["entropys"]
+
+                            base_log_probs_output = self.actor_rollout_wg.compute_base_log_prob(update_batch)
+                            update_batch.batch["base_log_probs"] = base_log_probs_output.batch["base_log_probs"]
+                            
                             self._add_entropy_metrics(
                                 metrics=metrics,
                                 batch=update_batch,
@@ -2103,12 +1826,7 @@ class RayPPOTrainer:
                 # =========================
                 if do_opd:
                     if opd_batch is not None and len(opd_batch) > 0:
-                        update_batch, fix_stats = self._make_fixed_size_batch(
-                            data=opd_batch,
-                            update_batch_size=self.opd_update_batch_size,
-                            prefix="hetero/opd",
-                        )
-                        metrics.update(fix_stats)
+                        update_batch = opd_batch
 
                         if update_batch is not None and len(update_batch) > 0:
                             print("[DEBUG] OPD UPDATE START.")
@@ -2127,7 +1845,7 @@ class RayPPOTrainer:
                             update_batch.batch["teacher_log_probs"] = teacher_log_probs_output.batch["ref_log_prob"]
 
                             base_log_probs_output = self.actor_rollout_wg.compute_base_log_prob(update_batch)
-                            update_batch.batch["base_log_probs"] = base_log_probs_output.batch["base_log_prob"]
+                            update_batch.batch["base_log_probs"] = base_log_probs_output.batch["base_log_probs"]
 
                             actor_output = self.actor_rollout_wg.update_actor_opd(update_batch)
                             actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])

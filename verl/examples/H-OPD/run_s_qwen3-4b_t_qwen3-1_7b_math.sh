@@ -15,7 +15,6 @@ ability=Math
 
 test_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/val_1000.parquet
 train_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_80_percent.parquet
-teacher_offline_rollout_results_path="/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/offline_rollout_results/${teacher_model_name}_DeepMath-103K_pass@16.json"
 
 student_model_path="/mnt/phwfile/datafrontier/public_models/Qwen3-${student_model_subfix}"
 teacher_model_path="/mnt/phwfile/datafrontier/public_models/Qwen3-${teacher_model_subfix}"
@@ -23,14 +22,12 @@ teacher_model_path="/mnt/phwfile/datafrontier/public_models/Qwen3-${teacher_mode
 today=$(date +%m%d_%H%M)
 
 # grpo configs
-grpo_batch_size=1024
-use_hetero_adv=false
+use_grpo=true
 grpo_lr_scale=1.0
 
 # opd configs
-opd_batch_size=0
-opd_lr_scale=1.0
-use_pos_delta_logp_mask=false     
+use_opd=true
+opd_lr_scale=1.0 
 
 # update mode config
 update_mode=both   # in [alt, both, warmup]
@@ -50,24 +47,8 @@ n_node=1
 n_gpu=8
 
 
-batch_size_to_bool() {
-    local name="$1"
-    local value="$2"
-    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: ${name}_batch_size must be a non-negative integer, got: ${value}" >&2
-        exit 1
-    fi
-    if (( 10#$value > 0 )); then
-        echo true
-    else
-        echo false
-    fi
-}
-
-use_grpo=$(batch_size_to_bool grpo "$grpo_batch_size")
-use_opd=$(batch_size_to_bool opd "$opd_batch_size")
 output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${warmup_mode}"
-output_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/TRA_weak2strong@${val_n}/${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}"
+output_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/TRA_weak2strong@${val_n}/${output_model_name}_G${use_grpo}_O${use_opd}_${today}"
 
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
@@ -88,18 +69,14 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.student_rollout_n=8 \
     +algorithm.hetero_distill.teacher_rollout_n=8 \
     +algorithm.hetero_distill.use_grpo=$use_grpo \
-    +algorithm.hetero_distill.use_hetero_adv=$use_hetero_adv \
     +algorithm.hetero_distill.use_opd=$use_opd \
     +algorithm.hetero_distill.update_mode=$update_mode \
     +algorithm.hetero_distill.opd_steps=$opd_steps \
     +algorithm.hetero_distill.grpo_steps=$grpo_steps \
     +algorithm.hetero_distill.warmup_steps=$warmup_steps \
-    +algorithm.hetero_distill.offline_teacher_rollout_path=$teacher_offline_rollout_results_path \
-    +algorithm.hetero_distill.grpo_update_batch_size=$grpo_batch_size \
-    +algorithm.hetero_distill.opd_update_batch_size=$opd_batch_size \
     data.train_files=$train_files \
     data.val_files=$test_files \
-    data.train_batch_size=256 \
+    data.train_batch_size=1024 \
     data.max_prompt_length=1024 \
     data.max_response_length=8192 \
     data.filter_overlong_prompts=True \
@@ -150,7 +127,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger='["console","wandb"]' \
     trainer.log_val_generations=0 \
     trainer.project_name="TRA_weak2strong@${val_n}" \
-    trainer.experiment_name="${output_model_name}_GB${grpo_batch_size}_OB${opd_batch_size}_${today}" \
+    trainer.experiment_name="${output_model_name}_G${use_grpo}_O${use_opd}_${today}" \
     trainer.n_gpus_per_node=$n_gpu \
     trainer.nnodes=$n_node \
     trainer.max_actor_ckpt_to_keep=1 \

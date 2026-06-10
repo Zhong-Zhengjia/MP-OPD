@@ -494,8 +494,8 @@ class DataParallelPPOActor(BasePPOActor):
             "advantages",
         ]
 
-        if self.config.use_kl_loss and "ref_log_prob" in data.batch.keys():
-            select_keys.append("ref_log_prob")
+        if self.config.use_kl_loss and "base_log_probs" in data.batch.keys():
+            select_keys.append("base_log_probs")
 
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
@@ -508,6 +508,10 @@ class DataParallelPPOActor(BasePPOActor):
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
         mini_batches = data.split(self.config.ppo_mini_batch_size)
+        mini_batches = [
+            mb for mb in mini_batches
+            if mb.batch.batch_size[0] == self.config.ppo_mini_batch_size
+        ]
 
         # ================ algorithm config ================
         entropy_coeff = self.config.entropy_coeff
@@ -601,11 +605,11 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         policy_loss = pg_loss
 
-                    if self.config.use_kl_loss and "ref_log_prob" in model_inputs:
-                        ref_log_prob = model_inputs["ref_log_prob"]
+                    if self.config.use_kl_loss and "base_log_probs" in model_inputs:
+                        base_log_prob = model_inputs["base_log_probs"]
                         kld = kl_penalty(
                             logprob=log_prob,
-                            ref_logprob=ref_log_prob,
+                            ref_logprob=base_log_prob,
                             kl_penalty=self.config.kl_loss_type,
                         )
                         kl_loss = agg_loss(
@@ -655,6 +659,10 @@ class DataParallelPPOActor(BasePPOActor):
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
         mini_batches = data.split(self.config.ppo_mini_batch_size)
+        mini_batches = [
+            mb for mb in mini_batches
+            if mb.batch.batch_size[0] == self.config.ppo_mini_batch_size
+        ]
 
         # ================ algorithm config ================
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
@@ -662,8 +670,6 @@ class DataParallelPPOActor(BasePPOActor):
         loss_agg_mode = self.config.loss_agg_mode
         policy_loss_fn = get_policy_loss_fn(loss_mode)
 
-        use_pos_delta_logp_mask = self.config.get("use_pos_delta_logp_mask", False)
-        print('[DEBUG] use_pos_delta_logp_mask: ', use_pos_delta_logp_mask, type(use_pos_delta_logp_mask))
         opd_lr_scale = self.config.get('opd_lr_scale', 0.2)
         print('[DEBUG] opd_lr_scale: ', opd_lr_scale)
         # ================ algorithm config ================
@@ -696,7 +702,7 @@ class DataParallelPPOActor(BasePPOActor):
                     response_mask = model_inputs["response_mask"]
                     teacher_log_probs = model_inputs["teacher_log_probs"].detach()
                     old_log_prob = model_inputs["old_log_probs"].detach()
-                    base_log_prob = model_inputs['base_log_probs'].detach()
+                    base_log_probs = model_inputs['base_log_probs'].detach()
 
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -711,19 +717,14 @@ class DataParallelPPOActor(BasePPOActor):
                         calculate_entropy=calculate_entropy,
                     )
 
-                    # reverse_kl = old_log_prob - base_log_prob
-                    # reward_correction = teacher_log_probs - base_log_prob
+                    # reverse_kl = old_log_prob - base_log_probs
+                    # reward_correction = teacher_log_probs - base_log_probs
                     # reverse_kl = reverse_kl - reward_correction * 1.25
                     # advantage = (-(reverse_kl))
                     delta_log_prob = teacher_log_probs - old_log_prob
                     advantages = delta_log_prob
 
-                    if use_pos_delta_logp_mask:
-                        policy_mask = response_mask * (delta_log_prob > 0).to(response_mask.dtype)
-                    else:
-                        policy_mask = response_mask
-                    if policy_mask.sum() == 0:
-                        continue
+                    policy_mask = response_mask   # To be extended
 
                     add_masked_advantage_metrics(
                         micro_batch_metrics,
@@ -745,14 +746,14 @@ class DataParallelPPOActor(BasePPOActor):
                     
                     policy_loss = opd_loss * opd_weight
 
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(
-                            loss_mat=entropy,
-                            loss_mask=policy_mask,
-                            loss_agg_mode=loss_agg_mode,
-                        )
-                        policy_loss = policy_loss - entropy_loss * entropy_coeff
-                        micro_batch_metrics["actor/opd_entropy_loss"] = entropy_loss.detach().item() * loss_scale_factor
+                    # if entropy_coeff != 0:
+                    #     entropy_loss = agg_loss(
+                    #         loss_mat=entropy,
+                    #         loss_mask=policy_mask,
+                    #         loss_agg_mode=loss_agg_mode,
+                    #     )
+                    #     policy_loss = policy_loss - entropy_loss * entropy_coeff
+                    #     micro_batch_metrics["actor/opd_entropy_loss"] = entropy_loss.detach().item() * loss_scale_factor
 
                     loss = policy_loss * loss_scale_factor
 
