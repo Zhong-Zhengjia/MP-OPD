@@ -74,7 +74,6 @@ while [[ $# -gt 0 ]]; do
 done
 set -- "${extra_args[@]}"
 
-
 batch_size_to_bool() {
     local name="$1"
     local value="$2"
@@ -129,7 +128,7 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.warmup_steps=$warmup_steps \
     data.train_files=$train_files \
     data.val_files=$test_files \
-    data.train_batch_size=1024 \
+    data.train_batch_size=256 \
     data.max_prompt_length=1024 \
     data.max_response_length=8192 \
     data.filter_overlong_prompts=True \
