@@ -8,7 +8,7 @@ export USED_MODEL="no_api"
 
 
 student_model_subfix=1.7B
-teacher_model_subfix=4B-M-RL
+teacher_model_subfix=4B
 student_model_name="Qwen3-${student_model_subfix}"
 teacher_model_name="Qwen3-${teacher_model_subfix}"
 ability=Math
@@ -22,20 +22,21 @@ teacher_model_path="/mnt/phwfile/datafrontier/public_models/Qwen3-${teacher_mode
 today=$(date +%m%d_%H%M)
 
 # grpo configs
-use_grpo=false
+use_grpo=true
 grpo_lr_scale=1.0
 
 # opd configs
 use_opd=true
 opd_lr_scale=1.0 
+opd_top_k=100
 
 # update mode config
-update_mode=both   # in [alt, both, warmup]
+update_mode=warmup   # in [alt, both, warmup]
     # alt update configs
 opd_steps=10
 grpo_steps=50
     # warmup update configs
-warmup_steps=20
+warmup_steps=10
 
 # validation config
 val_n=16
@@ -47,7 +48,7 @@ n_node=1
 n_gpu=8
 
 
-project_name=MathArena_LB_strong2weak@${val_n}
+project_name=MathArena_strong2weak@${val_n}
 
 # resume_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/TRA_strong2weak@16/Qwen3-1.7B-T4B-_GB1024_OB0_0606_0711/"
 resume_path=""
@@ -88,7 +89,7 @@ batch_size_to_bool() {
     fi
 }
 
-output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${update_mode}"
+output_model_name="Qwen3-${student_model_subfix}-T${teacher_model_subfix}-${update_mode}${warmup_steps}"
 
 resume_args=()
 if [[ -n "$resume_path" ]]; then

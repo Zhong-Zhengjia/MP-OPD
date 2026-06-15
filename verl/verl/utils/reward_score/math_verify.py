@@ -27,7 +27,7 @@ import requests
 
 MATH_VERIFY_SERVER_URL = os.getenv(
     "MATH_VERIFY_SERVER_URL",
-    "http://10.140.45.27:8008/verify",   # http://10.140.45.27:8008/verify, http://10.140.37.23:8132/verify
+    "http://10.140.37.20:8132/verify",   # http://10.140.45.27:8008/verify, http://10.140.37.23:8132/verify
 )
 
 MATH_VERIFY_HTTP_CONNECT_TIMEOUT = float(
@@ -54,14 +54,28 @@ def remote_math_verify(ground_truth: str, answer: str) -> bool:
             ),
         )
 
-        if resp.status_code != 200:
-            return False
+    except (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+    ) as e:
+        raise RuntimeError(
+            f"Math verify server is unavailable: {MATH_VERIFY_SERVER_URL}"
+        ) from e
 
-        data = resp.json()
-        return bool(data.get("result", False))
+    if 500 <= resp.status_code < 600:
+        raise RuntimeError(
+            f"Math verify server returned HTTP {resp.status_code}"
+        )
 
-    except Exception:
+    if resp.status_code != 200:
         return False
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return False
+
+    return bool(data.get("result", False))
 
 
 def last_boxed_only_string(string):

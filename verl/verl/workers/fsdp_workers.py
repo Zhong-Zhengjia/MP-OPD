@@ -1305,6 +1305,74 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="cyan", role="actor_compute_log_probs_on_ids")
+    def compute_actor_log_probs_on_ids(self, data: DataProto):
+        assert self._is_actor
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        from contextlib import nullcontext
+
+        is_lora = data.meta_info.pop("is_lora", False)
+        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.rollout.temperature
+
+        with self.ulysses_sharding_manager:
+            with adapter_ctx:
+                output = self.actor.compute_selected_log_probs(data=data)
+            output = DataProto.from_dict(tensors={"actor_topk_log_probs": output})
+
+        output = output.to("cpu")
+
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during compute_actor_log_probs_on_ids", logger=logger)
+
+        return output
+
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="cyan", role="ref_compute_log_probs_on_ids")
+    def compute_ref_log_probs_on_ids(self, data: DataProto):
+        if self._is_lora:
+            data.meta_info["is_lora"] = True
+            output = self.compute_actor_log_probs_on_ids(data)
+            return DataProto.from_dict(
+                tensors={"teacher_topk_log_probs": output.batch["actor_topk_log_probs"]}
+            )
+
+        assert self._is_ref
+
+        data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+            output = self.ref_policy.compute_selected_log_probs(data=data)
+            output = DataProto.from_dict(tensors={"teacher_topk_log_probs": output})
+
+        output = output.to("cpu")
+
+        if self.world_size > 1:
+            if fsdp_version(self.ref_policy.actor_module) == 1:
+                self.ref_policy.actor_module._handle.reshard(True)
+            elif fsdp_version(self.ref_policy.actor_module) == 2:
+                self.ref_policy.actor_module.reshard()
+
+        return output
+
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="cyan", role="actor_update_grpo")
     def update_actor_grpo(self, data: DataProto):
         assert self._is_actor
