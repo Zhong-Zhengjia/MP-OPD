@@ -1229,8 +1229,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output = self.actor.compute_topk_ids(data=data, top_k=top_k)
-            output = DataProto.from_dict(tensors={"actor_topk_ids": output})
+                entropys, output = self.actor.compute_topk_ids(data=data, top_k=top_k)
+            output = DataProto.from_dict(tensors={"actor_topk_ids": output, "entropys": entropys})
 
         output = output.to("cpu")
 
@@ -1262,8 +1262,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")
-            output = self.ref_policy.compute_topk_ids(data=data, top_k=top_k)
-            output = DataProto.from_dict(tensors={"ref_topk_ids": output})
+            entropys, output = self.ref_policy.compute_topk_ids(data=data, top_k=top_k)
+            output = DataProto.from_dict(tensors={"ref_topk_ids": output, "entropys": entropys})
 
         output = output.to("cpu")
 
@@ -1290,8 +1290,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")
-            output = self.base_policy.compute_topk_ids(data=data, top_k=top_k)
-            output = DataProto.from_dict(tensors={"base_topk_ids": output})
+            entropys, output = self.base_policy.compute_topk_ids(data=data, top_k=top_k)
+            output = DataProto.from_dict(tensors={"base_topk_ids": output, "entropys": entropys})
 
         output = output.to("cpu")
 

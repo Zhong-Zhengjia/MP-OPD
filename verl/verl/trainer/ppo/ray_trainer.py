@@ -1652,6 +1652,44 @@ class RayPPOTrainer:
         return union_ids, union_mask
 
 
+    def _add_topk_overlap_metrics(
+        self,
+        metrics,
+        batch,
+        actor_topk_ids,
+        ref_topk_ids,
+        union_topk_mask,
+        prefix="opd",
+    ):
+        with torch.no_grad():
+            k = actor_topk_ids.shape[-1]
+            token_shape = actor_topk_ids.shape[:-1]
+
+            union_count = union_topk_mask.sum(dim=-1).float()
+            intersection_count = (2.0 * k - union_count).clamp(min=0.0, max=float(k))
+
+            top1_match = actor_topk_ids[..., 0] == ref_topk_ids[..., 0]
+            teacher_top1_in_student_topk = (actor_topk_ids == ref_topk_ids[..., :1]).any(dim=-1)
+            student_top1_in_teacher_topk = (ref_topk_ids == actor_topk_ids[..., :1]).any(dim=-1)
+
+            valid_mask = None
+            for key in ("response_mask", "loss_mask"):
+                if key in batch.batch and tuple(batch.batch[key].shape) == tuple(token_shape):
+                    valid_mask = batch.batch[key].bool()
+                    break
+
+            if valid_mask is None:
+                valid_mask = torch.ones(token_shape, dtype=torch.bool, device=actor_topk_ids.device)
+
+            valid_mask = valid_mask & torch.isfinite(intersection_count)
+
+            metrics[f"{prefix}/topk_intersection_count"] = intersection_count[valid_mask].float().mean().item()
+            metrics[f"{prefix}/topk_union_count"] = union_count[valid_mask].float().mean().item()
+            metrics[f"{prefix}/top1_match_rate"] = top1_match[valid_mask].float().mean().item()
+            metrics[f"{prefix}/teacher_top1_in_student_topk_rate"] = teacher_top1_in_student_topk[valid_mask].float().mean().item()
+            metrics[f"{prefix}/student_top1_in_teacher_topk_rate"] = student_top1_in_teacher_topk[valid_mask].float().mean().item()
+
+
     def fit_heterogeneous(self):
         from omegaconf import OmegaConf
         from pprint import pprint
@@ -1893,11 +1931,28 @@ class RayPPOTrainer:
                             ref_topk_output = self.actor_rollout_wg.compute_ref_topk_ids(update_batch)
 
                             actor_topk_ids = actor_topk_output.batch["actor_topk_ids"]
+                            actor_entropys = actor_topk_output.batch['entropys']
                             ref_topk_ids = ref_topk_output.batch["ref_topk_ids"]
+
+                            self._add_entropy_metrics(
+                                metrics=metrics,
+                                batch=update_batch,
+                                entropys=actor_entropys,
+                                prefix="opd",
+                            )
 
                             union_topk_ids, union_topk_mask = self._build_union_topk_ids(
                                 actor_topk_ids,
                                 ref_topk_ids,
+                            )
+
+                            self._add_topk_overlap_metrics(
+                                metrics=metrics,
+                                batch=update_batch,
+                                actor_topk_ids=actor_topk_ids,
+                                ref_topk_ids=ref_topk_ids,
+                                union_topk_mask=union_topk_mask,
+                                prefix="opd",
                             )
 
                             update_batch.batch["union_topk_ids"] = union_topk_ids

@@ -21,12 +21,13 @@ teacher_model_path="/mnt/phwfile/datafrontier/public_models/${teacher_model_name
 today=$(date +%m%d_%H%M)
 
 # grpo configs
-use_grpo=true
+use_grpo=false
 grpo_lr_scale=1.0
 
 # opd configs
-use_opd=false
+use_opd=true
 opd_lr_scale=1.0 
+opd_top_k=100
 
 # update mode config
 update_mode=both   # in [alt, both, warmup]
@@ -46,7 +47,7 @@ n_node=1
 n_gpu=8
 
 
-project_name=MathArena_LB_strong2weak@${val_n}
+project_name=MathRL_strong2weak@${val_n}
 
 # resume_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/TRA_strong2weak@16/Qwen3-1.7B-T4B-_GB1024_OB0_0606_0711/"
 resume_path=""
@@ -88,7 +89,7 @@ batch_size_to_bool() {
     fi
 }
 
-output_model_name="${student_model_abb}-T${teacher_model_abb}-${update_mode}"
+output_model_name="${student_model_abb}-T${teacher_model_abb}-${update_mode}${warmup_steps}"
 
 resume_args=()
 if [[ -n "$resume_path" ]]; then

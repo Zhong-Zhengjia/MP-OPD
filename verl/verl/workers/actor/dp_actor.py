@@ -582,13 +582,14 @@ class DataParallelPPOActor(BasePPOActor):
             micro_batches = data.split(micro_batch_size)
 
         topk_lst = []
+        entropy_lst = []
 
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
 
             with torch.no_grad():
-                _, _, topk_ids = self._forward_micro_batch(
+                entropy, _, topk_ids = self._forward_micro_batch(
                     model_inputs,
                     temperature=temperature,
                     calculate_entropy=False,
@@ -597,13 +598,16 @@ class DataParallelPPOActor(BasePPOActor):
                 )
 
             topk_lst.append(topk_ids)
+            entropy_lst.append(entropy)
 
         topk_ids = torch.concat(topk_lst, dim=0)
+        entropys = torch.concat(entropy_lst, dim=0)
 
         if use_dynamic_bsz:
             topk_ids = restore_dynamic_batch(topk_ids, batch_idx_list)
+            entropys = restore_dynamic_batch(entropys, batch_idx_list)
 
-        return topk_ids
+        return entropys, topk_ids
 
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
