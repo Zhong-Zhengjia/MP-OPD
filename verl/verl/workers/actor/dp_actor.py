@@ -592,7 +592,7 @@ class DataParallelPPOActor(BasePPOActor):
                 entropy, _, topk_ids = self._forward_micro_batch(
                     model_inputs,
                     temperature=temperature,
-                    calculate_entropy=False,
+                    calculate_entropy=True,
                     return_topk=True,
                     top_k=top_k,
                 )
