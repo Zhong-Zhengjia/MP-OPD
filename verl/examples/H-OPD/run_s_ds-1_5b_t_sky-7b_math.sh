@@ -21,11 +21,11 @@ teacher_model_path="/mnt/phwfile/datafrontier/public_models/${teacher_model_name
 today=$(date +%m%d_%H%M)
 
 # grpo configs
-use_grpo=false
+use_grpo=true
 grpo_lr_scale=1.0
 
 # opd configs
-use_opd=true
+use_opd=false
 opd_lr_scale=1.0 
 opd_top_k=100
 
@@ -131,7 +131,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_files=$test_files \
     data.train_batch_size=256 \
     data.max_prompt_length=1024 \
-    data.max_response_length=10240 \
+    data.max_response_length=16384 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=True \
@@ -146,7 +146,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=true \
     actor_rollout_ref.actor.ppo_mini_batch_size=1024 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=11264 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768 \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
@@ -156,7 +156,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.free_cache_engine=true \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=11264 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
