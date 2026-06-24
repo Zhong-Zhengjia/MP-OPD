@@ -840,9 +840,10 @@ class DataParallelPPOActor(BasePPOActor):
             "input_ids",
             "attention_mask",
             "position_ids",
-            "union_topk_ids",
-            "union_topk_mask",
-            "teacher_topk_log_probs",
+            "teacher_log_probs",
+            "teacher_base_log_probs",
+            "old_log_probs",
+            "base_log_probs"
         ]
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -855,11 +856,18 @@ class DataParallelPPOActor(BasePPOActor):
             if mb.batch.batch_size[0] == self.config.ppo_mini_batch_size
         ]
 
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+        entropy_coeff = self.config.entropy_coeff
         loss_agg_mode = self.config.loss_agg_mode
+        policy_loss_fn = get_policy_loss_fn(loss_mode)
+
         opd_lr_scale = self.config.get("opd_lr_scale", 0.2)
-        opd_weight = self.config.get("opd_weight", 1.0)
+        print("[DEBUG] opd_lr_scale: ", opd_lr_scale)
+
+        lambda_vals = self.config.policy_loss.get("lambda_vals", 1.0)
 
         metrics = {}
+        opd_weight = 1.0
 
         for _ in range(self.config.ppo_epochs):
             for mini_batch in mini_batches:
@@ -879,52 +887,52 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics = {}
 
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+
                     response_mask = model_inputs["response_mask"]
-                    union_topk_mask = model_inputs["union_topk_mask"].bool()
-                    teacher_topk_log_probs = model_inputs["teacher_topk_log_probs"].detach()
+                    teacher_log_probs = model_inputs["teacher_log_probs"].detach()
+                    teacher_base_log_probs = model_inputs["teacher_base_log_probs"].detach()
+                    old_log_prob = model_inputs["old_log_probs"].detach()
+                    base_log_probs = model_inputs['base_log_probs'].detach()
+
+                    advantages = teacher_log_probs - teacher_base_log_probs - lambda_vals * (old_log_prob - base_log_probs)
+                    # advantages = teacher_log_probs - teacher_base_log_probs   # extreme update
+                    advantages = advantages.detach()
 
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
 
-                    _, _, student_topk_log_probs = self._forward_micro_batch(
+                    calculate_entropy = entropy_coeff != 0
+
+                    entropy, log_prob = self._forward_micro_batch(
                         model_inputs,
                         temperature=temperature,
-                        calculate_entropy=False,
-                        return_selected_log_probs=True,
+                        calculate_entropy=calculate_entropy,
                     )
 
-                    student_topk_log_probs = student_topk_log_probs.float()
-                    teacher_topk_log_probs = teacher_topk_log_probs.float()
+                    policy_mask = response_mask
 
-                    student_topk_log_probs = student_topk_log_probs.masked_fill(
-                        ~union_topk_mask,
-                        -torch.inf,
-                    )
-                    teacher_topk_log_probs = teacher_topk_log_probs.masked_fill(
-                        ~union_topk_mask,
-                        -torch.inf,
+                    add_masked_advantage_metrics(
+                        micro_batch_metrics,
+                        advantages=advantages,
+                        response_mask=policy_mask,
+                        prefix="actor/opd_advantages",
                     )
 
-                    reverse_kl_terms = student_topk_log_probs.exp() * (
-                        student_topk_log_probs - teacher_topk_log_probs
-                    )
-                    reverse_kl_terms = torch.where(
-                        union_topk_mask,
-                        reverse_kl_terms,
-                        torch.zeros_like(reverse_kl_terms),
-                    )
-
-                    reverse_kl = reverse_kl_terms.sum(dim=-1)
-
-                    opd_loss = agg_loss(
-                        loss_mat=reverse_kl,
-                        loss_mask=response_mask,
+                    opd_loss, pg_metrics = policy_loss_fn(
+                        old_log_prob=old_log_prob,
+                        log_prob=log_prob,
+                        advantages=advantages,
+                        response_mask=policy_mask,
                         loss_agg_mode=loss_agg_mode,
+                        config=self.config,
+                        rollout_is_weights=None,
                     )
+                    micro_batch_metrics.update(pg_metrics)
 
                     policy_loss = opd_loss * opd_weight
+
                     loss = policy_loss * loss_scale_factor
 
                     if self.scaler is not None:
@@ -934,41 +942,45 @@ class DataParallelPPOActor(BasePPOActor):
 
                     did_backward = True
 
-                    with torch.no_grad():
-                        valid_token_mask = response_mask.bool()
-                        valid_union_mask = union_topk_mask & valid_token_mask.unsqueeze(-1)
+                    student_logp = agg_loss(
+                        loss_mat=log_prob,
+                        loss_mask=policy_mask,
+                        loss_agg_mode=loss_agg_mode,
+                    )
+                    teacher_logp = agg_loss(
+                        loss_mat=teacher_log_probs,
+                        loss_mask=policy_mask,
+                        loss_agg_mode=loss_agg_mode,
+                    )
+                    teacher_base_logp = agg_loss(
+                        loss_mat=teacher_base_log_probs,
+                        loss_mask=policy_mask,
+                        loss_agg_mode=loss_agg_mode,
+                    )
+                    teacher_delta_logp = agg_loss(
+                        loss_mat=teacher_log_probs - teacher_base_log_probs,
+                        loss_mask=policy_mask,
+                        loss_agg_mode=loss_agg_mode,
+                    )
 
-                        student_prob = student_topk_log_probs.exp()
-                        teacher_prob = teacher_topk_log_probs.exp()
-
-                        micro_batch_metrics["actor/opd_reverse_kl"] = opd_loss.detach().item() * loss_scale_factor
-                        micro_batch_metrics["actor/opd_loss"] = policy_loss.detach().item() * loss_scale_factor
-                        micro_batch_metrics["actor/opd_student_top1_prob"] = (
-                            student_prob.max(dim=-1).values[valid_token_mask].mean().item()
-                            if valid_token_mask.any()
-                            else 0.0
-                        )
-                        micro_batch_metrics["actor/opd_teacher_top1_prob"] = (
-                            teacher_prob.max(dim=-1).values[valid_token_mask].mean().item()
-                            if valid_token_mask.any()
-                            else 0.0
-                        )
-                        micro_batch_metrics["actor/opd_union_size"] = (
-                            valid_union_mask.sum(dim=-1)[valid_token_mask].float().mean().item()
-                            if valid_token_mask.any()
-                            else 0.0
-                        )
+                    micro_batch_metrics["actor/opd_loss"] = opd_loss.detach().item() * loss_scale_factor
+                    micro_batch_metrics["actor/opd_weighted_loss"] = policy_loss.detach().item() * loss_scale_factor
+                    micro_batch_metrics["actor/opd_student_log_prob"] = student_logp.detach().item() * loss_scale_factor
+                    micro_batch_metrics["actor/opd_teacher_log_prob"] = teacher_logp.detach().item() * loss_scale_factor
+                    micro_batch_metrics["actor/opd_teacher_base_log_prob"] = teacher_base_logp.detach().item() * loss_scale_factor
+                    micro_batch_metrics["actor/opd_teacher_delta_log_prob"] = teacher_delta_logp.detach().item() * loss_scale_factor
 
                     append_to_dict(metrics, micro_batch_metrics)
 
                 if did_backward:
                     grad_norm = self._optimizer_step(lr_scale=opd_lr_scale)
-                    append_to_dict(metrics, {"actor/opd_grad_norm": grad_norm.detach().item()})
+                    append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
                 else:
-                    append_to_dict(metrics, {"actor/opd_grad_norm": 0.0})
+                    append_to_dict(metrics, {"actor/grad_norm": 0.0})
 
         self.actor_optimizer.zero_grad()
         return metrics
+
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):

@@ -6,10 +6,11 @@ export WANDB_API_KEY="wandb_v1_5LC467ydtnlX8jUBfZPy9f5AJWo_A83E8DFWNGt7UVUIhKkvB
 export WANDB_MODE=online
 export USED_MODEL="no_api"
 
-student_model_name=DeepSeek-R1-Distill-Qwen-1.5B
-teacher_model_name=Skywork-OR1-Math-7B
-student_model_abb=DS15
-teacher_model_abb=SK7
+student_model_name="Qwen3-8B"
+teacher_model_name="Qwen3-1.7B-ExtremeUpdated"
+teacher_base_model_name="Qwen3-1.7B"
+student_tag="Qwen3-8B"
+teacher_tag="1.7B_EU"
 ability=Math
 
 test_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/MathTestTotal/test.parquet
@@ -17,17 +18,19 @@ train_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/De
 
 student_model_path="/mnt/phwfile/datafrontier/public_models/${student_model_name}"
 teacher_model_path="/mnt/phwfile/datafrontier/public_models/${teacher_model_name}"
+teacher_base_model_path="/mnt/phwfile/datafrontier/public_models/${teacher_base_model_name}"
 
 today=$(date +%m%d_%H%M)
 
 # grpo configs
-use_grpo=true
+use_grpo=false
 grpo_lr_scale=1.0
 
 # opd configs
-use_opd=false
+use_opd=true
 opd_lr_scale=1.0 
 opd_top_k=100
+lambda_vals=1.0
 
 # update mode config
 update_mode=both   # in [alt, both, warmup]
@@ -35,7 +38,7 @@ update_mode=both   # in [alt, both, warmup]
 opd_steps=10
 grpo_steps=50
     # warmup update configs
-warmup_steps=20
+warmup_steps=10
 
 # validation config
 val_n=16
@@ -47,7 +50,7 @@ n_node=1
 n_gpu=8
 
 
-project_name=MathRL_strong2weak@${val_n}
+project_name=MT_weak2strong@${val_n}
 
 # resume_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/TRA_strong2weak@16/Qwen3-1.7B-T4B-_GB1024_OB0_0606_0711/"
 resume_path=""
@@ -74,7 +77,6 @@ while [[ $# -gt 0 ]]; do
 done
 set -- "${extra_args[@]}"
 
-
 batch_size_to_bool() {
     local name="$1"
     local value="$2"
@@ -89,7 +91,7 @@ batch_size_to_bool() {
     fi
 }
 
-output_model_name="${student_model_abb}-T${teacher_model_abb}-${update_mode}${warmup_steps}"
+output_model_name="${student_tag}-T${teacher_tag}_Lam${lambda_vals}"
 
 resume_args=()
 if [[ -n "$resume_path" ]]; then
@@ -137,10 +139,11 @@ python3 -m verl.trainer.main_ppo \
     data.shuffle=True \
     data.seed=3412 \
     data.return_raw_chat=True \
-    +data.apply_chat_template_kwargs.enable_thinking=true \
+    +data.apply_chat_template_kwargs.enable_thinking=false \
     actor_rollout_ref.model.path=$student_model_path \
     +actor_rollout_ref.model.base_model_path=$student_model_path \
     +actor_rollout_ref.ref.model.path=$teacher_model_path \
+    +actor_rollout_ref.ref.model.base_model_path=$teacher_base_model_path \
     actor_rollout_ref.actor.optim.lr=$lr \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 \
     actor_rollout_ref.model.use_remove_padding=true \
@@ -151,8 +154,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
-    actor_rollout_ref.rollout.data_parallel_size=2 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=8 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.free_cache_engine=true \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
@@ -172,6 +174,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.loss_agg_mode="seq-mean-token-mean" \
     +actor_rollout_ref.actor.grpo_lr_scale=$grpo_lr_scale \
     +actor_rollout_ref.actor.opd_lr_scale=$opd_lr_scale \
+    actor_rollout_ref.actor.policy_loss.lambda_vals=$lambda_vals \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=false \
     reward_model.reward_manager=naive \
@@ -191,4 +194,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir="$output_path" \
     "${resume_args[@]}" \
     trainer.test_freq=10 \
-    trainer.total_epochs=10 "$@"
+    trainer.total_epochs=3 "$@"

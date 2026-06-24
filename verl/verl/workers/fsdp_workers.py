@@ -921,7 +921,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # In heterogeneous distillation mode, actor base model is used as frozen student-base / self-teacher
             self.student_base_module_fsdp = self.base_module_fsdp
             self.student_base_policy = self.base_policy
-
+ 
         # Ref's base model (for computing base_ref_log_prob)
         self.base_ref_policy = None
         self._has_base_ref_model = False

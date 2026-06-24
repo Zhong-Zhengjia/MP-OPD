@@ -27,7 +27,7 @@ import requests
 
 MATH_VERIFY_SERVER_URL = os.getenv(
     "MATH_VERIFY_SERVER_URL",
-    "http://10.140.37.8:8132/verify",   # http://10.140.45.27:8008/verify, http://10.140.37.23:8132/verify, http://10.140.37.8:8132/verify
+    "http://10.140.37.3:7642/verify",   # http://10.140.45.27:8008/verify, http://10.140.37.23:8132/verify, http://10.140.37.8:8132/verify
 )
 
 MATH_VERIFY_HTTP_CONNECT_TIMEOUT = float(

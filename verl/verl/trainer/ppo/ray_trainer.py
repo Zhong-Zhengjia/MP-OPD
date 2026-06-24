@@ -1924,42 +1924,24 @@ class RayPPOTrainer:
                         if update_batch is not None and len(update_batch) > 0:
                             print("[DEBUG] OPD UPDATE START.")
 
-                            opd_top_k = int(self.config.actor_rollout_ref.actor.get("opd_top_k", 100))
-                            update_batch.meta_info["top_k"] = opd_top_k
-
-                            actor_topk_output = self.actor_rollout_wg.compute_actor_topk_ids(update_batch)
-                            ref_topk_output = self.actor_rollout_wg.compute_ref_topk_ids(update_batch)
-
-                            actor_topk_ids = actor_topk_output.batch["actor_topk_ids"]
-                            actor_entropys = actor_topk_output.batch['entropys']
-                            ref_topk_ids = ref_topk_output.batch["ref_topk_ids"]
-
+                            old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
+                            update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
+                            update_batch.batch['entropys'] = old_log_prob_output.batch["entropys"]
                             self._add_entropy_metrics(
                                 metrics=metrics,
                                 batch=update_batch,
-                                entropys=actor_entropys,
+                                entropys=old_log_prob_output.batch["entropys"],
                                 prefix="opd",
                             )
 
-                            union_topk_ids, union_topk_mask = self._build_union_topk_ids(
-                                actor_topk_ids,
-                                ref_topk_ids,
-                            )
+                            teacher_log_probs_output = self.actor_rollout_wg.compute_ref_log_prob(update_batch)
+                            update_batch.batch["teacher_log_probs"] = teacher_log_probs_output.batch["ref_log_prob"]
 
-                            self._add_topk_overlap_metrics(
-                                metrics=metrics,
-                                batch=update_batch,
-                                actor_topk_ids=actor_topk_ids,
-                                ref_topk_ids=ref_topk_ids,
-                                union_topk_mask=union_topk_mask,
-                                prefix="opd",
-                            )
+                            base_log_probs_output = self.actor_rollout_wg.compute_base_log_prob(update_batch)
+                            update_batch.batch["base_log_probs"] = base_log_probs_output.batch["base_log_probs"]
 
-                            update_batch.batch["union_topk_ids"] = union_topk_ids
-                            update_batch.batch["union_topk_mask"] = union_topk_mask
-
-                            teacher_topk_log_probs_output = self.actor_rollout_wg.compute_ref_log_probs_on_ids(update_batch)
-                            update_batch.batch["teacher_topk_log_probs"] = teacher_topk_log_probs_output.batch["teacher_topk_log_probs"]
+                            teacher_base_log_probs_output = self.actor_rollout_wg.compute_base_ref_log_prob(update_batch)
+                            update_batch.batch["teacher_base_log_probs"] = teacher_base_log_probs_output.batch["base_ref_log_prob"]
 
                             actor_output = self.actor_rollout_wg.update_actor_opd(update_batch)
                             actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])

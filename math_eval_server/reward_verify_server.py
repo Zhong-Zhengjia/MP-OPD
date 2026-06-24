@@ -7,6 +7,7 @@ import ipaddress
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Optional
+from datetime import datetime
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -21,7 +22,7 @@ logger = logging.getLogger("reward_verify_server")
 
 
 MATH_VERIFY_HOST = os.getenv("MATH_VERIFY_HOST", "0.0.0.0")
-MATH_VERIFY_PORT = int(os.getenv("MATH_VERIFY_PORT", "8132"))
+MATH_VERIFY_PORT = int(os.getenv("MATH_VERIFY_PORT", "7642"))
 MATH_VERIFY_WORKERS = int(os.getenv("MATH_VERIFY_WORKERS", "16"))
 MATH_VERIFY_TIMEOUT = float(os.getenv("MATH_VERIFY_TIMEOUT", "3"))
 MATH_VERIFY_MAX_TASKS = int(os.getenv("MATH_VERIFY_MAX_TASKS", "4096"))
