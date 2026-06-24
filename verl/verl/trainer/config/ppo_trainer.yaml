@@ -84,6 +84,18 @@ custom_reward_function:
   # The name of the reward function within the specified file. Default is 'compute_score'.
   name: compute_score
 
+# Validation-only reward (e.g. parallel code prime_code). Training keeps custom_reward_function / naive.
+val_custom_reward_function:
+
+  path: null
+
+  name: reward_func_batched
+
+  reward_kwargs:
+
+    code_timeout: 10
+    code_eval_workers: 16
+
 # config for the algorithm
 algorithm:
 

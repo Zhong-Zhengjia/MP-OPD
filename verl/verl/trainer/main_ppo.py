@@ -294,12 +294,7 @@ class TaskRunner:
             num_examine=0,
             **config.reward_model.get("reward_kwargs", {}),
         )
-        val_reward_fn = load_reward_manager(
-            config,
-            tokenizer,
-            num_examine=0,
-            **config.reward_model.get("reward_kwargs", {}),
-        )
+        val_reward_fn = _load_val_reward_manager(config, tokenizer)
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
@@ -382,6 +377,33 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
     )
 
     return dataset
+
+
+def _load_val_reward_manager(config, tokenizer):
+    """Validation reward: optional top-level ``val_custom_reward_function`` for code rule eval."""
+    val_cfg = config.get("val_custom_reward_function", None)
+    if val_cfg is not None and val_cfg.get("path"):
+        config_val = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+        OmegaConf.set_struct(config_val, False)
+        config_val.custom_reward_function = val_cfg
+        config_val.reward_model.reward_manager = val_cfg.get("reward_manager", "batch")
+        fn_name = val_cfg.get("name", "reward_func_batched")
+        if fn_name == "reward_func":
+            fn_name = "reward_func_batched"
+        config_val.custom_reward_function.name = fn_name
+        val_reward_kwargs = {
+            **dict(config.reward_model.get("reward_kwargs", {})),
+            **dict(val_cfg.get("reward_kwargs", {})),
+        }
+        return load_reward_manager(
+            config_val,
+            tokenizer,
+            num_examine=0,
+            **val_reward_kwargs,
+        )
+    return load_reward_manager(
+        config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+    )
 
 
 def create_rl_sampler(data_config, dataset):

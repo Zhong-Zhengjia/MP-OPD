@@ -79,7 +79,7 @@ class BatchRewardManager(AbstractRewardManager):
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if "rm_scores" in data.batch.keys():
+        if "rm_scores" in data.batch.keys() and not data.meta_info.get("validate", False):
             if return_dict:
                 reward_extra_keys = data.meta_info.get("reward_extra_keys", [])
                 reward_extra_info = {key: data.non_tensor_batch[key] for key in reward_extra_keys}

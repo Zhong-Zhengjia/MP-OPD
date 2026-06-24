@@ -50,6 +50,7 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    add_macro_average_val_metrics,
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
@@ -986,6 +987,21 @@ class RayPPOTrainer:
 
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        aggregate_group = self.config.trainer.get("val_aggregate_group", None)
+        aggregate_sources = self.config.trainer.get("val_aggregate_sources", None)
+        if aggregate_group and aggregate_sources:
+            if isinstance(aggregate_sources, str):
+                sources = [source.strip() for source in aggregate_sources.split(",") if source.strip()]
+            else:
+                sources = list(aggregate_sources)
+            aggregate_var = self.config.trainer.get("val_aggregate_var", "reward")
+            metric_dict = add_macro_average_val_metrics(
+                metric_dict,
+                group_name=aggregate_group,
+                sources=sources,
+                var_name=aggregate_var,
+            )
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)

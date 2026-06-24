@@ -7,6 +7,8 @@ def make_model(
     dataset: str,
     batch_size: int = 1,
     temperature: float = 0.0,
+    top_p: float = 1.0,
+    max_new_tokens: int = 16384,
     force_base_prompt: bool = False,
     # instruction model only
     instruction_prefix=None,
@@ -34,6 +36,8 @@ def make_model(
             name=model,
             batch_size=batch_size,
             temperature=temperature,
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
             dataset=dataset,
             force_base_prompt=force_base_prompt,
             tensor_parallel_size=tp,

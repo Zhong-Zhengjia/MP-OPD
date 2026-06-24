@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from verl.trainer.ppo.metric_utils import (
+    add_macro_average_val_metrics,
     bootstrap_metric,
     calc_maj_val,
     compute_data_metrics,
@@ -274,6 +275,40 @@ class TestCalcMajVal(unittest.TestCase):
         result = calc_maj_val(data, vote_key="pred", val_key="val")
 
         self.assertTrue(result in [0.9, 0.8])
+
+
+class TestAddMacroAverageValMetrics(unittest.TestCase):
+    """Tests for the add_macro_average_val_metrics function."""
+
+    def test_add_macro_average_val_metrics(self):
+        metric_dict = {
+            "val-core/taco/reward/mean@4": 0.8,
+            "val-core/apps/reward/mean@4": 0.6,
+            "val-core/codecontests/reward/mean@4": 0.4,
+            "val-core/codeforces/reward/mean@4": 0.2,
+        }
+
+        result = add_macro_average_val_metrics(
+            metric_dict,
+            group_name="code_avg",
+            sources=["taco", "apps", "codecontests", "codeforces"],
+        )
+
+        self.assertAlmostEqual(result["val-core/code_avg/reward/mean@4"], 0.5)
+
+    def test_add_macro_average_val_metrics_missing_source(self):
+        metric_dict = {
+            "val-core/taco/reward/mean@4": 0.8,
+            "val-core/apps/reward/mean@4": 0.6,
+        }
+
+        result = add_macro_average_val_metrics(
+            metric_dict,
+            group_name="code_avg",
+            sources=["taco", "apps", "missing"],
+        )
+
+        self.assertAlmostEqual(result["val-core/code_avg/reward/mean@4"], 0.7)
 
 
 class TestProcessValidationMetrics(unittest.TestCase):

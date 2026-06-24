@@ -488,3 +488,45 @@ def process_validation_metrics(
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
 
     return data_src2var2metric2val
+
+
+def add_macro_average_val_metrics(
+    metric_dict: dict[str, float],
+    group_name: str,
+    sources: list[str],
+    var_name: str = "reward",
+    section: str = "val-core",
+) -> dict[str, float]:
+    """Add macro-averaged validation metrics across multiple data sources.
+
+    For each source, this function looks up the core metric key:
+    ``{section}/{source}/{var_name}/mean@N`` and averages the values across
+    sources into ``{section}/{group_name}/{var_name}/mean@N``.
+    """
+    values = []
+    matched_suffix = None
+    missing_sources = []
+
+    for source in sources:
+        prefix = f"{section}/{source}/{var_name}/"
+        matching_keys = [key for key in metric_dict if key.startswith(prefix) and "/mean@" in key]
+        if not matching_keys:
+            missing_sources.append(source)
+            continue
+
+        key = sorted(matching_keys, key=lambda item: int(item.split("@")[-1]))[-1]
+        values.append(float(metric_dict[key]))
+        if matched_suffix is None:
+            matched_suffix = key.split("/")[-1]
+
+    if values and matched_suffix is not None:
+        avg_key = f"{section}/{group_name}/{var_name}/{matched_suffix}"
+        metric_dict[avg_key] = float(np.mean(values))
+
+    if missing_sources:
+        print(
+            f"[WARN] Skipped missing sources when computing macro average "
+            f"'{group_name}': {missing_sources}"
+        )
+
+    return metric_dict

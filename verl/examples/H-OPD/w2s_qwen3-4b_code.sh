@@ -7,14 +7,15 @@ export WANDB_MODE=online
 export USED_MODEL="no_api"
 
 student_model_name="Qwen3-8B"
-teacher_model_name="Qwen3-1.7B-ExtremeUpdated" # proxy expert
-teacher_base_model_name="Qwen3-1.7B"           # proxy base
+teacher_model_name="Qwen3-4B-Non-Thinking-RL-Code-Step300" # code proxy expert
+teacher_base_model_name="Qwen3-4B"                         # proxy base
 student_tag="Qwen3-8B"
-teacher_tag="1.7B_EU"
-ability=Math
+teacher_tag="4B_CodeRL"
+ability=Code
 
-test_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/MathTestTotal/test.parquet
-train_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_80_percent.parquet
+dataset_root=data/g_opd
+train_files=${dataset_root}/Eurus/code_train.parquet
+test_files=${dataset_root}/Eurus/code_validation.parquet
 
 student_model_path="/mnt/phwfile/datafrontier/public_models/${student_model_name}"
 teacher_model_path="/mnt/phwfile/datafrontier/public_models/${teacher_model_name}"
@@ -28,9 +29,9 @@ grpo_lr_scale=1.0
 
 # opd configs
 use_opd=true
-opd_lr_scale=1.0 
+opd_lr_scale=1.0
 opd_top_k=100
-lambda_vals=1.0   
+lambda_vals=1.0
 
 # update mode config
 update_mode=both   # in [alt, both, warmup]
@@ -41,7 +42,11 @@ grpo_steps=50
 warmup_steps=10
 
 # validation config
-val_n=16
+val_n=4
+val_metric_group=code_avg
+val_metric_sources=taco,apps,codecontests,codeforces
+code_eval_workers=32
+code_reward_path=verl/utils/reward_score/code_eval_reward/__init__.py
 
 # base learning rate
 lr=1e-6
@@ -109,6 +114,18 @@ fi
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
 
+export RAY_memory_usage_threshold=0.99
+export PYTHONUNBUFFERED=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+export NCCL_DEBUG=WARN
+export NCCL_TIMEOUT=7200
+export TOKENIZERS_PARALLELISM=true
+export HYDRA_FULL_ERROR=1
+
+# Avoid DataLoader workers colliding with ProcessPoolExecutor code reward.
+# export TMPDIR="${SLURM_TMPDIR:-/tmp/ray_code_reward_${USER}_${SLURM_JOB_ID:-local}}"
+# mkdir -p "$TMPDIR"
+
 unset RAY_ADDRESS
 unset RAY_NAMESPACE
 unset RAY_DASHBOARD_ADDRESS
@@ -132,13 +149,14 @@ python3 -m verl.trainer.main_ppo \
     data.train_files=$train_files \
     data.val_files=$test_files \
     data.train_batch_size=256 \
-    data.max_prompt_length=1024 \
+    data.max_prompt_length=2048 \
     data.max_response_length=16384 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=True \
     data.seed=3412 \
     data.return_raw_chat=True \
+    data.dataloader_num_workers=0 \
     +data.apply_chat_template_kwargs.enable_thinking=false \
     actor_rollout_ref.model.path=$student_model_path \
     +actor_rollout_ref.model.base_model_path=$student_model_path \
@@ -177,7 +195,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.policy_loss.lambda_vals=$lambda_vals \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=false \
-    reward_model.reward_manager=naive \
+    reward_model.reward_manager=batch \
+    custom_reward_function.path=$code_reward_path \
+    custom_reward_function.name=reward_func_batched \
+    +custom_reward_function.reward_kwargs.code_eval_workers=$code_eval_workers \
+    val_custom_reward_function.path=$code_reward_path \
+    val_custom_reward_function.name=reward_func_batched \
+    +val_custom_reward_function.reward_kwargs.code_eval_workers=$code_eval_workers \
     trainer.critic_warmup=0 \
     trainer.val_before_train=true \
     trainer.logger='["console","wandb"]' \
@@ -189,7 +213,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.max_critic_ckpt_to_keep=1 \
     trainer.save_freq=10 \
-    +trainer.best_metric_name="val-core/DeepMath-103K/reward/mean@${val_n}" \
+    +trainer.val_aggregate_group=$val_metric_group \
+    +trainer.val_aggregate_sources=$val_metric_sources \
+    +trainer.best_metric_name="val-core/${val_metric_group}/reward/mean@${val_n}" \
     +trainer.best_metric_mode="max" \
     trainer.default_local_dir="$output_path" \
     "${resume_args[@]}" \

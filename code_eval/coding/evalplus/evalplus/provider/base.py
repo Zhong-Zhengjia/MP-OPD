@@ -10,6 +10,7 @@ class DecoderBase(ABC):
         name: str,
         batch_size: int = 1,
         temperature: float = 0.8,
+        top_p: float = 1.0,
         max_new_tokens: int = 16384,
         dtype: str = "bfloat16",  # default
         trust_remote_code: bool = False,
@@ -20,6 +21,7 @@ class DecoderBase(ABC):
         self.name = name
         self.batch_size = batch_size
         self.temperature = temperature
+        self.top_p = top_p
         self.eos = EOS
         self.skip_special_tokens = False
         self.max_new_tokens = max_new_tokens
