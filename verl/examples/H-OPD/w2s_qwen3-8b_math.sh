@@ -196,7 +196,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=8 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.enforce_eager=true \
     actor_rollout_ref.rollout.free_cache_engine=true \
@@ -222,7 +222,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=false \
     reward_model.reward_manager=naive \
     trainer.critic_warmup=0 \
-    trainer.val_before_train=true \
+    trainer.val_before_train=false \
     trainer.logger='["console","wandb"]' \
     trainer.log_val_generations=0 \
     trainer.project_name=$project_name \

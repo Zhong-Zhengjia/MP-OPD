@@ -41,8 +41,10 @@ MATH_VERIFY_HTTP_READ_TIMEOUT = float(
 
 
 def remote_math_verify(ground_truth: str, answer: str) -> bool:
+    session = requests.Session()
+    session.trust_env = False
     try:
-        resp = requests.post(
+        resp = session.post(
             MATH_VERIFY_SERVER_URL,
             json={
                 "ground_truth": ground_truth,
@@ -60,7 +62,7 @@ def remote_math_verify(ground_truth: str, answer: str) -> bool:
         requests.exceptions.Timeout,
     ) as e:
         raise RuntimeError(
-            f"Math verify server is unavailable: {MATH_VERIFY_SERVER_URL}"
+            f"Math verify server is unavailable: {MATH_VERIFY_SERVER_URL} ({e})"
         ) from e
 
     if 500 <= resp.status_code < 600:
@@ -130,8 +132,8 @@ def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0
         if len(answer) > 100:
             answer = answer[:100]
         result = remote_math_verify(ground_truth, answer)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARNING] math_verify remote call failed: {e}", flush=True)
 
     if result:
         return 1.0

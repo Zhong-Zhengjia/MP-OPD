@@ -7,6 +7,22 @@
 #   trap stop_math_verify_server EXIT
 
 _math_verify_server_pid=""
+_math_verify_log_file=""
+
+_math_verify_resolve_log_file() {
+    local repo_root="$1"
+    local log_dir="${MATH_VERIFY_LOG_DIR:-${repo_root}/logs/w2s_math}"
+    mkdir -p "${log_dir}"
+    if [[ -n "${MATH_VERIFY_LOG_FILE:-}" ]]; then
+        echo "${MATH_VERIFY_LOG_FILE}"
+        return 0
+    fi
+    if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+        echo "${log_dir}/math_verify_${SLURM_JOB_ID}.log"
+    else
+        echo "${log_dir}/math_verify_local_$$.log"
+    fi
+}
 
 _math_verify_health_ok() {
     local url="$1"
@@ -79,10 +95,13 @@ start_math_verify_server() {
     export MATH_VERIFY_SERVER_URL="http://${node_ip}:${MATH_VERIFY_PORT}/verify"
     local health_url="http://${node_ip}:${MATH_VERIFY_PORT}/health"
 
-    echo "[math-verify] Starting server on port ${MATH_VERIFY_PORT} ..."
+    _math_verify_log_file="$(_math_verify_resolve_log_file "${repo_root}")"
+    export MATH_VERIFY_LOG_FILE="${_math_verify_log_file}"
+
+    echo "[math-verify] Starting server on port ${MATH_VERIFY_PORT} (log: ${_math_verify_log_file}) ..."
     (
         cd "${repo_root}/math_eval_server" || exit 1
-        exec python3 -u reward_verify_server.py
+        exec python3 -u reward_verify_server.py >> "${_math_verify_log_file}" 2>&1
     ) &
     _math_verify_server_pid=$!
 
@@ -95,13 +114,13 @@ start_math_verify_server() {
             return 0
         fi
         if ! kill -0 "${_math_verify_server_pid}" 2>/dev/null; then
-            echo "ERROR: math verify server exited before becoming healthy" >&2
+            echo "ERROR: math verify server exited before becoming healthy (see ${_math_verify_log_file})" >&2
             return 1
         fi
         sleep 1
     done
 
-    echo "ERROR: math verify server failed health check: ${health_url}" >&2
+    echo "ERROR: math verify server failed health check: ${health_url} (see ${_math_verify_log_file})" >&2
     _math_verify_health_ok "${health_url}" "1"
     stop_math_verify_server
     return 1
