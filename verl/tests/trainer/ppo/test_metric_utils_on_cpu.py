@@ -310,6 +310,23 @@ class TestAddMacroAverageValMetrics(unittest.TestCase):
 
         self.assertAlmostEqual(result["val-core/code_avg/reward/mean@4"], 0.7)
 
+    def test_add_macro_average_val_metrics_from_val_aux(self):
+        metric_dict = {
+            "val-core/taco/acc/mean@4": 0.8,
+            "val-aux/taco/reward/mean@4": 0.8,
+            "val-core/apps/acc/mean@4": 0.6,
+            "val-aux/apps/reward/mean@4": 0.6,
+        }
+
+        result = add_macro_average_val_metrics(
+            metric_dict,
+            group_name="code_avg",
+            sources=["taco", "apps"],
+            var_name="reward",
+        )
+
+        self.assertAlmostEqual(result["val-core/code_avg/reward/mean@4"], 0.7)
+
 
 class TestProcessValidationMetrics(unittest.TestCase):
     """Tests for the process_validation_metrics function."""

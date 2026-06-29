@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=e04-w2s_code
-#SBATCH --output=logs/w2s_code/slurm_code_%j.out
-#SBATCH --error=logs/w2s_code/slurm_code_%j.err
+#SBATCH --job-name=e04-w2s_math
+#SBATCH --output=logs/w2s_math/slurm_math_%j.out
+#SBATCH --error=logs/w2s_math/slurm_math_%j.err
 #SBATCH --chdir=/mnt/phwfile/datafrontier/wurong/code/RM-OPD
 #SBATCH --account=research
 #SBATCH --partition=DataFrontier_Explore
@@ -32,23 +32,28 @@ export WANDB_MODE=online
 export USED_MODEL="no_api"
 
 student_model_name="Qwen3-8B"
-teacher_model_name="Qwen3-4B-Non-Thinking-RL-Code-Step300" # code proxy expert
-teacher_base_model_name="Qwen3-4B"                         # proxy base
+teacher_model_name="Qwen3-1.7B-M-RL" # proxy expert
+teacher_base_model_name="Qwen3-1.7B"           # proxy base
 student_tag="Qwen3-8B"
-teacher_tag="4B_CodeRL"
-ability=Code
+teacher_tag="1.7B_Math"
+ability=Math
 
 # sbatch copies the script to /var/spool/slurmd/...; BASH_SOURCE is unreliable there.
 # SLURM_SUBMIT_DIR is the directory where sbatch was invoked (repo root).
 REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 VERL_ROOT="${REPO_ROOT}/verl"
+
+# Auto-start math verify HTTP server (Ray workers call it remotely; do not run math_verify in-process).
+source "${REPO_ROOT}/math_eval_server/start_math_verify_server.sh"
+start_math_verify_server "${REPO_ROOT}" || exit 1
+trap stop_math_verify_server EXIT
+
 cd "${VERL_ROOT}"
 export PYTHONPATH="${VERL_ROOT}:${PYTHONPATH:-}"
+export MATH_VERIFY_SERVER_URL
 
-dataset_root="${REPO_ROOT}/data/g_opd"
-train_files=${dataset_root}/Eurus/code_train.parquet
-test_files=${dataset_root}/Eurus/code_validation.parquet
-code_reward_path=${VERL_ROOT}/verl/utils/reward_score/code_eval_reward/__init__.py
+test_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/MathTestTotal/test.parquet
+train_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_80_percent.parquet
 
 student_model_path="/mnt/phwfile/datafrontier/public_models/${student_model_name}"
 teacher_model_path="/mnt/phwfile/datafrontier/public_models/${teacher_model_name}"
@@ -62,9 +67,9 @@ grpo_lr_scale=1.0
 
 # opd configs
 use_opd=true
-opd_lr_scale=1.0
+opd_lr_scale=1.0 
 opd_top_k=100
-lambda_vals=1.0
+lambda_vals=1.0    # lambda value for the lambda-based reward function
 
 # update mode config
 update_mode=both   # in [alt, both, warmup]
@@ -75,11 +80,10 @@ grpo_steps=50
 warmup_steps=10
 
 # validation config
-val_n=4
-val_metric_group=code_avg
-val_metric_sources=taco,apps,codecontests,codeforces
+val_n=16
+val_metric_group=math_avg
+val_metric_sources=AIME2024,AIME2025,AIME2026,SMT2025,CMIMC2025,HMMT2025FEB,HMMT2025NOV,HMMT2026FEB
 val_metric_sources_hydra="[${val_metric_sources}]"
-code_eval_workers=32
 
 # base learning rate
 lr=1e-6
@@ -88,7 +92,7 @@ n_node=1
 n_gpu=8
 
 
-project_name=MT_weak2strong@${val_n}
+project_name=MT_weak2strong@${val_n}-math
 
 # resume_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/TRA_strong2weak@16/Qwen3-1.7B-T4B-_GB1024_OB0_0606_0711/"
 resume_path=""
@@ -140,17 +144,12 @@ if [[ -n "$resume_path" ]]; then
         trainer.resume_from_path="$resume_path"
     )
 else
-    experiment_name="Code_${output_model_name}_G${use_grpo}_O${use_opd}_${today}"
+    experiment_name="${output_model_name}_G${use_grpo}_O${use_opd}_${today}"
     output_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/${project_name}/${experiment_name}"
 fi
 
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
-
-
-# Avoid DataLoader workers colliding with ProcessPoolExecutor code reward.
-# export TMPDIR="${SLURM_TMPDIR:-/tmp/ray_code_reward_${USER}_${SLURM_JOB_ID:-local}}"
-# mkdir -p "$TMPDIR"
 
 unset RAY_ADDRESS
 unset RAY_NAMESPACE
@@ -175,14 +174,13 @@ python3 -m verl.trainer.main_ppo \
     data.train_files=$train_files \
     data.val_files=$test_files \
     data.train_batch_size=256 \
-    data.max_prompt_length=2048 \
+    data.max_prompt_length=1024 \
     data.max_response_length=16384 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=True \
     data.seed=3412 \
     data.return_raw_chat=True \
-    data.dataloader_num_workers=0 \
     +data.apply_chat_template_kwargs.enable_thinking=false \
     actor_rollout_ref.model.path=$student_model_path \
     +actor_rollout_ref.model.base_model_path=$student_model_path \
@@ -198,7 +196,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=8 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.enforce_eager=true \
     actor_rollout_ref.rollout.free_cache_engine=true \
@@ -211,7 +209,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
     actor_rollout_ref.rollout.val_kwargs.n=$val_n \
     actor_rollout_ref.rollout.calculate_log_probs=false \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.use_kl_loss=true \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
@@ -222,13 +220,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.policy_loss.lambda_vals=$lambda_vals \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=false \
-    reward_model.reward_manager=batch \
-    custom_reward_function.path=$code_reward_path \
-    custom_reward_function.name=reward_func_batched \
-    +custom_reward_function.reward_kwargs.code_eval_workers=$code_eval_workers \
-    val_custom_reward_function.path=$code_reward_path \
-    val_custom_reward_function.name=reward_func_batched \
-    val_custom_reward_function.reward_kwargs.code_eval_workers=$code_eval_workers \
+    reward_model.reward_manager=naive \
     trainer.critic_warmup=0 \
     trainer.val_before_train=true \
     trainer.logger='["console","wandb"]' \

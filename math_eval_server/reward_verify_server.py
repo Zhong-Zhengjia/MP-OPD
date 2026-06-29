@@ -22,7 +22,7 @@ logger = logging.getLogger("reward_verify_server")
 
 
 MATH_VERIFY_HOST = os.getenv("MATH_VERIFY_HOST", "0.0.0.0")
-MATH_VERIFY_PORT = int(os.getenv("MATH_VERIFY_PORT", "7642"))
+MATH_VERIFY_PORT = int(os.getenv("MATH_VERIFY_PORT", "7683"))
 MATH_VERIFY_WORKERS = int(os.getenv("MATH_VERIFY_WORKERS", "16"))
 MATH_VERIFY_TIMEOUT = float(os.getenv("MATH_VERIFY_TIMEOUT", "3"))
 MATH_VERIFY_MAX_TASKS = int(os.getenv("MATH_VERIFY_MAX_TASKS", "4096"))
@@ -53,7 +53,8 @@ def _is_valid_ipv4(ip: str) -> bool:
         return False
 
 
-def get_machine_ips() -> list[str]:
+@lru_cache(maxsize=1)
+def get_machine_ips() -> tuple[str, ...]:
     ips = []
 
     try:
@@ -90,7 +91,7 @@ def get_machine_ips() -> list[str]:
         except Exception:
             pass
 
-    return ips
+    return tuple(ips)
 
 
 def print_server_address():

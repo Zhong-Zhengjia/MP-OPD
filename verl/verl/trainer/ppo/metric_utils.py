@@ -506,10 +506,17 @@ def add_macro_average_val_metrics(
     values = []
     matched_suffix = None
     missing_sources = []
+    sections_to_try = [section]
+    if section == "val-core":
+        sections_to_try.append("val-aux")
 
     for source in sources:
-        prefix = f"{section}/{source}/{var_name}/"
-        matching_keys = [key for key in metric_dict if key.startswith(prefix) and "/mean@" in key]
+        matching_keys = []
+        for sec in sections_to_try:
+            prefix = f"{sec}/{source}/{var_name}/"
+            matching_keys = [key for key in metric_dict if key.startswith(prefix) and "/mean@" in key]
+            if matching_keys:
+                break
         if not matching_keys:
             missing_sources.append(source)
             continue
