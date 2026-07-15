@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import psutil
@@ -1427,6 +1428,182 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
+    def _reshard_policy_module(self, policy) -> None:
+        if self.world_size <= 1:
+            return
+        module = policy.actor_module
+        if fsdp_version(module) == 1:
+            module._handle.reshard(True)
+        elif fsdp_version(module) == 2:
+            module.reshard()
+
+    def _set_ref_log_prob_meta_info(self, data: DataProto) -> DataProto:
+        data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        return data
+
+    def _compute_base_log_probs_opd(self, data: DataProto, opd_top_k: int):
+        if not self._has_base_model:
+            raise ValueError("Base model not initialized.")
+        data = self._set_ref_log_prob_meta_info(data)
+        data = data.to("cpu")
+        if opd_top_k > 0:
+            output = self.base_policy.compute_topk_log_probs_on_ids(data=data)
+        else:
+            output, _ = self.base_policy.compute_log_prob(data=data, calculate_entropy=False)
+        self._reshard_policy_module(self.base_policy)
+        return output
+
+    @staticmethod
+    def _shallow_copy_dataproto(data: DataProto) -> DataProto:
+        return DataProto(
+            batch=data.batch,
+            non_tensor_batch=data.non_tensor_batch,
+            meta_info=dict(data.meta_info),
+        )
+
+    def _compute_ref_log_probs_opd(self, data: DataProto, opd_top_k: int):
+        if self._is_lora:
+            data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+            data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+            data.meta_info["temperature"] = self.config.rollout.temperature
+            adapter_ctx = self.actor.actor_module.disable_adapter()
+            with adapter_ctx:
+                if opd_top_k > 0:
+                    output = self.actor.compute_topk_log_probs_on_ids(data=data)
+                else:
+                    output, _ = self.actor.compute_log_prob(data=data, calculate_entropy=False)
+            self._reshard_policy_module(self.actor)
+            return output
+        assert self._is_ref
+        data = self._set_ref_log_prob_meta_info(data)
+        data = data.to("cpu")
+        if opd_top_k > 0:
+            output = self.ref_policy.compute_topk_log_probs_on_ids(data=data)
+        else:
+            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+        self._reshard_policy_module(self.ref_policy)
+        return output
+
+    def _compute_base_ref_log_probs_opd(self, data: DataProto, opd_top_k: int):
+        if not self._has_base_ref_model:
+            raise ValueError("Base ref model not initialized.")
+        data = self._set_ref_log_prob_meta_info(data)
+        data = data.to("cpu")
+        if opd_top_k > 0:
+            output = self.base_ref_policy.compute_topk_log_probs_on_ids(data=data)
+        else:
+            output, _ = self.base_ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+        self._reshard_policy_module(self.base_ref_policy)
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="cyan", role="prepare_opd_log_probs")
+    def prepare_opd_log_probs(self, data: DataProto):
+        """Single RPC for OPD prep: one actor load/offload cycle + optional teacher parallel."""
+        assert self._is_actor
+
+        timing_metrics: dict[str, float] = {}
+        t_total = time.perf_counter()
+        opd_top_k = int(data.meta_info.get("top_k", 0))
+        parallel_student_base = bool(data.meta_info.pop("opd_parallel_student_base", False))
+        timing_metrics["timing/opd_student_base_parallel_enabled"] = float(parallel_student_base)
+
+        from contextlib import nullcontext
+
+        is_lora = data.meta_info.pop("is_lora", False)
+        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.rollout.temperature
+
+        t_load = time.perf_counter()
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        timing_metrics["timing/opd_actor_load_s"] = time.perf_counter() - t_load
+
+        output_tensors: dict[str, torch.Tensor] = {}
+
+        with self.ulysses_sharding_manager:
+            with adapter_ctx:
+                t_actor = time.perf_counter()
+                if opd_top_k > 0:
+                    entropys, topk_ids, actor_topk_lp = self.actor.compute_topk_ids_and_log_probs(
+                        data=data,
+                        top_k=opd_top_k,
+                    )
+                    output_tensors["student_topk_ids"] = topk_ids
+                    output_tensors["old_log_probs"] = actor_topk_lp
+                    output_tensors["entropys"] = entropys
+                    data = data.union(DataProto.from_dict(tensors={"student_topk_ids": topk_ids}))
+                else:
+                    old_lp, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                    output_tensors["old_log_probs"] = old_lp
+                    output_tensors["entropys"] = entropys
+                timing_metrics["timing/opd_actor_forward_s"] = time.perf_counter() - t_actor
+
+            if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+                self.actor.actor_module._handle.reshard(True)
+
+            def _run_timed(fn, proto: DataProto):
+                t0 = time.perf_counter()
+                result = fn(proto, opd_top_k)
+                return result, time.perf_counter() - t0
+
+            t_ref_models = time.perf_counter()
+            base_data = self._shallow_copy_dataproto(data)
+            ref_data = self._shallow_copy_dataproto(data)
+            base_ref_data = self._shallow_copy_dataproto(data)
+
+            if parallel_student_base:
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    base_future = executor.submit(_run_timed, self._compute_base_log_probs_opd, base_data)
+                    ref_future = executor.submit(_run_timed, self._compute_ref_log_probs_opd, ref_data)
+                    base_ref_future = executor.submit(
+                        _run_timed, self._compute_base_ref_log_probs_opd, base_ref_data
+                    )
+                    output_tensors["base_log_probs"], base_dt = base_future.result()
+                    output_tensors["teacher_log_probs"], ref_dt = ref_future.result()
+                    output_tensors["teacher_base_log_probs"], base_ref_dt = base_ref_future.result()
+                timing_metrics["timing/opd_proxy_parallel_wall_s"] = 0.0
+            else:
+                output_tensors["base_log_probs"], base_dt = _run_timed(
+                    self._compute_base_log_probs_opd, base_data
+                )
+                t_proxy = time.perf_counter()
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    ref_future = executor.submit(_run_timed, self._compute_ref_log_probs_opd, ref_data)
+                    base_ref_future = executor.submit(
+                        _run_timed, self._compute_base_ref_log_probs_opd, base_ref_data
+                    )
+                    output_tensors["teacher_log_probs"], ref_dt = ref_future.result()
+                    output_tensors["teacher_base_log_probs"], base_ref_dt = base_ref_future.result()
+                timing_metrics["timing/opd_proxy_parallel_wall_s"] = time.perf_counter() - t_proxy
+
+            timing_metrics["timing/opd_base_forward_s"] = base_dt
+            timing_metrics["timing/opd_ref_forward_s"] = ref_dt
+            timing_metrics["timing/opd_base_ref_forward_s"] = base_ref_dt
+            timing_metrics["timing/opd_ref_models_wall_s"] = time.perf_counter() - t_ref_models
+
+        output = DataProto.from_dict(tensors=output_tensors)
+        output = output.to("cpu")
+
+        t_offload = time.perf_counter()
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during prepare_opd_log_probs", logger=logger)
+        timing_metrics["timing/opd_actor_offload_s"] = time.perf_counter() - t_offload
+        timing_metrics["timing/opd_prepare_total_s"] = time.perf_counter() - t_total
+        timing_metrics["timing/opd_actor_param_offload"] = float(self._is_offload_param)
+        output.meta_info["metrics"] = timing_metrics
+
+        return output
+
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="cyan", role="actor_update_grpo")
@@ -1502,10 +1679,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 metrics = self.actor.update_policy_opd(data=data)
 
             metrics = reduce_metrics(metrics)
-            # metrics["perf/update_policy_opd_time"] = timer.last
-            # metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            # metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-            # metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+            metrics["timing/update_policy_opd_s"] = timer.last
+            metrics["memory/max_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+            metrics["memory/max_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            metrics["memory/cpu_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
             if self.actor_lr_scheduler is not None:
                 lr = self.actor_lr_scheduler.get_last_lr()[0]

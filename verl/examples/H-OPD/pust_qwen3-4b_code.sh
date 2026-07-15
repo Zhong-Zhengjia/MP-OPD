@@ -66,6 +66,12 @@ opd_lr_scale=1.0
 opd_top_k=100
 lambda_vals=1.0
 
+# actor param offload: set false when GPU memory allows (skips actor CPU<->GPU each step)
+actor_param_offload=true
+
+# include student primary-base in parallel OPD prep (teacher proxies always parallel)
+opd_parallel_student_base=false
+
 # update mode config
 update_mode=both   # in [alt, both, warmup]
     # alt update configs
@@ -173,6 +179,7 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.grpo_steps=$grpo_steps \
     +algorithm.hetero_distill.warmup_steps=$warmup_steps \
     +algorithm.hetero_distill.opd_top_k=$opd_top_k \
+    +algorithm.hetero_distill.opd_parallel_student_base=$opd_parallel_student_base \
     data.train_files=$train_files \
     data.val_files=$test_files \
     data.train_batch_size=256 \
@@ -196,7 +203,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768 \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
-    actor_rollout_ref.actor.fsdp_config.param_offload=true \
+    actor_rollout_ref.actor.fsdp_config.param_offload=$actor_param_offload \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=8 \
