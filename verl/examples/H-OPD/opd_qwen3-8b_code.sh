@@ -197,7 +197,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.loss_agg_mode="seq-mean-token-mean" \
     algorithm.use_kl_in_reward=false \
     +algorithm.opd_top_k=0 \
-    reward_model.reward_manager=naive \
+    reward_model.reward_manager=batch \
+    custom_reward_function.path=$code_reward_path \
+    custom_reward_function.name=reward_func_batched \
+    +custom_reward_function.reward_kwargs.code_eval_workers=$code_eval_workers \
     val_custom_reward_function.path=$code_reward_path \
     val_custom_reward_function.name=reward_func_batched \
     val_custom_reward_function.reward_kwargs.code_eval_workers=$code_eval_workers \
