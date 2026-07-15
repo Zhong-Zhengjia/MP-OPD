@@ -891,6 +891,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Initialize base models for corrected reward computation
         # Actor's base model (for computing base_log_prob)
         self.base_policy = None
+        self.student_base_policy = None
+        self.student_base_module_fsdp = None
         self._has_base_model = False
         base_model_path = self.config.model.get("base_model_path", None)
         if base_model_path is not None and self._is_actor:
@@ -1324,7 +1326,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output = self.actor.compute_selected_log_probs(data=data)
+                output = self.actor.compute_topk_log_probs_on_ids(data=data)
             output = DataProto.from_dict(tensors={"actor_topk_log_probs": output})
 
         output = output.to("cpu")
@@ -1358,7 +1360,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")
-            output = self.ref_policy.compute_selected_log_probs(data=data)
+            output = self.ref_policy.compute_topk_log_probs_on_ids(data=data)
             output = DataProto.from_dict(tensors={"teacher_topk_log_probs": output})
 
         output = output.to("cpu")
@@ -1368,6 +1370,60 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.ref_policy.actor_module._handle.reshard(True)
             elif fsdp_version(self.ref_policy.actor_module) == 2:
                 self.ref_policy.actor_module.reshard()
+
+        return output
+
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="cyan", role="base_compute_log_probs_on_ids")
+    def compute_base_log_probs_on_ids(self, data: DataProto):
+        if not self._has_base_model:
+            raise ValueError("Base model not initialized.")
+
+        data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+            output = self.base_policy.compute_topk_log_probs_on_ids(data=data)
+            output = DataProto.from_dict(tensors={"base_topk_log_probs": output})
+
+        output = output.to("cpu")
+
+        if self.world_size > 1:
+            if fsdp_version(self.base_policy.actor_module) == 1:
+                self.base_policy.actor_module._handle.reshard(True)
+            elif fsdp_version(self.base_policy.actor_module) == 2:
+                self.base_policy.actor_module.reshard()
+
+        return output
+
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="cyan", role="base_ref_compute_log_probs_on_ids")
+    def compute_base_ref_log_probs_on_ids(self, data: DataProto):
+        if not self._has_base_ref_model:
+            raise ValueError("Base ref model not initialized.")
+
+        data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+            output = self.base_ref_policy.compute_topk_log_probs_on_ids(data=data)
+            output = DataProto.from_dict(tensors={"teacher_base_topk_log_probs": output})
+
+        output = output.to("cpu")
+
+        if self.world_size > 1:
+            if fsdp_version(self.base_ref_policy.actor_module) == 1:
+                self.base_ref_policy.actor_module._handle.reshard(True)
+            elif fsdp_version(self.base_ref_policy.actor_module) == 2:
+                self.base_ref_policy.actor_module.reshard()
 
         return output
 

@@ -38,7 +38,7 @@ from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
-from verl.utils.torch_functional import logprobs_from_logits
+from verl.utils.torch_functional import logprobs_from_logits, topk_logprobs_from_logits
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -48,12 +48,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 def add_masked_advantage_metrics(metrics, advantages, response_mask, prefix: str):
     """
-    advantages: [bsz, response_len]
+    advantages: [bsz, response_len] or [bsz, response_len, k]
     response_mask: [bsz, response_len]
     """
     with torch.no_grad():
         mask = response_mask.bool()
-        valid_adv = advantages.detach().float()[mask]
+        adv = advantages.detach().float()
+        if adv.dim() == 3:
+            adv = adv.sum(dim=-1)
+        valid_adv = adv[mask]
 
         if valid_adv.numel() == 0:
             return
@@ -114,10 +117,12 @@ class DataParallelPPOActor(BasePPOActor):
         return_topk=False,
         top_k=None,
         return_selected_log_probs=False,
+        return_topk_log_probs=False,
     ):
         response_length = micro_batch["responses"].size(-1)
         selected_ids = micro_batch.get("union_topk_ids", None)
         selected_mask = micro_batch.get("union_topk_mask", None)
+        student_topk_ids = micro_batch.get("student_topk_ids", None) if return_topk_log_probs else None
 
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -140,6 +145,7 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs = None
             topk_ids = None
             selected_log_probs = None
+            topk_log_probs = None
 
             if position_ids.dim() == 3:
                 position_ids = position_ids.transpose(0, 1)
@@ -180,6 +186,22 @@ class DataParallelPPOActor(BasePPOActor):
 
                 selected_ids_rmpad = None
                 selected_mask_rmpad = None
+                student_topk_ids_rmpad = None
+
+                if return_topk_log_probs:
+                    topk_m = student_topk_ids.size(-1)
+                    full_student_topk_ids = torch.zeros(
+                        batch_size,
+                        seqlen,
+                        topk_m,
+                        dtype=student_topk_ids.dtype,
+                        device=student_topk_ids.device,
+                    )
+                    full_student_topk_ids[:, -response_length - 1 : -1, :] = student_topk_ids
+                    student_topk_ids_rmpad = index_first_axis(
+                        rearrange(full_student_topk_ids, "b s m -> (b s) m"),
+                        indices,
+                    )
 
                 if return_selected_log_probs:
                     selected_m = selected_ids.size(-1)
@@ -260,9 +282,22 @@ class DataParallelPPOActor(BasePPOActor):
                         selected_ids_rmpad = selected_ids_rmpad_t.transpose(0, 1)
                         selected_mask_rmpad = selected_mask_rmpad_t.transpose(0, 1).bool()
 
+                    if return_topk_log_probs:
+                        student_topk_ids_rmpad_t, _, _ = ulysses_pad_and_slice_inputs(
+                            student_topk_ids_rmpad.transpose(0, 1),
+                            position_ids_rmpad=None,
+                            sp_size=self.ulysses_sequence_parallel_size,
+                        )
+                        student_topk_ids_rmpad = student_topk_ids_rmpad_t.transpose(0, 1)
+
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)
 
-                use_fused = self.use_fused_kernels and not return_topk and not return_selected_log_probs
+                use_fused = (
+                    self.use_fused_kernels
+                    and not return_topk
+                    and not return_selected_log_probs
+                    and not return_topk_log_probs
+                )
                 extra_args = {}
 
                 if use_fused:
@@ -303,7 +338,13 @@ class DataParallelPPOActor(BasePPOActor):
                             dim=-1,
                         ).to(logits_rmpad.dtype)
 
-                    if not return_selected_log_probs:
+                    if return_topk_log_probs:
+                        topk_log_probs_rmpad = topk_logprobs_from_logits(
+                            logits_rmpad,
+                            student_topk_ids_rmpad.long(),
+                        )
+
+                    if not return_selected_log_probs and not return_topk_log_probs:
                         inplace_backward = not calculate_entropy and not return_topk
                         log_probs_rmpad = logprobs_from_logits(
                             logits=logits_rmpad,
@@ -321,7 +362,7 @@ class DataParallelPPOActor(BasePPOActor):
                             )
 
                 if self.use_ulysses_sp:
-                    if not return_selected_log_probs:
+                    if not return_selected_log_probs and not return_topk_log_probs:
                         log_probs_rmpad = gather_outputs_and_unpad(
                             log_probs_rmpad,
                             gather_dim=0,
@@ -353,6 +394,14 @@ class DataParallelPPOActor(BasePPOActor):
                             padding_size=pad_size,
                         )
 
+                    if return_topk_log_probs:
+                        topk_log_probs_rmpad = gather_outputs_and_unpad(
+                            topk_log_probs_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+
                 if calculate_entropy:
                     full_entropy = pad_input(
                         hidden_states=entropy_rmpad.unsqueeze(-1),
@@ -362,7 +411,7 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]
 
-                if not return_selected_log_probs:
+                if not return_selected_log_probs and not return_topk_log_probs:
                     full_log_probs = pad_input(
                         hidden_states=log_probs_rmpad.unsqueeze(-1),
                         indices=indices,
@@ -389,8 +438,22 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     selected_log_probs = full_selected_log_probs[:, -response_length - 1 : -1, :]
 
+                if return_topk_log_probs:
+                    full_topk_log_probs = pad_input(
+                        hidden_states=topk_log_probs_rmpad,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    topk_log_probs = full_topk_log_probs[:, -response_length - 1 : -1, :]
+
             else:
-                use_fused = self.use_fused_kernels and not return_topk and not return_selected_log_probs
+                use_fused = (
+                    self.use_fused_kernels
+                    and not return_topk
+                    and not return_selected_log_probs
+                    and not return_topk_log_probs
+                )
                 extra_args = {}
 
                 if use_fused:
@@ -434,6 +497,12 @@ class DataParallelPPOActor(BasePPOActor):
                             selected_logits.float(),
                             dim=-1,
                         ).to(logits.dtype)
+                    elif return_topk_log_probs:
+                        flat_logits = logits.reshape(-1, logits.size(-1))
+                        flat_topk_ids = student_topk_ids.reshape(-1, student_topk_ids.size(-1))
+                        topk_log_probs = topk_logprobs_from_logits(flat_logits, flat_topk_ids.long()).view_as(
+                            student_topk_ids
+                        )
                     else:
                         log_probs = logprobs_from_logits(
                             logits,
@@ -448,6 +517,9 @@ class DataParallelPPOActor(BasePPOActor):
                                 verl_F.entropy_from_logits,
                                 logits,
                             )
+
+            if return_topk_log_probs:
+                return entropy, log_probs, topk_log_probs
 
             if return_selected_log_probs:
                 return entropy, log_probs, selected_log_probs
@@ -670,6 +742,65 @@ class DataParallelPPOActor(BasePPOActor):
 
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
+    def compute_topk_log_probs_on_ids(self, data: DataProto) -> torch.Tensor:
+        """Compute true log pi(token) on fixed student top-k ids, shape (B, T, K)."""
+        self.actor_module.eval()
+
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]
+        use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        has_ref_input_ids = "ref_input_ids" in data.batch.keys()
+
+        select_keys = [
+            "responses",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "student_topk_ids",
+        ]
+
+        if has_ref_input_ids:
+            select_keys.extend(["ref_input_ids", "ref_attention_mask", "ref_position_ids"])
+
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+
+        data = data.select(
+            batch_keys=select_keys,
+            non_tensor_batch_keys=non_tensor_select_keys,
+        )
+
+        if use_dynamic_bsz:
+            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+        else:
+            micro_batches = data.split(micro_batch_size)
+
+        log_probs_lst = []
+
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+
+            with torch.no_grad():
+                _, _, topk_log_probs = self._forward_micro_batch(
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=False,
+                    return_topk_log_probs=True,
+                )
+
+            log_probs_lst.append(topk_log_probs)
+
+        log_probs = torch.concat(log_probs_lst, dim=0)
+
+        if use_dynamic_bsz:
+            log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
+
+        return log_probs
+
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy_grpo(self, data: DataProto):
         self.actor_module.train()
 
@@ -843,8 +974,12 @@ class DataParallelPPOActor(BasePPOActor):
             "teacher_log_probs",
             "teacher_base_log_probs",
             "old_log_probs",
-            "base_log_probs"
+            "base_log_probs",
         ]
+
+        has_topk_opd = "student_topk_ids" in data.batch.keys()
+        if has_topk_opd:
+            select_keys.append("student_topk_ids")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -873,6 +1008,15 @@ class DataParallelPPOActor(BasePPOActor):
             for mini_batch in mini_batches:
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    if has_topk_opd:
+                        padded_max_seq_len = mini_batch.batch["attention_mask"].shape[-1]
+                        topk_cap = getattr(self.config, "ppo_topk_max_token_len_per_gpu", 0)
+                        if not topk_cap or topk_cap <= 0:
+                            topk_cap = max(4096, self.config.ppo_max_token_len_per_gpu // 4)
+                        topk_cap = max(topk_cap, padded_max_seq_len)
+                        max_token_len = min(
+                            max_token_len, topk_cap * self.ulysses_sequence_parallel_size
+                        )
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
                     actual_mini_batch_size = len(mini_batch)
@@ -892,7 +1036,7 @@ class DataParallelPPOActor(BasePPOActor):
                     teacher_log_probs = model_inputs["teacher_log_probs"].detach()
                     teacher_base_log_probs = model_inputs["teacher_base_log_probs"].detach()
                     old_log_prob = model_inputs["old_log_probs"].detach()
-                    base_log_probs = model_inputs['base_log_probs'].detach()
+                    base_log_probs = model_inputs["base_log_probs"].detach()
 
                     advantages = teacher_log_probs - teacher_base_log_probs - lambda_vals * (old_log_prob - base_log_probs)
                     # advantages = teacher_log_probs - teacher_base_log_probs   # extreme update
@@ -905,11 +1049,19 @@ class DataParallelPPOActor(BasePPOActor):
 
                     calculate_entropy = entropy_coeff != 0
 
-                    entropy, log_prob = self._forward_micro_batch(
-                        model_inputs,
-                        temperature=temperature,
-                        calculate_entropy=calculate_entropy,
-                    )
+                    if has_topk_opd:
+                        _, _, log_prob = self._forward_micro_batch(
+                            model_inputs,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            return_topk_log_probs=True,
+                        )
+                    else:
+                        entropy, log_prob = self._forward_micro_batch(
+                            model_inputs,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                        )
 
                     policy_mask = response_mask
 
@@ -942,26 +1094,19 @@ class DataParallelPPOActor(BasePPOActor):
 
                     did_backward = True
 
-                    student_logp = agg_loss(
-                        loss_mat=log_prob,
-                        loss_mask=policy_mask,
-                        loss_agg_mode=loss_agg_mode,
-                    )
-                    teacher_logp = agg_loss(
-                        loss_mat=teacher_log_probs,
-                        loss_mask=policy_mask,
-                        loss_agg_mode=loss_agg_mode,
-                    )
-                    teacher_base_logp = agg_loss(
-                        loss_mat=teacher_base_log_probs,
-                        loss_mask=policy_mask,
-                        loss_agg_mode=loss_agg_mode,
-                    )
-                    teacher_delta_logp = agg_loss(
-                        loss_mat=teacher_log_probs - teacher_base_log_probs,
-                        loss_mask=policy_mask,
-                        loss_agg_mode=loss_agg_mode,
-                    )
+                    def _agg_topk_or_2d(loss_mat):
+                        if loss_mat.dim() == 3:
+                            loss_mat = loss_mat.sum(dim=-1)
+                        return agg_loss(
+                            loss_mat=loss_mat,
+                            loss_mask=policy_mask,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+
+                    student_logp = _agg_topk_or_2d(log_prob)
+                    teacher_logp = _agg_topk_or_2d(teacher_log_probs)
+                    teacher_base_logp = _agg_topk_or_2d(teacher_base_log_probs)
+                    teacher_delta_logp = _agg_topk_or_2d(teacher_log_probs - teacher_base_log_probs)
 
                     micro_batch_metrics["actor/opd_loss"] = opd_loss.detach().item() * loss_scale_factor
                     micro_batch_metrics["actor/opd_weighted_loss"] = policy_loss.detach().item() * loss_scale_factor
@@ -969,6 +1114,8 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics["actor/opd_teacher_log_prob"] = teacher_logp.detach().item() * loss_scale_factor
                     micro_batch_metrics["actor/opd_teacher_base_log_prob"] = teacher_base_logp.detach().item() * loss_scale_factor
                     micro_batch_metrics["actor/opd_teacher_delta_log_prob"] = teacher_delta_logp.detach().item() * loss_scale_factor
+                    if has_topk_opd:
+                        micro_batch_metrics["actor/opd_topk"] = float(model_inputs["student_topk_ids"].shape[-1])
 
                     append_to_dict(metrics, micro_batch_metrics)
 

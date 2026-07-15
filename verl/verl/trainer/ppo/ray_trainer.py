@@ -365,6 +365,7 @@ class RayPPOTrainer:
         hetero_cfg = self.config.algorithm.get("hetero_distill", {})
         print(hetero_cfg)
         self.student_rollout_n = hetero_cfg.get("student_rollout_n", 1)
+        self.opd_top_k = int(hetero_cfg.get("opd_top_k", 0))
 
         # Store base model paths for corrected reward computation
         self.base_model_path = config.actor_rollout_ref.model.get("base_model_path", None)
@@ -1710,6 +1711,56 @@ class RayPPOTrainer:
             metrics[f"{prefix}/student_top1_in_teacher_topk_rate"] = student_top1_in_teacher_topk[valid_mask].float().mean().item()
 
 
+    def _prepare_opd_update_batch(self, update_batch: DataProto) -> DataProto:
+        """Attach log-prob tensors for OPD update (top-1 or top-k only_stu)."""
+        if self.use_ref_retokenization:
+            from verl.trainer.ppo.ref_input_utils import prepare_ref_model_inputs
+
+            apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+            update_batch = prepare_ref_model_inputs(
+                batch=update_batch,
+                ref_tokenizer=self.ref_tokenizer,
+                apply_chat_template_kwargs=apply_chat_template_kwargs,
+            )
+
+        opd_top_k = self.opd_top_k
+
+        if opd_top_k > 0:
+            print(f"[DEBUG] OPD top-k update (only_stu), K={opd_top_k}")
+            update_batch.meta_info["top_k"] = opd_top_k
+
+            topk_ids_output = self.actor_rollout_wg.compute_actor_topk_ids(update_batch)
+            update_batch.batch["student_topk_ids"] = topk_ids_output.batch["actor_topk_ids"]
+            update_batch.batch["entropys"] = topk_ids_output.batch["entropys"]
+
+            student_old_lp = self.actor_rollout_wg.compute_actor_log_probs_on_ids(update_batch)
+            update_batch.batch["old_log_probs"] = student_old_lp.batch["actor_topk_log_probs"]
+
+            base_lp = self.actor_rollout_wg.compute_base_log_probs_on_ids(update_batch)
+            update_batch.batch["base_log_probs"] = base_lp.batch["base_topk_log_probs"]
+
+            teacher_lp = self.actor_rollout_wg.compute_ref_log_probs_on_ids(update_batch)
+            update_batch.batch["teacher_log_probs"] = teacher_lp.batch["teacher_topk_log_probs"]
+
+            teacher_base_lp = self.actor_rollout_wg.compute_base_ref_log_probs_on_ids(update_batch)
+            update_batch.batch["teacher_base_log_probs"] = teacher_base_lp.batch["teacher_base_topk_log_probs"]
+            return update_batch
+
+        old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
+        update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
+        update_batch.batch["entropys"] = old_log_prob_output.batch["entropys"]
+
+        teacher_log_probs_output = self.actor_rollout_wg.compute_ref_log_prob(update_batch)
+        update_batch.batch["teacher_log_probs"] = teacher_log_probs_output.batch["ref_log_prob"]
+
+        base_log_probs_output = self.actor_rollout_wg.compute_base_log_prob(update_batch)
+        update_batch.batch["base_log_probs"] = base_log_probs_output.batch["base_log_probs"]
+
+        teacher_base_log_probs_output = self.actor_rollout_wg.compute_base_ref_log_prob(update_batch)
+        update_batch.batch["teacher_base_log_probs"] = teacher_base_log_probs_output.batch["base_ref_log_prob"]
+        return update_batch
+
+
     def fit_heterogeneous(self):
         from omegaconf import OmegaConf
         from pprint import pprint
@@ -1947,24 +1998,15 @@ class RayPPOTrainer:
                         if update_batch is not None and len(update_batch) > 0:
                             print("[DEBUG] OPD UPDATE START.")
 
-                            old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
-                            update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
-                            update_batch.batch['entropys'] = old_log_prob_output.batch["entropys"]
+                            update_batch = self._prepare_opd_update_batch(update_batch)
                             self._add_entropy_metrics(
                                 metrics=metrics,
                                 batch=update_batch,
-                                entropys=old_log_prob_output.batch["entropys"],
+                                entropys=update_batch.batch["entropys"],
                                 prefix="opd",
                             )
-
-                            teacher_log_probs_output = self.actor_rollout_wg.compute_ref_log_prob(update_batch)
-                            update_batch.batch["teacher_log_probs"] = teacher_log_probs_output.batch["ref_log_prob"]
-
-                            base_log_probs_output = self.actor_rollout_wg.compute_base_log_prob(update_batch)
-                            update_batch.batch["base_log_probs"] = base_log_probs_output.batch["base_log_probs"]
-
-                            teacher_base_log_probs_output = self.actor_rollout_wg.compute_base_ref_log_prob(update_batch)
-                            update_batch.batch["teacher_base_log_probs"] = teacher_base_log_probs_output.batch["base_ref_log_prob"]
+                            if self.opd_top_k > 0:
+                                metrics["opd/top_k"] = self.opd_top_k
 
                             actor_output = self.actor_rollout_wg.update_actor_opd(update_batch)
                             actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])

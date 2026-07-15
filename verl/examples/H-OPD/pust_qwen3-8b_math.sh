@@ -175,6 +175,7 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.opd_steps=$opd_steps \
     +algorithm.hetero_distill.grpo_steps=$grpo_steps \
     +algorithm.hetero_distill.warmup_steps=$warmup_steps \
+    +algorithm.hetero_distill.opd_top_k=$opd_top_k \
     data.train_files=$train_files \
     data.val_files=$test_files \
     data.train_batch_size=256 \

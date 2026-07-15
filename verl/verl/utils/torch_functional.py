@@ -113,6 +113,70 @@ def logprobs_from_logits_naive(logits, labels):
     return logpy
 
 
+def logsumexp_from_logits_by_row(logits: torch.FloatTensor) -> torch.FloatTensor:
+    """Row-wise logsumexp without materializing a full log_softmax tensor."""
+    if logits.dtype in (torch.float32, torch.float64):
+        return torch.stack([torch.logsumexp(row, dim=-1) for row in logits])
+    return torch.logsumexp(logits, dim=-1)
+
+
+class _TopKLogProbsFunction(torch.autograd.Function):
+    """Top-k log probs with row-chunked backward to avoid a full (nnz, vocab) softmax buffer."""
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, topk_ids: torch.Tensor, row_chunk_size: int):
+        ctx.row_chunk_size = row_chunk_size
+        ctx.save_for_backward(logits, topk_ids)
+        logsumexp = logsumexp_from_logits_by_row(logits)
+        topk_logits = torch.gather(logits, dim=-1, index=topk_ids)
+        return topk_logits - logsumexp.unsqueeze(-1)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        grad_output is the gradient of the output of the topk_logprobs_from_logits function.
+        Args:
+            grad_output: (..., topk)
+        Returns:
+            grad_logits: (..., vocab_size)
+        """
+
+        logits, topk_ids = ctx.saved_tensors
+        row_chunk_size = ctx.row_chunk_size
+        grad_logits = torch.zeros_like(logits)
+
+        if grad_output is None:
+            return grad_logits, None, None
+
+        chunk_size = row_chunk_size if row_chunk_size > 0 else 256
+        for start in range(0, logits.size(0), chunk_size):
+            end = min(start + chunk_size, logits.size(0))
+            logits_chunk = logits[start:end]
+            topk_ids_chunk = topk_ids[start:end]
+            grad_out_chunk = grad_output[start:end]
+
+            logsumexp = torch.logsumexp(logits_chunk, dim=-1, keepdim=True)
+            softmax = torch.exp(logits_chunk - logsumexp)
+            grad_chunk = -softmax * grad_out_chunk.sum(dim=-1, keepdim=True)
+            grad_chunk.scatter_add_(1, topk_ids_chunk, grad_out_chunk)
+            grad_logits[start:end] = grad_chunk
+
+        return grad_logits, None, None
+
+
+def topk_logprobs_from_logits(
+    logits: torch.FloatTensor,
+    topk_ids: torch.Tensor,
+    row_chunk_size: int = 256,
+) -> torch.Tensor:
+    """Log probs on top-k ids; chunked backward when training."""
+    if logits.requires_grad:
+        return _TopKLogProbsFunction.apply(logits, topk_ids, row_chunk_size)
+    logsumexp = logsumexp_from_logits_by_row(logits)
+    topk_logits = torch.gather(logits, dim=-1, index=topk_ids)
+    return topk_logits - logsumexp.unsqueeze(-1)
+
+
 def logprobs_from_logits_v2(logits: torch.FloatTensor, labels):
     """
     A memory efficient implementation of logprobs_from_logits
@@ -120,7 +184,7 @@ def logprobs_from_logits_v2(logits: torch.FloatTensor, labels):
     if logits.dtype in [torch.float32, torch.float64]:
         logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption
-        logsumexp_values = torch.stack([torch.logsumexp(logit, dim=-1) for logit in logits])
+        logsumexp_values = logsumexp_from_logits_by_row(logits)
         logprobs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
     else:
         # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach
