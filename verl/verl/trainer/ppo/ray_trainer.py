@@ -365,7 +365,10 @@ class RayPPOTrainer:
         hetero_cfg = self.config.algorithm.get("hetero_distill", {})
         print(hetero_cfg)
         self.student_rollout_n = hetero_cfg.get("student_rollout_n", 1)
-        self.opd_top_k = int(hetero_cfg.get("opd_top_k", 0))
+        if self.is_hetero_distill:
+            self.opd_top_k = int(hetero_cfg.get("opd_top_k", 0))
+        else:
+            self.opd_top_k = int(self.config.algorithm.get("opd_top_k", 0))
         self.opd_parallel_student_base = bool(hetero_cfg.get("opd_parallel_student_base", False))
 
         # Store base model paths for corrected reward computation
@@ -1712,40 +1715,73 @@ class RayPPOTrainer:
             metrics[f"{prefix}/student_top1_in_teacher_topk_rate"] = student_top1_in_teacher_topk[valid_mask].float().mean().item()
 
 
-    def _prepare_opd_update_batch(self, update_batch: DataProto) -> tuple[DataProto, dict]:
-        """Attach log-prob tensors for OPD update via a single worker RPC."""
+    def _prepare_opd_batch(
+        self,
+        batch: DataProto,
+        *,
+        include_base: bool,
+        ref_on_actor: bool = False,
+        ref_output_key: str = "teacher_log_probs",
+        fetch_ref_externally: bool = False,
+    ) -> tuple[DataProto, object | None, dict]:
+        """Attach OPD log-prob tensors via prepare_opd_log_probs (+ optional external ref RPC)."""
         if self.use_ref_retokenization:
             from verl.trainer.ppo.ref_input_utils import prepare_ref_model_inputs
 
             apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
-            update_batch = prepare_ref_model_inputs(
-                batch=update_batch,
+            batch = prepare_ref_model_inputs(
+                batch=batch,
                 ref_tokenizer=self.ref_tokenizer,
                 apply_chat_template_kwargs=apply_chat_template_kwargs,
             )
 
         opd_top_k = self.opd_top_k
         if opd_top_k > 0:
+            batch.batch.pop("old_log_probs", None)
+
+        batch.meta_info["top_k"] = opd_top_k
+        batch.meta_info["opd_include_base"] = include_base
+        batch.meta_info["opd_parallel_student_base"] = self.opd_parallel_student_base
+        if ref_on_actor:
+            batch.meta_info["is_lora"] = True
+            batch.meta_info["opd_ref_on_actor"] = True
+            batch.meta_info["opd_ref_output_key"] = ref_output_key
+
+        if opd_top_k > 0 and include_base:
             print(f"[DEBUG] OPD top-k update (only_stu), K={opd_top_k}")
-            update_batch.meta_info["top_k"] = opd_top_k
-        else:
-            update_batch.meta_info["top_k"] = 0
 
-        update_batch.meta_info["opd_parallel_student_base"] = self.opd_parallel_student_base
-
-        lp_output = self.actor_rollout_wg.prepare_opd_log_probs(update_batch)
+        lp_output = self.actor_rollout_wg.prepare_opd_log_probs(batch)
         timing_metrics = lp_output.meta_info.get("metrics", {})
 
-        update_batch.batch["old_log_probs"] = lp_output.batch["old_log_probs"]
-        update_batch.batch["entropys"] = lp_output.batch["entropys"]
-        update_batch.batch["base_log_probs"] = lp_output.batch["base_log_probs"]
-        update_batch.batch["teacher_log_probs"] = lp_output.batch["teacher_log_probs"]
-        update_batch.batch["teacher_base_log_probs"] = lp_output.batch["teacher_base_log_probs"]
+        batch.batch["old_log_probs"] = lp_output.batch["old_log_probs"]
+        if "entropys" in lp_output.batch:
+            batch.batch["entropys"] = lp_output.batch["entropys"]
+
+        if include_base:
+            batch.batch["base_log_probs"] = lp_output.batch["base_log_probs"]
+            batch.batch["teacher_log_probs"] = lp_output.batch["teacher_log_probs"]
+            batch.batch["teacher_base_log_probs"] = lp_output.batch["teacher_base_log_probs"]
+
         if opd_top_k > 0:
-            update_batch.batch["student_topk_ids"] = lp_output.batch["student_topk_ids"]
+            batch.batch["student_topk_ids"] = lp_output.batch["student_topk_ids"]
+            if ref_on_actor and ref_output_key in lp_output.batch:
+                batch.batch[ref_output_key] = lp_output.batch[ref_output_key]
+            elif fetch_ref_externally:
+                ref_batch = batch
+                ref_batch.meta_info["opd_ref_output_key"] = ref_output_key
+                ref_lp = self.ref_policy_wg.compute_ref_log_probs_on_ids(ref_batch)
+                batch = batch.union(ref_lp)
 
+        entropys = lp_output.batch["entropys"] if "entropys" in lp_output.batch else None
+        return batch, entropys, timing_metrics
+
+    def _prepare_opd_update_batch(self, update_batch: DataProto) -> tuple[DataProto, dict]:
+        """PUST / hetero OPD update: student + base + teacher + teacher-base log probs."""
+        update_batch, _, timing_metrics = self._prepare_opd_batch(
+            update_batch,
+            include_base=True,
+        )
         return update_batch, timing_metrics
-
 
     def fit_heterogeneous(self):
         from omegaconf import OmegaConf
@@ -2075,7 +2111,7 @@ class RayPPOTrainer:
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
-            assert val_metrics, f"{val_metrics=}"
+            assert val_metrics, f"val_metrics is empty"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
@@ -2212,57 +2248,81 @@ class RayPPOTrainer:
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
                     else:  # Recompute old_log_probs
-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch.batch["response_mask"]
-                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                            entropy_agg = agg_loss(
-                                loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                        if self.opd_top_k > 0:
+                            assert not bypass_recomputing_logprobs, (
+                                "top-k OPD requires decoupled log-prob mode (bypass_mode=false)"
                             )
-                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                            metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
-                            batch = batch.union(old_log_prob)
-                            if "rollout_log_probs" in batch.batch.keys():
-                                # TODO: we may want to add diff of probs too.
-                                from verl.utils.debug.metrics import calculate_debug_metrics
-
-                                metrics.update(calculate_debug_metrics(batch))
-
-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
-
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                            # Get apply_chat_template_kwargs from config if available
-                            apply_chat_template_kwargs = self.config.data.get(
-                                "apply_chat_template_kwargs", {}
-                            )
-
-                            # If ref model uses different tokenizer/prompt template, re-tokenize inputs for ref model
-                            if self.use_ref_retokenization:
-                                from verl.trainer.ppo.ref_input_utils import prepare_ref_model_inputs
-                                
-                                batch = prepare_ref_model_inputs(
-                                    batch=batch,
-                                    ref_tokenizer=self.ref_tokenizer,
-                                    apply_chat_template_kwargs=apply_chat_template_kwargs,
+                            assert self.use_reference_policy, "top-k OPD requires a reference (teacher) policy"
+                            with marked_timer("opd_topk_log_probs", timing_raw, color="blue"):
+                                batch, entropys, opd_prep_timing = self._prepare_opd_batch(
+                                    batch,
+                                    include_base=False,
+                                    ref_on_actor=self.ref_in_actor,
+                                    ref_output_key="ref_log_prob",
+                                    fetch_ref_externally=self.use_reference_policy and not self.ref_in_actor,
                                 )
-                                
-                                if not self.ref_in_actor: 
-                                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                                else:
-                                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                                batch = batch.union(ref_log_prob)
-                            
-                            else:
-                                # Standard ref model log prob computation
-                                if not self.ref_in_actor:
-                                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                                else:
-                                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                                batch = batch.union(ref_log_prob)
+                                metrics.update({f"opd/{k}": v for k, v in opd_prep_timing.items()})
+                                metrics["opd/top_k"] = self.opd_top_k
+                                if entropys is not None:
+                                    response_masks = batch.batch["response_mask"]
+                                    loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                                    entropy_agg = agg_loss(
+                                        loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                                    )
+                                    metrics["actor/entropy"] = entropy_agg.detach().item()
+                        else:
+                            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                                entropys = old_log_prob.batch["entropys"]
+                                response_masks = batch.batch["response_mask"]
+                                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                                entropy_agg = agg_loss(
+                                    loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                                )
+                                old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                                metrics.update(old_log_prob_metrics)
+                                old_log_prob.batch.pop("entropys")
+                                batch = batch.union(old_log_prob)
+                                if "rollout_log_probs" in batch.batch.keys():
+                                    # TODO: we may want to add diff of probs too.
+                                    from verl.utils.debug.metrics import calculate_debug_metrics
+
+                                    metrics.update(calculate_debug_metrics(batch))
+
+                            if self.use_reference_policy:
+                                # compute reference log_prob
+                                with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                                    # Get apply_chat_template_kwargs from config if available
+                                    apply_chat_template_kwargs = self.config.data.get(
+                                        "apply_chat_template_kwargs", {}
+                                    )
+
+                                    # If ref model uses different tokenizer/prompt template, re-tokenize inputs for ref model
+                                    if self.use_ref_retokenization:
+                                        from verl.trainer.ppo.ref_input_utils import prepare_ref_model_inputs
+
+                                        batch = prepare_ref_model_inputs(
+                                            batch=batch,
+                                            ref_tokenizer=self.ref_tokenizer,
+                                            apply_chat_template_kwargs=apply_chat_template_kwargs,
+                                        )
+
+                                        if not self.ref_in_actor:
+                                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                        else:
+                                            ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                        batch = batch.union(ref_log_prob)
+
+                                    else:
+                                        # Standard ref model log prob computation
+                                        if not self.ref_in_actor:
+                                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                        else:
+                                            ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                        batch = batch.union(ref_log_prob)
+
+                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in batch.batch.keys()'
+               
 
                     if not hasattr(self, "_debug_sample_saved"):
                         self._debug_sample_saved = False

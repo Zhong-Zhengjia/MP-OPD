@@ -1345,12 +1345,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="cyan", role="ref_compute_log_probs_on_ids")
     def compute_ref_log_probs_on_ids(self, data: DataProto):
+        output_key = data.meta_info.pop("opd_ref_output_key", "teacher_log_probs")
         if self._is_lora:
             data.meta_info["is_lora"] = True
             output = self.compute_actor_log_probs_on_ids(data)
-            return DataProto.from_dict(
-                tensors={"teacher_topk_log_probs": output.batch["actor_topk_log_probs"]}
-            )
+            return DataProto.from_dict(tensors={output_key: output.batch["actor_topk_log_probs"]})
 
         assert self._is_ref
 
@@ -1362,7 +1361,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = data.to("cpu")
             output = self.ref_policy.compute_topk_log_probs_on_ids(data=data)
-            output = DataProto.from_dict(tensors={"teacher_topk_log_probs": output})
+            output = DataProto.from_dict(tensors={output_key: output})
 
         output = output.to("cpu")
 
@@ -1373,7 +1372,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.ref_policy.actor_module.reshard()
 
         return output
-
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="cyan", role="base_compute_log_probs_on_ids")
@@ -1503,13 +1501,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="cyan", role="prepare_opd_log_probs")
     def prepare_opd_log_probs(self, data: DataProto):
-        """Single RPC for OPD prep: one actor load/offload cycle + optional teacher parallel."""
+        """Single RPC for OPD prep: student log-probs + optional ref-on-actor + optional base models.
+
+        meta_info knobs:
+          - top_k: 0 = full-vocab response-token log probs; >0 = student top-k ids + log probs
+          - opd_include_base: run student-base / teacher / teacher-base forwards (PUST)
+          - opd_parallel_student_base: 3-way vs 2-way parallel when opd_include_base=True
+          - opd_ref_on_actor: LoRA ref top-k on actor worker (standard OPD)
+          - opd_ref_output_key: tensor key for opd_ref_on_actor output (default teacher_log_probs)
+        """
         assert self._is_actor
 
         timing_metrics: dict[str, float] = {}
         t_total = time.perf_counter()
         opd_top_k = int(data.meta_info.get("top_k", 0))
+        include_base = bool(data.meta_info.pop("opd_include_base", False))
         parallel_student_base = bool(data.meta_info.pop("opd_parallel_student_base", False))
+        ref_on_actor = bool(data.meta_info.pop("opd_ref_on_actor", False))
+        ref_output_key = data.meta_info.pop("opd_ref_output_key", "teacher_log_probs")
         timing_metrics["timing/opd_student_base_parallel_enabled"] = float(parallel_student_base)
 
         from contextlib import nullcontext
@@ -1528,6 +1537,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         timing_metrics["timing/opd_actor_load_s"] = time.perf_counter() - t_load
 
         output_tensors: dict[str, torch.Tensor] = {}
+        topk_ids = None
 
         with self.ulysses_sharding_manager:
             with adapter_ctx:
@@ -1550,45 +1560,57 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
                 self.actor.actor_module._handle.reshard(True)
 
-            def _run_timed(fn, proto: DataProto):
-                t0 = time.perf_counter()
-                result = fn(proto, opd_top_k)
-                return result, time.perf_counter() - t0
+            if ref_on_actor and opd_top_k > 0:
+                t_ref = time.perf_counter()
+                ref_data = self._shallow_copy_dataproto(data)
+                ref_data = ref_data.union(DataProto.from_dict(tensors={"student_topk_ids": topk_ids}))
+                with self.actor.actor_module.disable_adapter():
+                    ref_lp = self.actor.compute_topk_log_probs_on_ids(data=ref_data)
+                output_tensors[ref_output_key] = ref_lp
+                timing_metrics["timing/opd_ref_forward_s"] = time.perf_counter() - t_ref
+                if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+                    self.actor.actor_module._handle.reshard(True)
 
-            t_ref_models = time.perf_counter()
-            base_data = self._shallow_copy_dataproto(data)
-            ref_data = self._shallow_copy_dataproto(data)
-            base_ref_data = self._shallow_copy_dataproto(data)
+            if include_base:
+                def _run_timed(fn, proto: DataProto):
+                    t0 = time.perf_counter()
+                    result = fn(proto, opd_top_k)
+                    return result, time.perf_counter() - t0
 
-            if parallel_student_base:
-                with ThreadPoolExecutor(max_workers=3) as executor:
-                    base_future = executor.submit(_run_timed, self._compute_base_log_probs_opd, base_data)
-                    ref_future = executor.submit(_run_timed, self._compute_ref_log_probs_opd, ref_data)
-                    base_ref_future = executor.submit(
-                        _run_timed, self._compute_base_ref_log_probs_opd, base_ref_data
+                t_ref_models = time.perf_counter()
+                base_data = self._shallow_copy_dataproto(data)
+                ref_data = self._shallow_copy_dataproto(data)
+                base_ref_data = self._shallow_copy_dataproto(data)
+
+                if parallel_student_base:
+                    with ThreadPoolExecutor(max_workers=3) as executor:
+                        base_future = executor.submit(_run_timed, self._compute_base_log_probs_opd, base_data)
+                        ref_future = executor.submit(_run_timed, self._compute_ref_log_probs_opd, ref_data)
+                        base_ref_future = executor.submit(
+                            _run_timed, self._compute_base_ref_log_probs_opd, base_ref_data
+                        )
+                        output_tensors["base_log_probs"], base_dt = base_future.result()
+                        output_tensors["teacher_log_probs"], ref_dt = ref_future.result()
+                        output_tensors["teacher_base_log_probs"], base_ref_dt = base_ref_future.result()
+                    timing_metrics["timing/opd_proxy_parallel_wall_s"] = 0.0
+                else:
+                    output_tensors["base_log_probs"], base_dt = _run_timed(
+                        self._compute_base_log_probs_opd, base_data
                     )
-                    output_tensors["base_log_probs"], base_dt = base_future.result()
-                    output_tensors["teacher_log_probs"], ref_dt = ref_future.result()
-                    output_tensors["teacher_base_log_probs"], base_ref_dt = base_ref_future.result()
-                timing_metrics["timing/opd_proxy_parallel_wall_s"] = 0.0
-            else:
-                output_tensors["base_log_probs"], base_dt = _run_timed(
-                    self._compute_base_log_probs_opd, base_data
-                )
-                t_proxy = time.perf_counter()
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    ref_future = executor.submit(_run_timed, self._compute_ref_log_probs_opd, ref_data)
-                    base_ref_future = executor.submit(
-                        _run_timed, self._compute_base_ref_log_probs_opd, base_ref_data
-                    )
-                    output_tensors["teacher_log_probs"], ref_dt = ref_future.result()
-                    output_tensors["teacher_base_log_probs"], base_ref_dt = base_ref_future.result()
-                timing_metrics["timing/opd_proxy_parallel_wall_s"] = time.perf_counter() - t_proxy
+                    t_proxy = time.perf_counter()
+                    with ThreadPoolExecutor(max_workers=2) as executor:
+                        ref_future = executor.submit(_run_timed, self._compute_ref_log_probs_opd, ref_data)
+                        base_ref_future = executor.submit(
+                            _run_timed, self._compute_base_ref_log_probs_opd, base_ref_data
+                        )
+                        output_tensors["teacher_log_probs"], ref_dt = ref_future.result()
+                        output_tensors["teacher_base_log_probs"], base_ref_dt = base_ref_future.result()
+                    timing_metrics["timing/opd_proxy_parallel_wall_s"] = time.perf_counter() - t_proxy
 
-            timing_metrics["timing/opd_base_forward_s"] = base_dt
-            timing_metrics["timing/opd_ref_forward_s"] = ref_dt
-            timing_metrics["timing/opd_base_ref_forward_s"] = base_ref_dt
-            timing_metrics["timing/opd_ref_models_wall_s"] = time.perf_counter() - t_ref_models
+                timing_metrics["timing/opd_base_forward_s"] = base_dt
+                timing_metrics["timing/opd_ref_forward_s"] = ref_dt
+                timing_metrics["timing/opd_base_ref_forward_s"] = base_ref_dt
+                timing_metrics["timing/opd_ref_models_wall_s"] = time.perf_counter() - t_ref_models
 
         output = DataProto.from_dict(tensors=output_tensors)
         output = output.to("cpu")
@@ -1603,7 +1625,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output.meta_info["metrics"] = timing_metrics
 
         return output
-
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="cyan", role="actor_update_grpo")

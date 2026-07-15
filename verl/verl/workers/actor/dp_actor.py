@@ -1270,6 +1270,10 @@ class DataParallelPPOActor(BasePPOActor):
         if self.config.policy_loss.only_reverse_kl_advantages and "ref_log_prob" in data.batch.keys():
             if "ref_log_prob" not in select_keys:
                 select_keys.append("ref_log_prob")
+
+        has_topk_opd = "student_topk_ids" in data.batch.keys()
+        if has_topk_opd:
+            select_keys.append("student_topk_ids")
         
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -1290,6 +1294,15 @@ class DataParallelPPOActor(BasePPOActor):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    if has_topk_opd:
+                        padded_max_seq_len = mini_batch.batch["attention_mask"].shape[-1]
+                        topk_cap = getattr(self.config, "ppo_topk_max_token_len_per_gpu", 0)
+                        if not topk_cap or topk_cap <= 0:
+                            topk_cap = max(4096, self.config.ppo_max_token_len_per_gpu // 4)
+                        topk_cap = max(topk_cap, padded_max_seq_len)
+                        max_token_len = min(
+                            max_token_len, topk_cap * self.ulysses_sequence_parallel_size
+                        )
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
                     self.gradient_accumulation = (
@@ -1319,9 +1332,17 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
-                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                    )
+                    if has_topk_opd:
+                        entropy, _, log_prob = self._forward_micro_batch(
+                            model_inputs,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            return_topk_log_probs=True,
+                        )
+                    else:
+                        entropy, log_prob = self._forward_micro_batch(
+                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        )
 
                     # for fully_async_policy recipe
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -1403,6 +1424,8 @@ class DataParallelPPOActor(BasePPOActor):
                         rollout_is_weights=rollout_is_weights,
                     )
                     micro_batch_metrics.update(pg_metrics)
+                    if has_topk_opd:
+                        micro_batch_metrics["actor/opd_topk"] = float(model_inputs["student_topk_ids"].shape[-1])
 
                     # Skip if using pure rollout correction mode (metrics already in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)
@@ -1426,7 +1449,7 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         policy_loss = pg_loss
 
-                    if self.config.use_kl_loss:
+                    if self.config.use_kl_loss and not has_topk_opd:
                         ref_log_prob = model_inputs["ref_log_prob"]
                         # compute kl loss
                         kld = kl_penalty(

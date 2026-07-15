@@ -183,7 +183,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
-    actor_rollout_ref.rollout.calculate_log_probs=true \
+    actor_rollout_ref.rollout.calculate_log_probs=false \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
@@ -196,12 +196,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     actor_rollout_ref.actor.loss_agg_mode="seq-mean-token-mean" \
     algorithm.use_kl_in_reward=false \
+    +algorithm.opd_top_k=0 \
     reward_model.reward_manager=naive \
     val_custom_reward_function.path=$code_reward_path \
     val_custom_reward_function.name=reward_func_batched \
     val_custom_reward_function.reward_kwargs.code_eval_workers=$code_eval_workers \
     trainer.critic_warmup=0 \
-    trainer.val_before_train=true \
+    trainer.val_before_train=false \
     trainer.logger='["console","wandb"]' \
     trainer.log_val_generations=0 \
     trainer.project_name=$project_name \
