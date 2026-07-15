@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=e04-w2s_math
-#SBATCH --output=logs/w2s_math/slurm_math_%j.out
-#SBATCH --error=logs/w2s_math/slurm_math_%j.err
-#SBATCH --chdir=/mnt/phwfile/datafrontier/wurong/code/RM-OPD
+#SBATCH --job-name=e05-m-2.0
+#SBATCH --output=logs/w2s_math/slurm_math_lambda_2.0_%j.out
+#SBATCH --error=logs/w2s_math/slurm_math_lambda_2.0_%j.err
+#SBATCH --chdir=/mnt/petrelfs/wurong/workspace/RM-OPD
 #SBATCH --account=research
 #SBATCH --partition=DataFrontier_Explore
 #SBATCH --gres=gpu:8
@@ -69,7 +69,7 @@ grpo_lr_scale=1.0
 use_opd=true
 opd_lr_scale=1.0 
 opd_top_k=100
-lambda_vals=1.0    # lambda value for the lambda-based reward function
+lambda_vals=2.0    # lambda value for the lambda-based reward function
 
 # update mode config
 update_mode=both   # in [alt, both, warmup]
@@ -94,7 +94,11 @@ n_gpu=8
 
 project_name=MT_weak2strong@${val_n}-math
 
-# resume_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/TRA_strong2weak@16/Qwen3-1.7B-T4B-_GB1024_OB0_0606_0711/"
+
+# resume_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/MT_weak2strong@16-math/Qwen3-8B-T1.7B_Math_Lam1.5_Gfalse_Otrue_0705_1245"
+# resume_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/MT_weak2strong@16-math/Qwen3-8B-T1.7B_Math_Lam1.25_Gfalse_Otrue_0706_1205"
+# resume_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/MT_weak2strong@16-math/Qwen3-8B-T1.7B_Math_Lam1.5_Gfalse_Otrue_0705_1245"
+# resume_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/MT_weak2strong@16-math/Qwen3-8B-T1.7B_Math_Lam1.0_Gfalse_Otrue_0629_1707"
 resume_path=""
 extra_args=()
 while [[ $# -gt 0 ]]; do
@@ -229,7 +233,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name="$experiment_name" \
     trainer.n_gpus_per_node=$n_gpu \
     trainer.nnodes=$n_node \
-    trainer.max_actor_ckpt_to_keep=1 \
+    trainer.max_actor_ckpt_to_keep=2 \
     trainer.max_critic_ckpt_to_keep=1 \
     trainer.save_freq=10 \
     +trainer.val_aggregate_group=$val_metric_group \

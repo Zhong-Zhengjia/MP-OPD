@@ -1180,7 +1180,7 @@ class RayPPOTrainer:
             actor_local_path,
             actor_remote_path,
             self.global_steps,
-            max_ckpt_to_keep=1,
+            max_ckpt_to_keep=None,
         )
 
         # critic
@@ -1195,7 +1195,7 @@ class RayPPOTrainer:
                 critic_local_path,
                 critic_remote_path,
                 self.global_steps,
-                max_ckpt_to_keep=1,
+                max_ckpt_to_keep=None,
             )
 
         # dataloader state
@@ -1263,6 +1263,10 @@ class RayPPOTrainer:
             last_path = os.path.join(search_root, "last")
             if self._is_checkpoint_dir(last_path):
                 return last_path
+
+            best_path = os.path.join(search_root, "best_valid")
+            if self._is_checkpoint_dir(best_path):
+                return best_path
 
             latest_path = find_latest_ckpt_path(search_root)
             if self._is_checkpoint_dir(latest_path):
@@ -1723,6 +1727,9 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+
+        # load checkpoint before doing anything (restores model, dataloader, global_steps)
+        self._load_checkpoint()
 
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
