@@ -348,6 +348,12 @@ class RayPPOTrainer:
         # Store ref_tokenizer for re-tokenization when ref model uses different tokenizer
         self.ref_tokenizer = ref_tokenizer
         self.use_ref_retokenization = ref_tokenizer is not None
+        if self.use_ref_retokenization:
+            from verl.trainer.ppo.ref_input_utils import tokenizers_need_cross_token_bridge
+
+            self.use_cross_token_bridge = tokenizers_need_cross_token_bridge(tokenizer, ref_tokenizer)
+        else:
+            self.use_cross_token_bridge = False
 
         if self.use_ref_retokenization:
             return_raw_chat = config.data.get("return_raw_chat", False)
@@ -356,6 +362,11 @@ class RayPPOTrainer:
                     "When using a different tokenizer for ref model (ref_tokenizer is provided) "
                     "you must set data.return_raw_chat=True in config to enable re-tokenization. "
                     "This is needed to access the original messages for re-tokenizing with ref model's chat template."
+                )
+            if self.use_cross_token_bridge:
+                print(
+                    "Cross-tokenizer bridge enabled for proxy/ref models "
+                    "(text response bridge + common-token OPD mask)."
                 )
 
         # training mode
@@ -1725,17 +1736,25 @@ class RayPPOTrainer:
         fetch_ref_externally: bool = False,
     ) -> tuple[DataProto, object | None, dict]:
         """Attach OPD log-prob tensors via prepare_opd_log_probs (+ optional external ref RPC)."""
+        cross_token_stats: dict = {}
         if self.use_ref_retokenization:
             from verl.trainer.ppo.ref_input_utils import prepare_ref_model_inputs
 
             apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
-            batch = prepare_ref_model_inputs(
+            batch, cross_token_stats = prepare_ref_model_inputs(
                 batch=batch,
                 ref_tokenizer=self.ref_tokenizer,
+                primary_tokenizer=self.tokenizer,
+                cross_token_bridge=self.use_cross_token_bridge,
                 apply_chat_template_kwargs=apply_chat_template_kwargs,
             )
 
         opd_top_k = self.opd_top_k
+        if self.use_cross_token_bridge and opd_top_k > 0:
+            raise ValueError(
+                "cross-tokenizer PUST (Phase 0/1) does not support opd_top_k > 0. "
+                "Set algorithm.hetero_distill.opd_top_k=0 or use the same tokenizer."
+            )
         if opd_top_k > 0:
             batch.batch.pop("old_log_probs", None)
 
@@ -1762,6 +1781,23 @@ class RayPPOTrainer:
             batch.batch["teacher_log_probs"] = lp_output.batch["teacher_log_probs"]
             batch.batch["teacher_base_log_probs"] = lp_output.batch["teacher_base_log_probs"]
 
+        if self.use_cross_token_bridge:
+            from verl.trainer.ppo.ref_input_utils import (
+                align_teacher_log_probs_to_primary,
+                maybe_apply_sequence_level_opd_fallback,
+            )
+
+            batch, align_stats = align_teacher_log_probs_to_primary(batch)
+            cross_token_stats.update(align_stats)
+
+            hetero_cfg = self.config.algorithm.get("hetero_distill", {})
+            fallback_threshold = float(hetero_cfg.get("cross_token_common_ratio_threshold", 0.8))
+            batch, fallback_stats = maybe_apply_sequence_level_opd_fallback(
+                batch,
+                common_ratio_threshold=fallback_threshold,
+            )
+            cross_token_stats.update(fallback_stats)
+
         if opd_top_k > 0:
             batch.batch["student_topk_ids"] = lp_output.batch["student_topk_ids"]
             if ref_on_actor and ref_output_key in lp_output.batch:
@@ -1773,6 +1809,7 @@ class RayPPOTrainer:
                 batch = batch.union(ref_lp)
 
         entropys = lp_output.batch["entropys"] if "entropys" in lp_output.batch else None
+        timing_metrics.update(cross_token_stats)
         return batch, entropys, timing_metrics
 
     def _prepare_opd_update_batch(self, update_batch: DataProto) -> tuple[DataProto, dict]:
@@ -2301,9 +2338,11 @@ class RayPPOTrainer:
                                     if self.use_ref_retokenization:
                                         from verl.trainer.ppo.ref_input_utils import prepare_ref_model_inputs
 
-                                        batch = prepare_ref_model_inputs(
+                                        batch, _ = prepare_ref_model_inputs(
                                             batch=batch,
                                             ref_tokenizer=self.ref_tokenizer,
+                                            primary_tokenizer=self.tokenizer,
+                                            cross_token_bridge=self.use_cross_token_bridge,
                                             apply_chat_template_kwargs=apply_chat_template_kwargs,
                                         )
 
@@ -2312,6 +2351,14 @@ class RayPPOTrainer:
                                         else:
                                             ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                                         batch = batch.union(ref_log_prob)
+                                        if self.use_cross_token_bridge:
+                                            from verl.trainer.ppo.ref_input_utils import (
+                                                align_ref_side_log_probs_to_primary,
+                                            )
+
+                                            batch, _ = align_ref_side_log_probs_to_primary(
+                                                batch, keys=("ref_log_prob",)
+                                            )
 
                                     else:
                                         # Standard ref model log prob computation
@@ -2366,6 +2413,15 @@ class RayPPOTrainer:
                             # Restore ref_input_ids tensors back to batch
                             for key, tensor in ref_input_tensors.items():
                                 batch.batch[key] = tensor
+
+                            if self.use_cross_token_bridge:
+                                from verl.trainer.ppo.ref_input_utils import (
+                                    align_ref_side_log_probs_to_primary,
+                                )
+
+                                batch, _ = align_ref_side_log_probs_to_primary(
+                                    batch, keys=("base_ref_log_prob",)
+                                )
                             
                             print(f"Computed base log probs for corrected reward: "
                                   f"base_log_prob shape={batch.batch['base_log_prob'].shape}, "

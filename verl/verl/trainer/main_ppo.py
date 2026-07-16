@@ -287,6 +287,13 @@ class TaskRunner:
             )
             ref_tokenizer = hf_tokenizer(ref_local_path, trust_remote_code=trust_remote_code)
             print(f"Loaded ref_tokenizer from {ref_local_path} for re-tokenization")
+            from verl.trainer.ppo.ref_input_utils import tokenizers_need_cross_token_bridge
+
+            if tokenizers_need_cross_token_bridge(tokenizer, ref_tokenizer):
+                print(
+                    "Primary and ref tokenizers differ; cross-tokenizer text bridge "
+                    "and common-token OPD mask will be enabled during PUST/OPD."
+                )
 
         reward_fn = load_reward_manager(
             config,

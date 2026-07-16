@@ -109,6 +109,20 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.scaler = None
 
+    @staticmethod
+    def _append_ref_select_keys(select_keys: list[str], batch_keys) -> list[str]:
+        if "ref_input_ids" in batch_keys:
+            select_keys.extend(["ref_input_ids", "ref_attention_mask", "ref_position_ids"])
+            if "ref_responses" in batch_keys:
+                select_keys.append("ref_responses")
+        return select_keys
+
+    @staticmethod
+    def _response_length_for_forward(micro_batch, use_ref_inputs: bool) -> int:
+        if use_ref_inputs and "ref_responses" in micro_batch:
+            return micro_batch["ref_responses"].size(-1)
+        return micro_batch["responses"].size(-1)
+
     def _forward_micro_batch(
         self,
         micro_batch,
@@ -120,7 +134,8 @@ class DataParallelPPOActor(BasePPOActor):
         return_topk_log_probs=False,
         return_topk_with_log_probs=False,
     ):
-        response_length = micro_batch["responses"].size(-1)
+        use_ref_inputs = "ref_input_ids" in micro_batch
+        response_length = self._response_length_for_forward(micro_batch, use_ref_inputs)
         selected_ids = micro_batch.get("union_topk_ids", None)
         selected_mask = micro_batch.get("union_topk_mask", None)
         student_topk_ids = micro_batch.get("student_topk_ids", None) if return_topk_log_probs else None
@@ -639,8 +654,7 @@ class DataParallelPPOActor(BasePPOActor):
         has_ref_input_ids = "ref_input_ids" in data.batch.keys()
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
-        if has_ref_input_ids:
-            select_keys.extend(["ref_input_ids", "ref_attention_mask", "ref_position_ids"])
+        select_keys = self._append_ref_select_keys(select_keys, data.batch.keys())
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -688,9 +702,7 @@ class DataParallelPPOActor(BasePPOActor):
         has_ref_input_ids = "ref_input_ids" in data.batch.keys()
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
-
-        if has_ref_input_ids:
-            select_keys.extend(["ref_input_ids", "ref_attention_mask", "ref_position_ids"])
+        select_keys = self._append_ref_select_keys(select_keys, data.batch.keys())
 
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
@@ -742,8 +754,7 @@ class DataParallelPPOActor(BasePPOActor):
         has_ref_input_ids = "ref_input_ids" in data.batch.keys()
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
-        if has_ref_input_ids:
-            select_keys.extend(["ref_input_ids", "ref_attention_mask", "ref_position_ids"])
+        select_keys = self._append_ref_select_keys(select_keys, data.batch.keys())
 
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -805,9 +816,7 @@ class DataParallelPPOActor(BasePPOActor):
             "union_topk_ids",
             "union_topk_mask",
         ]
-
-        if has_ref_input_ids:
-            select_keys.extend(["ref_input_ids", "ref_attention_mask", "ref_position_ids"])
+        select_keys = self._append_ref_select_keys(select_keys, data.batch.keys())
 
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
@@ -864,9 +873,7 @@ class DataParallelPPOActor(BasePPOActor):
             "position_ids",
             "student_topk_ids",
         ]
-
-        if has_ref_input_ids:
-            select_keys.extend(["ref_input_ids", "ref_attention_mask", "ref_position_ids"])
+        select_keys = self._append_ref_select_keys(select_keys, data.batch.keys())
 
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
@@ -1085,6 +1092,8 @@ class DataParallelPPOActor(BasePPOActor):
         has_topk_opd = "student_topk_ids" in data.batch.keys()
         if has_topk_opd:
             select_keys.append("student_topk_ids")
+        if "cross_token_opd_mask" in data.batch.keys():
+            select_keys.append("cross_token_opd_mask")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -1147,6 +1156,14 @@ class DataParallelPPOActor(BasePPOActor):
                     # advantages = teacher_log_probs - teacher_base_log_probs   # extreme update
                     advantages = advantages.detach()
 
+                    policy_mask = response_mask
+                    if "cross_token_opd_mask" in model_inputs:
+                        cross_token_mask = model_inputs["cross_token_opd_mask"].to(dtype=response_mask.dtype)
+                        policy_mask = response_mask * cross_token_mask
+                        micro_batch_metrics["actor/opd_cross_token_mask_ratio"] = (
+                            cross_token_mask.sum() / response_mask.sum().clamp(min=1)
+                        ).item()
+
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
@@ -1167,8 +1184,6 @@ class DataParallelPPOActor(BasePPOActor):
                             temperature=temperature,
                             calculate_entropy=calculate_entropy,
                         )
-
-                    policy_mask = response_mask
 
                     add_masked_advantage_metrics(
                         micro_batch_metrics,
