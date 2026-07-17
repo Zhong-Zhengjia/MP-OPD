@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=e05-m-cross
-#SBATCH --output=logs/w2s_math/slurm_math_lambda_1.0_cross_tokenizer_%j.out
-#SBATCH --error=logs/w2s_math/slurm_math_lambda_1.0_cross_tokenizer_%j.err
+#SBATCH --job-name=e05-m-cross25
+#SBATCH --output=logs/w2s_math/slurm_math_cross_qwen25_proxy_%j.out
+#SBATCH --error=logs/w2s_math/slurm_math_cross_qwen25_proxy_%j.err
 #SBATCH --chdir=/mnt/petrelfs/wurong/workspace/RM-OPD
 #SBATCH --account=research
 #SBATCH --partition=DataFrontier_Explore
@@ -32,10 +32,10 @@ export WANDB_MODE=online
 export USED_MODEL="no_api"
 
 student_model_name="Qwen3-8B"
-teacher_model_name="Qwen3-1.7B-M-RL" # proxy expert
-teacher_base_model_name="Qwen3-1.7B"           # proxy base
+teacher_model_name="Qwen2.5-Math-7B" # proxy expert
+teacher_base_model_name="Qwen2.5-7B"           # proxy base
 student_tag="Qwen3-8B"
-teacher_tag="1.7B_Math"
+teacher_tag="2.5_Math7B"
 ability=Math
 
 # sbatch copies the script to /var/spool/slurmd/...; BASH_SOURCE is unreliable there.
@@ -67,15 +67,21 @@ grpo_lr_scale=1.0
 
 # opd configs
 use_opd=true
-opd_lr_scale=1.0 
-opd_top_k=100
-lambda_vals=2.0    # lambda value for the lambda-based reward function
+opd_lr_scale=1.0
+# cross-tokenizer PUST must use full-vocab token log prob (no top-k id sharing across vocabs)
+opd_top_k=0
+lambda_vals=1.0    # lambda value for the lambda-based reward function
 
-# actor param offload: set false when GPU memory allows (skips actor CPU<->GPU each step)
+student_rollout_n=1
+
+# actor param offload: false when GPU memory allows (skips actor CPU<->GPU each step)
 actor_param_offload=true
 
-# include student primary-base in parallel OPD prep (teacher proxies always parallel)
+# parallel OPD prep: student-base + teacher + teacher-base forwards overlap
 opd_parallel_student_base=false
+
+# Phase 1 hook: warn when common-token ratio falls below this threshold
+cross_token_common_ratio_threshold=0.8
 
 # update mode config
 update_mode=both   # in [alt, both, warmup]
@@ -98,7 +104,7 @@ n_node=1
 n_gpu=8
 
 
-project_name=MT_weak2strong@${val_n}-math
+project_name=MT_weak2strong@${val_n}-math-cross25
 
 
 # resume_path="/mnt/phwfile/datafrontier/fudaocheng/checkpoints/trained/MT_weak2strong@16-math/Qwen3-8B-T1.7B_Math_Lam1.5_Gfalse_Otrue_0705_1245"
@@ -143,7 +149,7 @@ batch_size_to_bool() {
     fi
 }
 
-output_model_name="${student_tag}-T${teacher_tag}_Lam${lambda_vals}"
+output_model_name="${student_tag}-T${teacher_tag}_Lam${lambda_vals}_Cross"
 
 resume_args=()
 if [[ -n "$resume_path" ]]; then
@@ -174,7 +180,7 @@ mkdir -p "${RAY_TMPDIR}"
 
 python3 -m verl.trainer.main_ppo \
     +algorithm.train_mode=heterogeneous_distill \
-    +algorithm.hetero_distill.student_rollout_n=8 \
+    +algorithm.hetero_distill.student_rollout_n=$student_rollout_n \
     +algorithm.hetero_distill.use_grpo=$use_grpo \
     +algorithm.hetero_distill.use_opd=$use_opd \
     +algorithm.hetero_distill.update_mode=$update_mode \
@@ -183,6 +189,7 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.warmup_steps=$warmup_steps \
     +algorithm.hetero_distill.opd_top_k=$opd_top_k \
     +algorithm.hetero_distill.opd_parallel_student_base=$opd_parallel_student_base \
+    +algorithm.hetero_distill.cross_token_common_ratio_threshold=$cross_token_common_ratio_threshold \
     data.train_files=$train_files \
     data.val_files=$test_files \
     data.train_batch_size=256 \
@@ -224,7 +231,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.use_kl_loss=true \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     actor_rollout_ref.actor.loss_agg_mode="seq-mean-token-mean" \
     +actor_rollout_ref.actor.grpo_lr_scale=$grpo_lr_scale \

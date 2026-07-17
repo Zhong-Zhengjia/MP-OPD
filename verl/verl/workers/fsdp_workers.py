@@ -1446,6 +1446,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if not self._has_base_model:
             raise ValueError("Base model not initialized.")
         data = self._set_ref_log_prob_meta_info(data)
+        # The student base must score primary-tokenizer inputs.  Cross-tokenizer
+        # batches also contain ref_input_ids for the proxy models.
+        data.meta_info["use_ref_inputs"] = False
         data = data.to("cpu")
         if opd_top_k > 0:
             output = self.base_policy.compute_topk_log_probs_on_ids(data=data)
@@ -1478,6 +1481,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return output
         assert self._is_ref
         data = self._set_ref_log_prob_meta_info(data)
+        data.meta_info["use_ref_inputs"] = True
         data = data.to("cpu")
         if opd_top_k > 0:
             output = self.ref_policy.compute_topk_log_probs_on_ids(data=data)
@@ -1490,6 +1494,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if not self._has_base_ref_model:
             raise ValueError("Base ref model not initialized.")
         data = self._set_ref_log_prob_meta_info(data)
+        data.meta_info["use_ref_inputs"] = True
         data = data.to("cpu")
         if opd_top_k > 0:
             output = self.base_ref_policy.compute_topk_log_probs_on_ids(data=data)
@@ -1542,9 +1547,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             with adapter_ctx:
                 t_actor = time.perf_counter()
+                # ref_input_ids belongs exclusively to the proxy models.  Keep
+                # primary-tokenizer inputs for the student actor forward.
+                primary_data = self._shallow_copy_dataproto(data)
+                primary_data.meta_info["use_ref_inputs"] = False
                 if opd_top_k > 0:
                     entropys, topk_ids, actor_topk_lp = self.actor.compute_topk_ids_and_log_probs(
-                        data=data,
+                        data=primary_data,
                         top_k=opd_top_k,
                     )
                     output_tensors["student_topk_ids"] = topk_ids
@@ -1552,7 +1561,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     output_tensors["entropys"] = entropys
                     data = data.union(DataProto.from_dict(tensors={"student_topk_ids": topk_ids}))
                 else:
-                    old_lp, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                    old_lp, entropys = self.actor.compute_log_prob(data=primary_data, calculate_entropy=True)
                     output_tensors["old_log_probs"] = old_lp
                     output_tensors["entropys"] = entropys
                 timing_metrics["timing/opd_actor_forward_s"] = time.perf_counter() - t_actor

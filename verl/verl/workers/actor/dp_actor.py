@@ -110,8 +110,8 @@ class DataParallelPPOActor(BasePPOActor):
             self.scaler = None
 
     @staticmethod
-    def _append_ref_select_keys(select_keys: list[str], batch_keys) -> list[str]:
-        if "ref_input_ids" in batch_keys:
+    def _append_ref_select_keys(select_keys: list[str], batch_keys, use_ref_inputs: bool = True) -> list[str]:
+        if use_ref_inputs and "ref_input_ids" in batch_keys:
             select_keys.extend(["ref_input_ids", "ref_attention_mask", "ref_position_ids"])
             if "ref_responses" in batch_keys:
                 select_keys.append("ref_responses")
@@ -133,8 +133,8 @@ class DataParallelPPOActor(BasePPOActor):
         return_selected_log_probs=False,
         return_topk_log_probs=False,
         return_topk_with_log_probs=False,
+        use_ref_inputs: bool = False,
     ):
-        use_ref_inputs = "ref_input_ids" in micro_batch
         response_length = self._response_length_for_forward(micro_batch, use_ref_inputs)
         selected_ids = micro_batch.get("union_topk_ids", None)
         selected_mask = micro_batch.get("union_topk_mask", None)
@@ -151,7 +151,7 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
 
-            if "ref_input_ids" in micro_batch.keys():
+            if use_ref_inputs and "ref_input_ids" in micro_batch:
                 input_ids = micro_batch["ref_input_ids"]
                 attention_mask = micro_batch["ref_attention_mask"]
                 position_ids = micro_batch["ref_position_ids"]
@@ -652,9 +652,10 @@ class DataParallelPPOActor(BasePPOActor):
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         has_ref_input_ids = "ref_input_ids" in data.batch.keys()
+        use_ref_inputs = data.meta_info.get("use_ref_inputs", has_ref_input_ids)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
-        select_keys = self._append_ref_select_keys(select_keys, data.batch.keys())
+        select_keys = self._append_ref_select_keys(select_keys, data.batch.keys(), use_ref_inputs=use_ref_inputs)
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -672,7 +673,10 @@ class DataParallelPPOActor(BasePPOActor):
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    use_ref_inputs=use_ref_inputs,
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
