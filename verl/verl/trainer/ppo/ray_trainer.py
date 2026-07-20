@@ -1685,7 +1685,7 @@ class RayPPOTrainer:
         modulation[valid] = (1.0 - importance[valid] + epsilon) / (1.0 - mean_importance + epsilon)
         
         # Clip and re-normalize to prevent extreme amplification
-        max_mod = float(pace_cfg.get("pace_micro_max_modulation", 5.0))
+        max_mod = float(pace_cfg.get("pace_micro_max_modulation", 5.0)) # TODO: To be checked
         modulation[valid] = torch.clamp(modulation[valid], max=max_mod)
         mod_mean = modulation[valid].mean()
         modulation[valid] = modulation[valid] / (mod_mean + epsilon)

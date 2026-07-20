@@ -53,7 +53,6 @@ export MATH_VERIFY_SERVER_URL
 
 test_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/MathTestTotal/test.parquet
 train_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_80_percent.parquet
-pace_val_files=null
 
 student_model_path="/mnt/phwfile/datafrontier/public_models/${student_model_name}"
 teacher_model_path="/mnt/phwfile/datafrontier/public_models/${teacher_model_name}"
@@ -71,27 +70,6 @@ opd_lr_scale=1.0
 # cross-tokenizer PUST must use full-vocab token log prob (no top-k id sharing across vocabs)
 opd_top_k=0
 lambda_vals=1.0    # lambda value for the lambda-based reward function
-
-# PACE adaptive anchoring. Defaults retain the legacy fixed-lambda PUST path.
-# Ablations: fixed micro=(true,true,false); macro only=(true,false,true);
-# full PACE=(true,true,true).
-pace_enable=false
-pace_micro_enable=false
-pace_macro_enable=false
-pace_lambda0_init=$lambda_vals
-pace_lambda_min=0.1
-pace_lambda_max=10.0
-pace_beta1=0.9
-pace_beta2=0.99
-pace_eta=0.1
-pace_update_interval=1
-# Macro signal: rollout (default) or validation. With validation, data.pace_val_files
-# should be the manually sampled held-out subset and trainer.best_metric_name
-# is reused as the PACE progress signal.
-pace_reward_source=rollout
-pace_validation_n=8
-pace_validation_metric="val-core/${val_metric_group}/reward/mean@${pace_validation_n}"
-pace_micro_max_modulation=5.0
 
 student_rollout_n=1
 
@@ -213,7 +191,6 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.cross_token_common_ratio_threshold=$cross_token_common_ratio_threshold \
     data.train_files=$train_files \
     data.val_files=$test_files \
-    data.pace_val_files=$pace_val_files \
     data.train_batch_size=256 \
     data.max_prompt_length=1024 \
     data.max_response_length=16384 \
@@ -260,20 +237,6 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.actor.grpo_lr_scale=$grpo_lr_scale \
     +actor_rollout_ref.actor.opd_lr_scale=$opd_lr_scale \
     actor_rollout_ref.actor.policy_loss.lambda_vals=$lambda_vals \
-    actor_rollout_ref.actor.policy_loss.pace_enable=$pace_enable \
-    actor_rollout_ref.actor.policy_loss.pace_micro_enable=$pace_micro_enable \
-    actor_rollout_ref.actor.policy_loss.pace_macro_enable=$pace_macro_enable \
-    actor_rollout_ref.actor.policy_loss.pace_lambda0_init=$pace_lambda0_init \
-    actor_rollout_ref.actor.policy_loss.pace_lambda_min=$pace_lambda_min \
-    actor_rollout_ref.actor.policy_loss.pace_lambda_max=$pace_lambda_max \
-    actor_rollout_ref.actor.policy_loss.pace_beta1=$pace_beta1 \
-    actor_rollout_ref.actor.policy_loss.pace_beta2=$pace_beta2 \
-    actor_rollout_ref.actor.policy_loss.pace_eta=$pace_eta \
-    actor_rollout_ref.actor.policy_loss.pace_update_interval=$pace_update_interval \
-    actor_rollout_ref.actor.policy_loss.pace_reward_source=$pace_reward_source \
-    actor_rollout_ref.actor.policy_loss.pace_validation_n=$pace_validation_n \
-    actor_rollout_ref.actor.policy_loss.pace_validation_metric=$pace_validation_metric \
-    actor_rollout_ref.actor.policy_loss.pace_micro_max_modulation=$pace_micro_max_modulation \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=false \
     reward_model.reward_manager=naive \
