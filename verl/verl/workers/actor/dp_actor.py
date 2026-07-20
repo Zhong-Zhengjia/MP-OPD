@@ -1098,16 +1098,19 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("student_topk_ids")
         if "cross_token_opd_mask" in data.batch.keys():
             select_keys.append("cross_token_opd_mask")
+        has_pace_token_lambda = "pace_token_lambda" in data.batch.keys()
+        if has_pace_token_lambda:
+            select_keys.append("pace_token_lambda")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
         mini_batches = data.split(self.config.ppo_mini_batch_size)
-        mini_batches = [
-            mb for mb in mini_batches
-            if mb.batch.batch_size[0] == self.config.ppo_mini_batch_size
-        ]
+        # mini_batches = [
+        #     mb for mb in mini_batches
+        #     if mb.batch.batch_size[0] == self.config.ppo_mini_batch_size
+        # ]
 
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
         entropy_coeff = self.config.entropy_coeff
@@ -1156,7 +1159,12 @@ class DataParallelPPOActor(BasePPOActor):
                     old_log_prob = model_inputs["old_log_probs"].detach()
                     base_log_probs = model_inputs["base_log_probs"].detach()
 
-                    advantages = teacher_log_probs - teacher_base_log_probs - lambda_vals * (old_log_prob - base_log_probs)
+                    anchor_delta = old_log_prob - base_log_probs
+                    if has_pace_token_lambda:
+                        token_lambda = model_inputs["pace_token_lambda"].detach()
+                        advantages = teacher_log_probs - teacher_base_log_probs - token_lambda * anchor_delta
+                    else:
+                        advantages = teacher_log_probs - teacher_base_log_probs - lambda_vals * anchor_delta
                     # advantages = teacher_log_probs - teacher_base_log_probs   # extreme update
                     advantages = advantages.detach()
 
@@ -1167,6 +1175,10 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics["actor/opd_cross_token_mask_ratio"] = (
                             cross_token_mask.sum() / response_mask.sum().clamp(min=1)
                         ).item()
+                    if has_pace_token_lambda:
+                        micro_batch_metrics["actor/pace_token_lambda_mean"] = (
+                            token_lambda * policy_mask
+                        ).sum().div(policy_mask.sum().clamp(min=1)).item()
 
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size

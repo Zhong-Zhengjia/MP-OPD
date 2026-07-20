@@ -55,6 +55,46 @@ class PolicyLossConfig(BaseConfig):
     only_reverse_kl_advantages: bool = False
     lambda_vals: float = 1.0
     multi_teacher_distill: bool = False
+    # PACE keeps the legacy scalar lambda path unchanged unless explicitly enabled.
+    # The micro controller redistributes lambda across response tokens, while the
+    # macro controller adjusts its global baseline from rollout reward changes.
+    pace_enable: bool = False
+    pace_micro_enable: bool = False
+    pace_macro_enable: bool = False
+    pace_lambda0_init: float = 1.0
+    pace_lambda_min: float = 0.1
+    pace_lambda_max: float = 10.0
+    pace_beta1: float = 0.9
+    pace_beta2: float = 0.99
+    pace_eta: float = 0.1
+    pace_update_interval: int = 1
+    pace_epsilon: float = 1e-8
+    # Macro progress signal: "rollout" reuses training rollouts; "validation"
+    # runs data.pace_val_files and reads trainer.best_metric_name.
+    pace_reward_source: str = "rollout"
+    pace_validation_n: int = 8
+    pace_validation_metric: str = ""
+    pace_micro_max_modulation: float = 5.0
+
+    def __post_init__(self):
+        if self.pace_lambda_min <= 0:
+            raise ValueError("pace_lambda_min must be positive.")
+        if self.pace_lambda_max < self.pace_lambda_min:
+            raise ValueError("pace_lambda_max must be >= pace_lambda_min.")
+        if not 0 <= self.pace_beta1 < 1 or not 0 <= self.pace_beta2 < 1:
+            raise ValueError("pace_beta1 and pace_beta2 must be in [0, 1).")
+        if self.pace_eta < 0:
+            raise ValueError("pace_eta must be non-negative.")
+        if self.pace_update_interval <= 0:
+            raise ValueError("pace_update_interval must be positive.")
+        if self.pace_epsilon <= 0:
+            raise ValueError("pace_epsilon must be positive.")
+        if self.pace_reward_source not in {"rollout", "validation"}:
+            raise ValueError("pace_reward_source must be 'rollout' or 'validation'.")
+        if self.pace_validation_n <= 0:
+            raise ValueError("pace_validation_n must be positive.")
+        if self.pace_micro_max_modulation <= 1.0:
+            raise ValueError("pace_micro_max_modulation must be > 1.0.")
 
 
 @dataclass

@@ -484,6 +484,27 @@ class RayPPOTrainer:
             collate_fn=collate_fn,
         )
 
+        pace_val_files = self.config.data.get("pace_val_files", None)
+        if pace_val_files:
+            self.pace_val_dataset = create_rl_dataset(
+                pace_val_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                max_samples=self.config.data.get("val_max_samples", -1),
+            )
+            self.pace_val_dataloader = StatefulDataLoader(
+                dataset=self.pace_val_dataset,
+                batch_size=val_batch_size,
+                num_workers=num_workers,
+                shuffle=self.config.data.get("validation_shuffle", True),
+                drop_last=False,
+                collate_fn=collate_fn,
+            )
+        else:
+            self.pace_val_dataset = None
+            self.pace_val_dataloader = None
+
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
 
@@ -718,7 +739,7 @@ class RayPPOTrainer:
     def _topk_overlap_ratio(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return a.unsqueeze(-1).eq(b.unsqueeze(-2)).any(dim=-1).float().sum(dim=-1) / a.shape[-1]
 
-    def _validate(self):
+    def _validate(self, dataloader=None, val_n=None):
         validation_db_path = self._prepare_validation_db()
 
         data_source_lst = []
@@ -728,7 +749,10 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
 
-        val_n = int(self.config.actor_rollout_ref.rollout.val_kwargs.n)
+        if dataloader is None:
+            dataloader = self.val_dataloader
+        if val_n is None:
+            val_n = int(self.config.actor_rollout_ref.rollout.val_kwargs.n)
         if val_n <= 0:
             raise ValueError(f"val_kwargs.n must be positive, got {val_n}")
 
@@ -764,7 +788,7 @@ class RayPPOTrainer:
             conn.execute("BEGIN")
             pending_db_rows = 0
 
-            for test_data in self.val_dataloader:
+            for test_data in dataloader:
                 base_test_batch = DataProto.from_single_dict(test_data)
                 base_batch_size = len(base_test_batch.batch["input_ids"])
 
@@ -1225,6 +1249,8 @@ class RayPPOTrainer:
             "metric_name": best_metric_name,
             "metric_value": current_metric,
         }
+        if hasattr(self, "pace_enabled"):
+            meta["pace_state"] = self._pace_state_dict()
         torch.save(meta, os.path.join(local_ckpt_folder, "meta.pt"))
 
         local_latest_checkpointed_iteration = os.path.join(base_dir, "latest_checkpointed_iteration.txt")
@@ -1350,6 +1376,8 @@ class RayPPOTrainer:
         if os.path.exists(meta_path):
             meta = torch.load(meta_path, map_location="cpu", weights_only=False)
             self.global_steps = int(meta.get("global_steps", self.global_steps))
+            if hasattr(self, "pace_enabled"):
+                self._load_pace_state_dict(meta.get("pace_state", {}))
             print(f"Loaded trainer state: global_steps={self.global_steps}")
         else:
             print(f"Warning: trainer meta not found at {meta_path}; global_steps remains {self.global_steps}.")
@@ -1457,6 +1485,7 @@ class RayPPOTrainer:
 
     def _init_hetero_train_state(self):
         hetero_cfg = self.config.algorithm.get("hetero_distill", {})
+        pace_cfg = self.config.actor_rollout_ref.actor.policy_loss
 
         self.student_rollout_n = hetero_cfg.get("student_rollout_n", 8)
 
@@ -1475,6 +1504,213 @@ class RayPPOTrainer:
         self.actor_update_steps = 0
         self.grpo_update_steps = 0
         self.opd_update_steps = 0
+        self.pace_enabled = bool(pace_cfg.get("pace_enable", False))
+        self.pace_micro_enabled = self.pace_enabled and bool(pace_cfg.get("pace_micro_enable", False))
+        self.pace_macro_enabled = self.pace_enabled and bool(pace_cfg.get("pace_macro_enable", False))
+        self.pace_lambda0 = float(pace_cfg.get("pace_lambda0_init", pace_cfg.get("lambda_vals", 1.0)))
+        self.pace_m = 0.0
+        self.pace_v = 0.0
+        self.pace_prev_reward = None
+
+    def _pace_config(self):
+        return self.config.actor_rollout_ref.actor.policy_loss
+
+    def _pace_state_dict(self) -> dict:
+        return {
+            "enabled": self.pace_enabled,
+            "lambda0": self.pace_lambda0,
+            "m": self.pace_m,
+            "v": self.pace_v,
+            "prev_reward": self.pace_prev_reward,
+        }
+
+    def _load_pace_state_dict(self, state: dict) -> None:
+        if not self.pace_enabled or not state:
+            return
+        self.pace_lambda0 = float(state.get("lambda0", self.pace_lambda0))
+        self.pace_m = float(state.get("m", self.pace_m))
+        self.pace_v = float(state.get("v", self.pace_v))
+        prev_reward = state.get("prev_reward", self.pace_prev_reward)
+        self.pace_prev_reward = None if prev_reward is None else float(prev_reward)
+
+    def _maybe_update_pace_from_validation(self, metrics: dict) -> None:
+        """Run held-out validation at PACE's interval, before an OPD update."""
+        if not self.pace_enabled or not self.pace_macro_enabled:
+            return
+
+        pace_cfg = self._pace_config()
+        if pace_cfg.get("pace_reward_source", "rollout") != "validation":
+            return
+        if self.global_steps % int(pace_cfg.get("pace_update_interval", 1)) != 0:
+            metrics["pace/controller_update"] = 0.0
+            return
+
+        if not hasattr(self, "pace_val_dataloader") or self.pace_val_dataloader is None:
+            raise ValueError("PACE validation dataloader is not initialized. Please provide data.pace_val_files in config.")
+
+        pace_val_n = int(pace_cfg.get("pace_validation_n", 8))
+        validation_metrics = self._validate(dataloader=self.pace_val_dataloader, val_n=pace_val_n)
+        
+        # Add prefix so it doesn't pollute the main metrics
+        metrics.update({f"pace-val/{k}": v for k, v in validation_metrics.items()})
+        
+        metric_name = pace_cfg.get("pace_validation_metric", "")
+        if not metric_name:
+            raise ValueError("pace_validation_metric must be set when pace_reward_source='validation'")
+            
+        if metric_name not in validation_metrics:
+            available = ", ".join(sorted(validation_metrics))
+            raise KeyError(
+                f"PACE validation reward metric '{metric_name}' (pace_validation_metric) "
+                f"was not produced by _validate(). Available: {available}"
+            )
+        metrics["pace/progress_source_validation"] = 1.0
+        metrics["pace/validation_reward"] = float(validation_metrics[metric_name])
+        self._update_pace_controller(metrics["pace/validation_reward"], metrics)
+
+    def _update_pace_controller(self, reward: float, metrics: dict) -> None:
+        """Update PACE's global lambda baseline from a sampled rollout reward."""
+        if not self.pace_enabled:
+            return
+
+        pace_cfg = self._pace_config()
+        metrics["pace/lambda0"] = self.pace_lambda0
+        metrics["pace/macro_enabled"] = float(self.pace_macro_enabled)
+        if not self.pace_macro_enabled:
+            return
+
+        interval = int(pace_cfg.get("pace_update_interval", 1))
+        if self.global_steps % interval != 0:
+            metrics["pace/controller_update"] = 0.0
+            return
+
+        reward = float(reward)
+        metrics["pace/reward"] = reward
+        if self.pace_prev_reward is None:
+            self.pace_prev_reward = reward
+            metrics["pace/controller_update"] = 0.0
+            return
+
+        epsilon = float(pace_cfg.get("pace_epsilon", 1e-8))
+        delta = (reward - self.pace_prev_reward) / (abs(self.pace_prev_reward) + epsilon)
+        beta1 = float(pace_cfg.get("pace_beta1", 0.9))
+        beta2 = float(pace_cfg.get("pace_beta2", 0.99))
+        self.pace_m = beta1 * self.pace_m + (1.0 - beta1) * delta
+        self.pace_v = beta2 * self.pace_v + (1.0 - beta2) * delta * delta
+        # SNR is the signed, noise-normalized reward-improvement trend:
+        # positive => stable improvement; negative => degradation. The exponent
+        # maps that trend multiplicatively onto lambda0; it intentionally matches
+        # the proposal without an extra clip. lambda_min/max bound lambda0 itself.
+        snr = self.pace_m / (np.sqrt(self.pace_v) + epsilon)
+        exponent = -float(pace_cfg.get("pace_eta", 0.1)) * snr
+        self.pace_lambda0 = float(
+            np.clip(
+                self.pace_lambda0 * np.exp(exponent),
+                float(pace_cfg.get("pace_lambda_min", 0.1)),
+                float(pace_cfg.get("pace_lambda_max", 10.0)),
+            )
+        )
+        self.pace_prev_reward = reward
+        metrics.update(
+            {
+                "pace/controller_update": 1.0,
+                "pace/reward_delta": delta,
+                "pace/reward_snr": snr,
+                "pace/lambda0": self.pace_lambda0,
+                "pace/m": self.pace_m,
+                "pace/v": self.pace_v,
+            }
+        )
+
+    def _apply_pace_micro_reweight(self, batch: DataProto) -> dict[str, float]:
+        """Attach batch-conserving token lambda values for the PUST anchor term."""
+        if not self.pace_enabled or (not self.pace_micro_enabled and not self.pace_macro_enabled):
+            return {}
+
+        pace_cfg = self._pace_config()
+        response_mask = batch.batch["response_mask"].float()
+        # response_mask excludes padding. Cross-token PUST additionally excludes
+        # primary positions that cannot be aligned to a proxy token. Only these
+        # positions participate in OPD loss or in PACE batch statistics.
+        policy_mask = response_mask
+        if "cross_token_opd_mask" in batch.batch:
+            policy_mask = policy_mask * batch.batch["cross_token_opd_mask"].to(dtype=policy_mask.dtype)
+
+        if not self.pace_micro_enabled:
+            token_lambda = torch.full_like(policy_mask, self.pace_lambda0)
+            batch.batch["pace_token_lambda"] = token_lambda
+            return {
+                "pace/enabled": 1.0,
+                "pace/micro_enabled": 0.0,
+                "pace/lambda0": self.pace_lambda0,
+                "pace/token_lambda_mean": self.pace_lambda0,
+            }
+
+        epsilon = float(pace_cfg.get("pace_epsilon", 1e-8))
+        # Select only loss-bearing positions: padding/alignment-excluded tokens
+        # must not affect MinMax ranges, mean importance, or the lambda budget.
+        valid = policy_mask > 0
+        if not torch.any(valid):
+            batch.batch["pace_token_lambda"] = torch.full_like(policy_mask, self.pace_lambda0)
+            return {
+                "pace/enabled": 1.0,
+                "pace/micro_enabled": 1.0,
+                "pace/empty_valid_mask": 1.0,
+                "pace/lambda0": self.pace_lambda0,
+            }
+
+        entropy = batch.batch["entropys"].detach().float()
+        # TODO(PACE): for a shared tokenizer, replace this scalar proxy with
+        # KL(pi_student || pi_teacher) from full distributions when available.
+        # Cross-tokenizer PUST only aligns log-probabilities of corresponding
+        # token positions; its teacher and student vocabularies differ, so the
+        # full distributions are defined over different event spaces and an
+        # exact token-level KL cannot be computed without a vocabulary mapping.
+        disagreement = (batch.batch["old_log_probs"] - batch.batch["teacher_log_probs"]).detach().float().abs()
+
+        def _minmax(values: torch.Tensor) -> torch.Tensor:
+            selected = values[valid]
+            return (values - selected.min()) / (selected.max() - selected.min() + epsilon)
+
+        entropy_hat = _minmax(entropy)
+        disagreement_hat = _minmax(disagreement)
+        importance = entropy_hat + disagreement_hat - entropy_hat * disagreement_hat # Reference: https://arxiv.org/pdf/2604.14084
+        mean_importance = importance[valid].mean()
+        # Initialize excluded positions to one; they never enter the loss.
+        # For valid positions, g_t=(1-s_t+eps)/(1-mean(s)+eps), so its batch
+        # mean is exactly one up to floating-point rounding. This line alone
+        # does not ensure conservation; the following valid-position assignment
+        # and denominator containing mean_importance do.
+        modulation = torch.ones_like(importance)
+        modulation[valid] = (1.0 - importance[valid] + epsilon) / (1.0 - mean_importance + epsilon)
+        
+        # Clip and re-normalize to prevent extreme amplification
+        max_mod = float(pace_cfg.get("pace_micro_max_modulation", 5.0))
+        modulation[valid] = torch.clamp(modulation[valid], max=max_mod)
+        mod_mean = modulation[valid].mean()
+        modulation[valid] = modulation[valid] / (mod_mean + epsilon)
+        
+        token_lambda = self.pace_lambda0 * modulation
+        batch.batch["pace_token_lambda"] = token_lambda.to(dtype=batch.batch["old_log_probs"].dtype)
+
+        valid_lambda = token_lambda[valid].float()
+        res = {
+            "pace/enabled": 1.0,
+            "pace/micro_enabled": 1.0,
+            "pace/lambda0": self.pace_lambda0,
+            "pace/importance_mean": mean_importance.item(),
+            "pace/modulation_mean": modulation[valid].mean().item(),
+            "pace/modulation_std": modulation[valid].std(unbiased=False).item(),
+            "pace/token_lambda_mean": valid_lambda.mean().item(),
+            "pace/token_lambda_max": valid_lambda.max().item(),
+            "pace/token_lambda_min": valid_lambda.min().item(),
+            "pace/disagreement_proxy_mean": disagreement[valid].mean().item(),
+            "pace/entropy_mean": entropy[valid].mean().item(),
+        }
+        if valid_lambda.numel() > 0:
+            res["pace/token_lambda_p90"] = torch.quantile(valid_lambda, 0.90).item()
+            res["pace/token_lambda_p99"] = torch.quantile(valid_lambda, 0.99).item()
+        return res
 
 
     def _build_hetero_train_batches(
@@ -1983,6 +2219,14 @@ class RayPPOTrainer:
                 metrics["hetero/student_rollout_correct_mean"] = student_reward_flat.mean().item()
                 metrics["hetero/student_rollout_correct_std"] = student_reward.std(unbiased=False).item()
                 metrics["hetero/student_rollout_correct_group_mean_std"] = student_rollout_correct_group_mean_std
+                if self._pace_config().get("pace_reward_source", "rollout") == "rollout":
+                    metrics["pace/progress_source_rollout"] = 1.0
+                    self._update_pace_controller(metrics["hetero/student_rollout_correct_mean"], metrics)
+                else:
+                    # Validation is deliberately deferred until after rollout
+                    # batch construction and immediately before OPD preparation.
+                    # That makes the updated lambda0 apply to this OPD update.
+                    metrics["pace/progress_source_rollout"] = 0.0
 
                 # =========================
                 # 4) build distillation batch
@@ -2057,8 +2301,10 @@ class RayPPOTrainer:
                         if update_batch is not None and len(update_batch) > 0:
                             print("[DEBUG] OPD UPDATE START.")
 
+                            self._maybe_update_pace_from_validation(metrics)
                             update_batch, opd_prep_timing = self._prepare_opd_update_batch(update_batch)
                             metrics.update({f"opd/{k}": v for k, v in opd_prep_timing.items()})
+                            metrics.update(self._apply_pace_micro_reweight(update_batch))
                             self._add_entropy_metrics(
                                 metrics=metrics,
                                 batch=update_batch,

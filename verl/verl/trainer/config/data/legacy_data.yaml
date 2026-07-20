@@ -13,6 +13,9 @@ train_files: ~/data/rlhf/gsm8k/train.parquet
 # Validation parquet. Can be a list or a single file.
 val_files: ~/data/rlhf/gsm8k/test.parquet
 
+# Separate validation parquet for PACE macro controller. Can be a list or a single file.
+pace_val_files: null
+
 # Maximum sample length to be used.
 # Set to -1 to use full dataset, otherwise, randomly
 # select the specified number of samples from train dataset

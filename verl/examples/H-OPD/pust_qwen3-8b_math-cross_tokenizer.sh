@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=e05-m-cross25
-#SBATCH --output=logs/w2s_math/slurm_math_cross_qwen25_proxy_%j.out
-#SBATCH --error=logs/w2s_math/slurm_math_cross_qwen25_proxy_%j.err
+#SBATCH --job-name=e05-m-cross_Skywork-OR1-Math-7B
+#SBATCH --output=logs/w2s_math/slurm_math_cross_Skywork-OR1-Math-7B_%j.out
+#SBATCH --error=logs/w2s_math/slurm_math_cross_Skywork-OR1-Math-7B_%j.err
 #SBATCH --chdir=/mnt/petrelfs/wurong/workspace/RM-OPD
 #SBATCH --account=research
 #SBATCH --partition=DataFrontier_Explore
@@ -17,7 +17,6 @@
 set -x
 export PYTHONUNBUFFERED=1
 export RAY_DEDUP_LOGS=0
-export CUDA_LAUNCH_BLOCKING=1
 export NCCL_DEBUG=WARN
 export NCCL_TIMEOUT=7200
 export TORCH_DISTRIBUTED_DEBUG=INFO
@@ -32,10 +31,10 @@ export WANDB_MODE=online
 export USED_MODEL="no_api"
 
 student_model_name="Qwen3-8B"
-teacher_model_name="Qwen2.5-Math-7B" # proxy expert
+teacher_model_name="Skywork-OR1-Math-7B" # proxy expert
 teacher_base_model_name="Qwen2.5-7B"           # proxy base
 student_tag="Qwen3-8B"
-teacher_tag="2.5_Math7B"
+teacher_tag="Skywork-OR1-Math-7B"
 ability=Math
 
 # sbatch copies the script to /var/spool/slurmd/...; BASH_SOURCE is unreliable there.
@@ -54,6 +53,7 @@ export MATH_VERIFY_SERVER_URL
 
 test_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/MathTestTotal/test.parquet
 train_files=/mnt/phwfile/datafrontier/fudaocheng/datasets/G-OPD-Training-Data/DeepMath-103K/train_80_percent.parquet
+pace_val_files=null
 
 student_model_path="/mnt/phwfile/datafrontier/public_models/${student_model_name}"
 teacher_model_path="/mnt/phwfile/datafrontier/public_models/${teacher_model_name}"
@@ -72,10 +72,31 @@ opd_lr_scale=1.0
 opd_top_k=0
 lambda_vals=1.0    # lambda value for the lambda-based reward function
 
+# PACE adaptive anchoring. Defaults retain the legacy fixed-lambda PUST path.
+# Ablations: fixed micro=(true,true,false); macro only=(true,false,true);
+# full PACE=(true,true,true).
+pace_enable=false
+pace_micro_enable=false
+pace_macro_enable=false
+pace_lambda0_init=$lambda_vals
+pace_lambda_min=0.1
+pace_lambda_max=10.0
+pace_beta1=0.9
+pace_beta2=0.99
+pace_eta=0.1
+pace_update_interval=1
+# Macro signal: rollout (default) or validation. With validation, data.pace_val_files
+# should be the manually sampled held-out subset and trainer.best_metric_name
+# is reused as the PACE progress signal.
+pace_reward_source=rollout
+pace_validation_n=8
+pace_validation_metric="val-core/${val_metric_group}/reward/mean@${pace_validation_n}"
+pace_micro_max_modulation=5.0
+
 student_rollout_n=1
 
 # actor param offload: false when GPU memory allows (skips actor CPU<->GPU each step)
-actor_param_offload=true
+actor_param_offload=false
 
 # parallel OPD prep: student-base + teacher + teacher-base forwards overlap
 opd_parallel_student_base=false
@@ -192,6 +213,7 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.cross_token_common_ratio_threshold=$cross_token_common_ratio_threshold \
     data.train_files=$train_files \
     data.val_files=$test_files \
+    data.pace_val_files=$pace_val_files \
     data.train_batch_size=256 \
     data.max_prompt_length=1024 \
     data.max_response_length=16384 \
@@ -210,6 +232,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=true \
     actor_rollout_ref.actor.ppo_mini_batch_size=1024 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.use_dynamic_bsz=true \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768 \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.actor.fsdp_config.param_offload=$actor_param_offload \
@@ -237,6 +260,20 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.actor.grpo_lr_scale=$grpo_lr_scale \
     +actor_rollout_ref.actor.opd_lr_scale=$opd_lr_scale \
     actor_rollout_ref.actor.policy_loss.lambda_vals=$lambda_vals \
+    actor_rollout_ref.actor.policy_loss.pace_enable=$pace_enable \
+    actor_rollout_ref.actor.policy_loss.pace_micro_enable=$pace_micro_enable \
+    actor_rollout_ref.actor.policy_loss.pace_macro_enable=$pace_macro_enable \
+    actor_rollout_ref.actor.policy_loss.pace_lambda0_init=$pace_lambda0_init \
+    actor_rollout_ref.actor.policy_loss.pace_lambda_min=$pace_lambda_min \
+    actor_rollout_ref.actor.policy_loss.pace_lambda_max=$pace_lambda_max \
+    actor_rollout_ref.actor.policy_loss.pace_beta1=$pace_beta1 \
+    actor_rollout_ref.actor.policy_loss.pace_beta2=$pace_beta2 \
+    actor_rollout_ref.actor.policy_loss.pace_eta=$pace_eta \
+    actor_rollout_ref.actor.policy_loss.pace_update_interval=$pace_update_interval \
+    actor_rollout_ref.actor.policy_loss.pace_reward_source=$pace_reward_source \
+    actor_rollout_ref.actor.policy_loss.pace_validation_n=$pace_validation_n \
+    actor_rollout_ref.actor.policy_loss.pace_validation_metric=$pace_validation_metric \
+    actor_rollout_ref.actor.policy_loss.pace_micro_max_modulation=$pace_micro_max_modulation \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=false \
     reward_model.reward_manager=naive \

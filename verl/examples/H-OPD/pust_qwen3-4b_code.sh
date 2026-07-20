@@ -2,7 +2,7 @@
 #SBATCH --job-name=e04-w2s_code
 #SBATCH --output=logs/w2s_code/slurm_code_%j.out
 #SBATCH --error=logs/w2s_code/slurm_code_%j.err
-#SBATCH --chdir=/mnt/phwfile/datafrontier/wurong/code/RM-OPD
+#SBATCH --chdir=/mnt/petrelfs/wurong/workspace/RM-OPD
 #SBATCH --account=research
 #SBATCH --partition=DataFrontier_Explore
 #SBATCH --gres=gpu:8
@@ -37,6 +37,8 @@ teacher_base_model_name="Qwen3-4B"                         # proxy base
 student_tag="Qwen3-8B"
 teacher_tag="4B_CodeRL"
 ability=Code
+
+student_rollout_n=1
 
 # sbatch copies the script to /var/spool/slurmd/...; BASH_SOURCE is unreliable there.
 # SLURM_SUBMIT_DIR is the directory where sbatch was invoked (repo root).
@@ -135,7 +137,7 @@ batch_size_to_bool() {
     fi
 }
 
-output_model_name="${student_tag}-T${teacher_tag}_Lam${lambda_vals}"
+output_model_name="${student_tag}-T${teacher_tag}_Lam${lambda_vals}-n${student_rollout_n}"
 
 resume_args=()
 if [[ -n "$resume_path" ]]; then
@@ -171,7 +173,7 @@ mkdir -p "${RAY_TMPDIR}"
 
 python3 -m verl.trainer.main_ppo \
     +algorithm.train_mode=heterogeneous_distill \
-    +algorithm.hetero_distill.student_rollout_n=8 \
+    +algorithm.hetero_distill.student_rollout_n=$student_rollout_n \
     +algorithm.hetero_distill.use_grpo=$use_grpo \
     +algorithm.hetero_distill.use_opd=$use_opd \
     +algorithm.hetero_distill.update_mode=$update_mode \

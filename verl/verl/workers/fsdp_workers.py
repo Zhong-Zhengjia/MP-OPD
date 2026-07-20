@@ -1606,15 +1606,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     output_tensors["base_log_probs"], base_dt = _run_timed(
                         self._compute_base_log_probs_opd, base_data
                     )
-                    t_proxy = time.perf_counter()
-                    with ThreadPoolExecutor(max_workers=2) as executor:
-                        ref_future = executor.submit(_run_timed, self._compute_ref_log_probs_opd, ref_data)
-                        base_ref_future = executor.submit(
-                            _run_timed, self._compute_base_ref_log_probs_opd, base_ref_data
-                        )
-                        output_tensors["teacher_log_probs"], ref_dt = ref_future.result()
-                        output_tensors["teacher_base_log_probs"], base_ref_dt = base_ref_future.result()
-                    timing_metrics["timing/opd_proxy_parallel_wall_s"] = time.perf_counter() - t_proxy
+                    # All models share the same FSDP/NCCL process group.  Do not
+                    # issue teacher and teacher-base forwards from separate
+                    # threads here: ranks can enter collectives in different
+                    # orders and deadlock.  `parallel_student_base=False` must
+                    # therefore disable *all* proxy-model concurrency.
+                    output_tensors["teacher_log_probs"], ref_dt = _run_timed(
+                        self._compute_ref_log_probs_opd, ref_data
+                    )
+                    output_tensors["teacher_base_log_probs"], base_ref_dt = _run_timed(
+                        self._compute_base_ref_log_probs_opd, base_ref_data
+                    )
+                    timing_metrics["timing/opd_proxy_parallel_wall_s"] = 0.0
 
                 timing_metrics["timing/opd_base_forward_s"] = base_dt
                 timing_metrics["timing/opd_ref_forward_s"] = ref_dt

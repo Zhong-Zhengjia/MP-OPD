@@ -78,6 +78,28 @@ policy_loss:
   # If true, uses multi-teacher distillation path (requires opd_teacher field in data)
   multi_teacher_distill: false
 
+  # PACE: adaptive PUST anchoring. Disabled by default to preserve legacy OPD.
+  pace_enable: false
+  # Token-level Soft-OR redistribution of the PUST anchor coefficient.
+  pace_micro_enable: false
+  # Adam-style controller driven by the training rollout reward.
+  pace_macro_enable: false
+  pace_lambda0_init: 1.0
+  pace_lambda_min: 0.1
+  pace_lambda_max: 10.0
+  pace_beta1: 0.9
+  pace_beta2: 0.99
+  pace_eta: 0.1
+  pace_update_interval: 1
+  # Numerical protection only; it is not intended for tuning.
+  pace_epsilon: 1.0e-8
+  # "rollout" reuses training rollouts; "validation" evaluates data.pace_val_files
+  # before the OPD update and reads trainer.best_metric_name.
+  pace_reward_source: rollout
+  pace_validation_n: 8
+  pace_validation_metric: ""
+  pace_micro_max_modulation: 5.0
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
