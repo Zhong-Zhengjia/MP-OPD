@@ -47,7 +47,7 @@ VERL_ROOT="${REPO_ROOT}/verl"
 cd "${VERL_ROOT}"
 export PYTHONPATH="${VERL_ROOT}:${PYTHONPATH:-}"
 
-dataset_root="${REPO_ROOT}/data/g_opd"
+dataset_root="${REPO_ROOT}/data/opd/training/g_opd"
 train_files=${dataset_root}/Eurus/code_train.parquet
 test_files=${dataset_root}/Eurus/code_validation.parquet
 code_reward_path=${VERL_ROOT}/verl/utils/reward_score/code_eval_reward/__init__.py

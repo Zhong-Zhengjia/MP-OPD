@@ -2219,14 +2219,15 @@ class RayPPOTrainer:
                 metrics["hetero/student_rollout_correct_mean"] = student_reward_flat.mean().item()
                 metrics["hetero/student_rollout_correct_std"] = student_reward.std(unbiased=False).item()
                 metrics["hetero/student_rollout_correct_group_mean_std"] = student_rollout_correct_group_mean_std
-                if self._pace_config().get("pace_reward_source", "rollout") == "rollout":
-                    metrics["pace/progress_source_rollout"] = 1.0
-                    self._update_pace_controller(metrics["hetero/student_rollout_correct_mean"], metrics)
-                else:
-                    # Validation is deliberately deferred until after rollout
-                    # batch construction and immediately before OPD preparation.
-                    # That makes the updated lambda0 apply to this OPD update.
-                    metrics["pace/progress_source_rollout"] = 0.0
+                if self.pace_enabled and self.pace_macro_enabled:
+                    if self._pace_config().get("pace_reward_source", "rollout") == "rollout":
+                        metrics["pace/progress_source_rollout"] = 1.0
+                        self._update_pace_controller(metrics["hetero/student_rollout_correct_mean"], metrics)
+                    else:
+                        # Validation is deliberately deferred until after rollout
+                        # batch construction and immediately before OPD preparation.
+                        # That makes the updated lambda0 apply to this OPD update.
+                        metrics["pace/progress_source_rollout"] = 0.0
 
                 # =========================
                 # 4) build distillation batch
