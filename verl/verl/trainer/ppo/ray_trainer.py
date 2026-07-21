@@ -2088,10 +2088,12 @@ class RayPPOTrainer:
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="HeteroDistill Progress")
         self.global_steps += 1
         last_val_metrics = None
+        self.max_steps_duration = 0
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
+                timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -2155,205 +2157,223 @@ class RayPPOTrainer:
                     "global_steps": self.global_steps,
                 }
 
+                with marked_timer("step", timing_raw):
+                    with marked_timer("gen", timing_raw, color="red"):
+                        student_rollout_batch = self.actor_rollout_wg.generate_sequences(student_gen_batch)
 
-                rollout_start = time.time()
-                student_rollout_batch = self.actor_rollout_wg.generate_sequences(student_gen_batch)
-                rollout_end = time.time()
+                    student_batch = student_rollout_batch
+                    student_batch = self._ensure_response_mask(student_batch)
+                    student_batch.meta_info["global_token_num"] = torch.sum(
+                        student_batch.batch["attention_mask"], dim=-1
+                    ).tolist()
 
-                print(f"[DEBUG] Student rollout time cost: {rollout_end-rollout_start} s")
+                    student_response_len = student_batch.batch["response_mask"].sum(dim=-1).float().mean().item()
+                    metrics["hetero/student_response_length_mean"] = student_response_len
 
-                student_batch = student_rollout_batch
-                student_batch = self._ensure_response_mask(student_batch)
+                    # ======Rollout Debug Start ======
+                    student_batch_size = len(student_batch.batch["prompts"])
+                    print(f'[DEBUG] Student rollout batch size: {student_batch_size}')
+                    print(f'[DEBUG] Student average response length: {student_response_len}')
+                    print(f"[DEBUG] Student rollout time cost: {timing_raw.get('gen', 0.0)} s")
 
-                student_response_len = student_batch.batch["response_mask"].sum(dim=-1).float().mean().item()
-                metrics["hetero/student_response_length_mean"] = student_response_len
+                    i= 0
+                    prompt_ids = student_batch.batch["prompts"][i]
+                    prompt_length = prompt_ids.shape[0]
+                    attention_mask = student_batch.batch["attention_mask"][i]
+                    response_ids = student_batch.batch["responses"][i]
+                    valid_response_length = attention_mask[prompt_length:].sum().item()
+                    valid_response_ids = response_ids[:valid_response_length]
+                    response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
+                    print("[DEBUG] Student response_text:")
+                    print(repr(response_text))
 
-                # ======Rollout Debug Start ======
-                student_batch_size = len(student_batch.batch["prompts"])
-                print(f'[DEBUG] Student rollout batch size: {student_batch_size}')
-                print(f'[DEBUG] Student average response length: {student_response_len}')
+                    now = datetime.now()
+                    print('[DEBUG] current time: ', now.strftime('%Y-%m-%d %H:%M:%S'))
+                    # ======Rollout Debug End ======
 
-                i= 0
-                prompt_ids = student_batch.batch["prompts"][i]
-                prompt_length = prompt_ids.shape[0]
-                attention_mask = student_batch.batch["attention_mask"][i]
-                response_ids = student_batch.batch["responses"][i]
-                valid_response_length = attention_mask[prompt_length:].sum().item()
-                valid_response_ids = response_ids[:valid_response_length]
-                response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
-                print("[DEBUG] Student response_text:")
-                print(repr(response_text))
+                    # =========================
+                    # 3) reward / correctness
+                    # =========================
+                    with marked_timer("reward", timing_raw, color="yellow"):
+                        student_reward_tensor, student_reward_extra_infos = compute_reward(
+                            student_batch, self.reward_fn
+                        )
+                    student_reward = self._compute_binary_correctness_from_reward_tensor(
+                        student_reward_tensor
+                    ).float()
+                    student_batch.batch["reward"] = student_reward
 
-                now = datetime.now()
-                print('[DEBUG] current time: ', now.strftime('%Y-%m-%d %H:%M:%S'))
-                # ======Rollout Debug End ======
+                    from collections import defaultdict
 
+                    student_reward_flat = student_reward.detach().float().view(-1).cpu()
+                    uids = student_batch.non_tensor_batch["uid"]
 
-                # =========================
-                # 3) reward / correctness
-                # =========================
-                student_reward_tensor, student_reward_extra_infos = compute_reward(student_batch, self.reward_fn)
-                student_reward = self._compute_binary_correctness_from_reward_tensor(student_reward_tensor).float()
-                student_batch.batch["reward"] = student_reward
+                    uid_to_indices = defaultdict(list)
+                    for idx, uid in enumerate(uids):
+                        uid_to_indices[str(uid)].append(idx)
 
+                    group_stds = []
+                    for indices in uid_to_indices.values():
+                        group_rewards = student_reward_flat[indices]
+                        group_stds.append(group_rewards.std(unbiased=False))
 
-                from collections import defaultdict
-
-                student_reward_flat = student_reward.detach().float().view(-1).cpu()
-                uids = student_batch.non_tensor_batch["uid"]
-
-                uid_to_indices = defaultdict(list)
-                for idx, uid in enumerate(uids):
-                    uid_to_indices[str(uid)].append(idx)
-
-                group_stds = []
-                for indices in uid_to_indices.values():
-                    group_rewards = student_reward_flat[indices]
-                    group_stds.append(group_rewards.std(unbiased=False))
-
-                if len(group_stds) > 0:
-                    student_rollout_correct_group_mean_std = torch.stack(group_stds).mean().item()
-                else:
-                    student_rollout_correct_group_mean_std = 0.0
-
-                metrics["hetero/student_rollout_correct_mean"] = student_reward_flat.mean().item()
-                metrics["hetero/student_rollout_correct_std"] = student_reward.std(unbiased=False).item()
-                metrics["hetero/student_rollout_correct_group_mean_std"] = student_rollout_correct_group_mean_std
-                if self.pace_enabled and self.pace_macro_enabled:
-                    if self._pace_config().get("pace_reward_source", "rollout") == "rollout":
-                        metrics["pace/progress_source_rollout"] = 1.0
-                        self._update_pace_controller(metrics["hetero/student_rollout_correct_mean"], metrics)
+                    if len(group_stds) > 0:
+                        student_rollout_correct_group_mean_std = torch.stack(group_stds).mean().item()
                     else:
-                        # Validation is deliberately deferred until after rollout
-                        # batch construction and immediately before OPD preparation.
-                        # That makes the updated lambda0 apply to this OPD update.
-                        metrics["pace/progress_source_rollout"] = 0.0
+                        student_rollout_correct_group_mean_std = 0.0
 
-                # =========================
-                # 4) build distillation batch
-                # =========================
-                grpo_batch, opd_batch, build_stats = self._build_hetero_train_batches(
-                    student_batch=student_batch,
-                    student_reward_tensor=student_reward_tensor,
-                )
-                metrics.update(build_stats)
+                    metrics["hetero/student_rollout_correct_mean"] = student_reward_flat.mean().item()
+                    metrics["hetero/student_rollout_correct_std"] = student_reward.std(unbiased=False).item()
+                    metrics["hetero/student_rollout_correct_group_mean_std"] = student_rollout_correct_group_mean_std
+                    if self.pace_enabled and self.pace_macro_enabled:
+                        if self._pace_config().get("pace_reward_source", "rollout") == "rollout":
+                            metrics["pace/progress_source_rollout"] = 1.0
+                            self._update_pace_controller(metrics["hetero/student_rollout_correct_mean"], metrics)
+                        else:
+                            # Validation is deliberately deferred until after rollout
+                            # batch construction and immediately before OPD preparation.
+                            # That makes the updated lambda0 apply to this OPD update.
+                            metrics["pace/progress_source_rollout"] = 0.0
 
-                do_grpo, do_opd, update_phase = self._get_hetero_update_mode()
-                metrics["hetero/update_phase_is_grpo"] = int(update_phase == "grpo")
-                metrics["hetero/update_phase_is_opd"] = int(update_phase == "opd")
+                    # =========================
+                    # 4) build distillation batch
+                    # =========================
+                    with marked_timer("build_hetero", timing_raw, color="cyan"):
+                        grpo_batch, opd_batch, build_stats = self._build_hetero_train_batches(
+                            student_batch=student_batch,
+                            student_reward_tensor=student_reward_tensor,
+                        )
+                    metrics.update(build_stats)
 
-                # =========================
-                # GRPO update
-                # =========================
-                grpo_has_candidate = grpo_batch is not None and len(grpo_batch) > 0
+                    do_grpo, do_opd, update_phase = self._get_hetero_update_mode()
+                    metrics["hetero/update_phase_is_grpo"] = int(update_phase == "grpo")
+                    metrics["hetero/update_phase_is_opd"] = int(update_phase == "opd")
 
-                if do_grpo:
-                    if grpo_has_candidate:
+                    # =========================
+                    # GRPO update
+                    # =========================
+                    grpo_has_candidate = grpo_batch is not None and len(grpo_batch) > 0
 
+                    if do_grpo:
                         if grpo_has_candidate:
-                            grpo_batch = compute_advantage(
-                                data=grpo_batch,
-                                adv_estimator=AdvantageEstimator.GRPO,
-                                gamma=self.config.algorithm.get("gamma", 1.0),
-                                lam=self.config.algorithm.get("lam", 1.0),
-                                num_repeat=self.student_rollout_n,
-                                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
-                                config=self.config.algorithm,
-                            )
 
-                        update_batch = grpo_batch
+                            if grpo_has_candidate:
+                                grpo_batch = compute_advantage(
+                                    data=grpo_batch,
+                                    adv_estimator=AdvantageEstimator.GRPO,
+                                    gamma=self.config.algorithm.get("gamma", 1.0),
+                                    lam=self.config.algorithm.get("lam", 1.0),
+                                    num_repeat=self.student_rollout_n,
+                                    norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                                    config=self.config.algorithm,
+                                )
 
-                        if update_batch is not None and len(update_batch) > 0:
-                            print("[DEBUG] GRPO UPDATE START.")
+                            update_batch = grpo_batch
 
-                            old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
-                            update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
-                            update_batch.batch['entropys'] = old_log_prob_output.batch["entropys"]
+                            if update_batch is not None and len(update_batch) > 0:
+                                print("[DEBUG] GRPO UPDATE START.")
 
-                            base_log_probs_output = self.actor_rollout_wg.compute_base_log_prob(update_batch)
-                            update_batch.batch["base_log_probs"] = base_log_probs_output.batch["base_log_probs"]
-                            
-                            self._add_entropy_metrics(
-                                metrics=metrics,
-                                batch=update_batch,
-                                entropys=old_log_prob_output.batch["entropys"],
-                                prefix="grpo",
-                            )
+                                with marked_timer("grpo_prep", timing_raw, color="blue"):
+                                    old_log_prob_output = self.actor_rollout_wg.compute_log_prob(update_batch)
+                                    update_batch.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
+                                    update_batch.batch['entropys'] = old_log_prob_output.batch["entropys"]
 
-                            actor_output = self.actor_rollout_wg.update_actor_grpo(update_batch)
-                            actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                            metrics.update({f"grpo/{k}": v for k, v in actor_metrics.items()})
+                                    base_log_probs_output = self.actor_rollout_wg.compute_base_log_prob(update_batch)
+                                    update_batch.batch["base_log_probs"] = base_log_probs_output.batch["base_log_probs"]
 
-                            self.grpo_update_steps += 1
-                            self.actor_update_steps += 1
+                                self._add_entropy_metrics(
+                                    metrics=metrics,
+                                    batch=update_batch,
+                                    entropys=old_log_prob_output.batch["entropys"],
+                                    prefix="grpo",
+                                )
+
+                                with marked_timer("update_grpo", timing_raw, color="red"):
+                                    actor_output = self.actor_rollout_wg.update_actor_grpo(update_batch)
+                                actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                                metrics.update({f"grpo/{k}": v for k, v in actor_metrics.items()})
+
+                                self.grpo_update_steps += 1
+                                self.actor_update_steps += 1
+                        else:
+                            metrics["hetero/grpo_skip_no_candidate"] = 1
                     else:
-                        metrics["hetero/grpo_skip_no_candidate"] = 1
-                else:
-                    metrics["hetero/grpo_skip_by_schedule"] = 1
+                        metrics["hetero/grpo_skip_by_schedule"] = 1
 
+                    # =========================
+                    # OPD update
+                    # =========================
+                    if do_opd:
+                        if opd_batch is not None and len(opd_batch) > 0:
+                            update_batch = opd_batch
 
-                # =========================
-                # OPD update
-                # =========================
-                if do_opd:
-                    if opd_batch is not None and len(opd_batch) > 0:
-                        update_batch = opd_batch
+                            if update_batch is not None and len(update_batch) > 0:
+                                print("[DEBUG] OPD UPDATE START.")
 
-                        if update_batch is not None and len(update_batch) > 0:
-                            print("[DEBUG] OPD UPDATE START.")
+                                self._maybe_update_pace_from_validation(metrics)
+                                with marked_timer("opd_prep", timing_raw, color="olive"):
+                                    update_batch, opd_prep_timing = self._prepare_opd_update_batch(update_batch)
+                                metrics.update({f"opd/{k}": v for k, v in opd_prep_timing.items()})
+                                metrics.update(self._apply_pace_micro_reweight(update_batch))
+                                self._add_entropy_metrics(
+                                    metrics=metrics,
+                                    batch=update_batch,
+                                    entropys=update_batch.batch["entropys"],
+                                    prefix="opd",
+                                )
+                                if self.opd_top_k > 0:
+                                    metrics["opd/top_k"] = self.opd_top_k
 
-                            self._maybe_update_pace_from_validation(metrics)
-                            update_batch, opd_prep_timing = self._prepare_opd_update_batch(update_batch)
-                            metrics.update({f"opd/{k}": v for k, v in opd_prep_timing.items()})
-                            metrics.update(self._apply_pace_micro_reweight(update_batch))
-                            self._add_entropy_metrics(
-                                metrics=metrics,
-                                batch=update_batch,
-                                entropys=update_batch.batch["entropys"],
-                                prefix="opd",
-                            )
-                            if self.opd_top_k > 0:
-                                metrics["opd/top_k"] = self.opd_top_k
+                                with marked_timer("update_opd", timing_raw, color="purple"):
+                                    actor_output = self.actor_rollout_wg.update_actor_opd(update_batch)
+                                actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                                metrics.update({f"opd/{k}": v for k, v in actor_metrics.items()})
 
-                            actor_output = self.actor_rollout_wg.update_actor_opd(update_batch)
-                            actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                            metrics.update({f"opd/{k}": v for k, v in actor_metrics.items()})
-
-                            self.opd_update_steps += 1
-                            self.actor_update_steps += 1
+                                self.opd_update_steps += 1
+                                self.actor_update_steps += 1
+                        else:
+                            metrics["hetero/opd_skip_no_candidate"] = 1
                     else:
-                        metrics["hetero/opd_skip_no_candidate"] = 1
-                else:
-                    metrics["hetero/opd_skip_by_schedule"] = 1
+                        metrics["hetero/opd_skip_by_schedule"] = 1
 
-                metrics["training/grpo_update_steps"] = self.grpo_update_steps
-                metrics["training/opd_update_steps"] = self.opd_update_steps
-                metrics["training/actor_update_steps"] = self.actor_update_steps
+                    metrics["training/grpo_update_steps"] = self.grpo_update_steps
+                    metrics["training/opd_update_steps"] = self.opd_update_steps
+                    metrics["training/actor_update_steps"] = self.actor_update_steps
 
-                # =========================
-                # 6) validate / save / log
-                # =========================
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                ):
-                    val_metrics = self._validate()
-                    pprint(f"Validation metrics: {val_metrics}")
-                    if is_last_step:
-                        last_val_metrics = val_metrics
-                    metrics.update(val_metrics)
+                    # =========================
+                    # 6) validate / save / log
+                    # =========================
+                    if (
+                        self.val_reward_fn is not None
+                        and self.config.trainer.test_freq > 0
+                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                    ):
+                        with marked_timer("testing", timing_raw, color="green"):
+                            val_metrics = self._validate()
+                        pprint(f"Validation metrics: {val_metrics}")
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                        metrics.update(val_metrics)
 
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
-                ):
-                    self._save_checkpoint(metrics=metrics)
+                    if self.config.trainer.save_freq > 0 and (
+                        is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                    ):
+                        with marked_timer("save_checkpoint", timing_raw, color="green"):
+                            self._save_checkpoint(metrics=metrics)
+
+                steps_duration = timing_raw.get("step", 0.0)
+                self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
                 metrics.update(
                     {
                         "training/global_step": self.global_steps,
                         "training/epoch": epoch,
                     }
+                )
+                metrics.update(compute_timing_metrics(batch=student_batch, timing_raw=timing_raw))
+                n_gpus = self.resource_pool_manager.get_n_gpus()
+                metrics.update(
+                    compute_throughout_metrics(batch=student_batch, timing_raw=timing_raw, n_gpus=n_gpus)
                 )
 
                 logger.log(data=metrics, step=self.global_steps)

@@ -252,9 +252,20 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
     num_response_tokens = torch.sum(response_info["response_length"]).item()
     num_overall_tokens = num_prompt_tokens + num_response_tokens
 
+    hetero_stage_names = [
+        "reward",
+        "build_hetero",
+        "grpo_prep",
+        "update_grpo",
+        "opd_prep",
+        "update_opd",
+        "testing",
+        "save_checkpoint",
+    ]
     num_tokens_of_section = {
         "gen": num_response_tokens,
         **{name: num_overall_tokens for name in ["ref", "values", "adv", "update_critic", "update_actor"]},
+        **{name: num_overall_tokens for name in hetero_stage_names},
     }
 
     return {

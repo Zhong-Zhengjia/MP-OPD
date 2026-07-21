@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:8
 #SBATCH --quotatype=reserved
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=48
 #SBATCH --mem=500G
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -65,7 +65,7 @@ grpo_lr_scale=1.0
 # opd configs
 use_opd=true
 opd_lr_scale=1.0
-opd_top_k=100
+opd_top_k=0
 lambda_vals=1.0
 
 # actor param offload: set false when GPU memory allows (skips actor CPU<->GPU each step)
@@ -240,7 +240,7 @@ python3 -m verl.trainer.main_ppo \
     val_custom_reward_function.name=reward_func_batched \
     val_custom_reward_function.reward_kwargs.code_eval_workers=$code_eval_workers \
     trainer.critic_warmup=0 \
-    trainer.val_before_train=true \
+    trainer.val_before_train=false \
     trainer.logger='["console","wandb"]' \
     trainer.log_val_generations=0 \
     trainer.project_name=$project_name \
