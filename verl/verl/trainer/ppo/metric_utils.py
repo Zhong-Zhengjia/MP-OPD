@@ -25,6 +25,36 @@ import torch
 from verl import DataProto
 from verl.utils.import_utils import deprecated
 
+_PASSTHROUGH_METRIC_PREFIXES = ("hetero/", "pace/", "timing_s/", "timing_per_token_ms/", "perf/")
+
+
+def merge_worker_metrics(
+    raw_metrics: dict[str, Any],
+    *,
+    prefix: str | None = None,
+) -> dict[str, Any]:
+    """Merge worker-side metrics into the trainer log dict.
+
+    Worker timing keys use the ``timing/`` namespace and are normalized to
+    ``timing_s/*`` so they sit alongside driver-side ``marked_timer`` metrics.
+    Keys that already belong to another namespace (e.g. ``hetero/``) are kept
+    as-is instead of being nested under ``opd/``.
+    """
+    merged: dict[str, Any] = {}
+    for key, value in raw_metrics.items():
+        if key.startswith("timing/"):
+            name = key[len("timing/") :]
+            if name.endswith("_s"):
+                name = name[:-2]
+            merged[f"timing_s/{name}"] = value
+        elif key.startswith(_PASSTHROUGH_METRIC_PREFIXES):
+            merged[key] = value
+        elif prefix is not None:
+            merged[f"{prefix}/{key}"] = value
+        else:
+            merged[key] = value
+    return merged
+
 
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
@@ -294,8 +324,7 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
     Returns:
         A dictionary containing:
             - perf/total_num_tokens: Total number of tokens processed in the batch
-            - perf/time_per_step: Time taken for the step in seconds
-            - perf/throughput: Tokens processed per second per GPU
+            - timing_s/throughput_per_gpu: Tokens processed per second per GPU
 
     Note:
         The throughput is calculated as total_tokens / (time * n_gpus) to normalize
@@ -308,8 +337,7 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
     # f'Theoretical TFLOPs/s/GPU​': promised_flops,
     return {
         "perf/total_num_tokens": total_num_tokens,
-        "perf/time_per_step": time,
-        "perf/throughput": total_num_tokens / (time * n_gpus),
+        "timing_s/throughput_per_gpu": total_num_tokens / (time * n_gpus),
     }
 
 

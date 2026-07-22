@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=e05-m-2.0
-#SBATCH --output=logs/w2s_math/slurm_math_lambda_2.0_%j.out
-#SBATCH --error=logs/w2s_math/slurm_math_lambda_2.0_%j.err
+#SBATCH --job-name=e05-m-1.0
+#SBATCH --output=logs/w2s_math/slurm_math_lambda_1.0_rollout_1_%j.out
+#SBATCH --error=logs/w2s_math/slurm_math_lambda_1.0_rollout_1_%j.err
 #SBATCH --chdir=/mnt/petrelfs/wurong/workspace/RM-OPD
 #SBATCH --account=research
 #SBATCH --partition=DataFrontier_Explore
@@ -32,10 +32,10 @@ export WANDB_MODE=online
 export USED_MODEL="no_api"
 
 student_model_name="Qwen3-8B"
-teacher_model_name="Qwen3-1.7B-M-RL" # proxy expert
-teacher_base_model_name="Qwen3-1.7B"           # proxy base
+teacher_model_name="Qwen3-4B-Non-Thinking-RL-Math-Step1200" # proxy expert
+teacher_base_model_name="Qwen3-4B"           # proxy base
 student_tag="Qwen3-8B"
-teacher_tag="1.7B_Math"
+teacher_tag="4B_Math_RL_Step1200"
 ability=Math
 
 # sbatch copies the script to /var/spool/slurmd/...; BASH_SOURCE is unreliable there.
@@ -68,8 +68,9 @@ grpo_lr_scale=1.0
 # opd configs
 use_opd=true
 opd_lr_scale=1.0 
-opd_top_k=100
-lambda_vals=2.0    # lambda value for the lambda-based reward function
+opd_top_k=0
+lambda_vals=1.0    # lambda value for the lambda-based reward function
+student_rollout_n=1
 
 # actor param offload: set false when GPU memory allows (skips actor CPU<->GPU each step)
 actor_param_offload=true
@@ -174,7 +175,7 @@ mkdir -p "${RAY_TMPDIR}"
 
 python3 -m verl.trainer.main_ppo \
     +algorithm.train_mode=heterogeneous_distill \
-    +algorithm.hetero_distill.student_rollout_n=8 \
+    +algorithm.hetero_distill.student_rollout_n=$student_rollout_n \
     +algorithm.hetero_distill.use_grpo=$use_grpo \
     +algorithm.hetero_distill.use_opd=$use_opd \
     +algorithm.hetero_distill.update_mode=$update_mode \
@@ -185,7 +186,7 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.opd_parallel_student_base=$opd_parallel_student_base \
     data.train_files=$train_files \
     data.val_files=$test_files \
-    data.train_batch_size=256 \
+    data.train_batch_size=1024 \
     data.max_prompt_length=1024 \
     data.max_response_length=16384 \
     data.filter_overlong_prompts=True \
@@ -224,7 +225,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.use_kl_loss=true \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_coef=0 \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     actor_rollout_ref.actor.loss_agg_mode="seq-mean-token-mean" \
     +actor_rollout_ref.actor.grpo_lr_scale=$grpo_lr_scale \

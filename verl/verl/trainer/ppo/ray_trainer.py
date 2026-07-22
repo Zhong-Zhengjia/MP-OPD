@@ -54,6 +54,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    merge_worker_metrics,
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
@@ -2007,6 +2008,8 @@ class RayPPOTrainer:
 
         lp_output = self.actor_rollout_wg.prepare_opd_log_probs(batch)
         timing_metrics = lp_output.meta_info.get("metrics", {})
+        if timing_metrics:
+            timing_metrics = reduce_metrics(timing_metrics)
 
         batch.batch["old_log_probs"] = lp_output.batch["old_log_probs"]
         if "entropys" in lp_output.batch:
@@ -2291,7 +2294,7 @@ class RayPPOTrainer:
                                 with marked_timer("update_grpo", timing_raw, color="red"):
                                     actor_output = self.actor_rollout_wg.update_actor_grpo(update_batch)
                                 actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                                metrics.update({f"grpo/{k}": v for k, v in actor_metrics.items()})
+                                metrics.update(merge_worker_metrics(actor_metrics, prefix="grpo"))
 
                                 self.grpo_update_steps += 1
                                 self.actor_update_steps += 1
@@ -2313,7 +2316,7 @@ class RayPPOTrainer:
                                 self._maybe_update_pace_from_validation(metrics)
                                 with marked_timer("opd_prep", timing_raw, color="olive"):
                                     update_batch, opd_prep_timing = self._prepare_opd_update_batch(update_batch)
-                                metrics.update({f"opd/{k}": v for k, v in opd_prep_timing.items()})
+                                metrics.update(merge_worker_metrics(opd_prep_timing, prefix="opd"))
                                 metrics.update(self._apply_pace_micro_reweight(update_batch))
                                 self._add_entropy_metrics(
                                     metrics=metrics,
@@ -2327,7 +2330,7 @@ class RayPPOTrainer:
                                 with marked_timer("update_opd", timing_raw, color="purple"):
                                     actor_output = self.actor_rollout_wg.update_actor_opd(update_batch)
                                 actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                                metrics.update({f"opd/{k}": v for k, v in actor_metrics.items()})
+                                metrics.update(merge_worker_metrics(actor_metrics, prefix="opd"))
 
                                 self.opd_update_steps += 1
                                 self.actor_update_steps += 1
@@ -2565,7 +2568,7 @@ class RayPPOTrainer:
                                     ref_output_key="ref_log_prob",
                                     fetch_ref_externally=self.use_reference_policy and not self.ref_in_actor,
                                 )
-                                metrics.update({f"opd/{k}": v for k, v in opd_prep_timing.items()})
+                                metrics.update(merge_worker_metrics(opd_prep_timing, prefix="opd"))
                                 metrics["opd/top_k"] = self.opd_top_k
                                 if entropys is not None:
                                     response_masks = batch.batch["response_mask"]
@@ -2754,7 +2757,7 @@ class RayPPOTrainer:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
+                        metrics.update(merge_worker_metrics(critic_output_metrics))
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -2763,7 +2766,7 @@ class RayPPOTrainer:
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
+                        metrics.update(merge_worker_metrics(actor_output_metrics))
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

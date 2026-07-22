@@ -226,3 +226,5 @@ models
 plt/
 
 .specstory
+
+.specstory/
