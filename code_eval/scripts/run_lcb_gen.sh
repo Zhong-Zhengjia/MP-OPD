@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Default values
-MODEL_PATH="Qwen/Qwen3-4"
+MODEL_PATH="Qwen/Qwen3-4B"
 LOCAL_MODEL_PATH=""
 CUDA_GPU_ID="7"
 NUM_GPUS=1

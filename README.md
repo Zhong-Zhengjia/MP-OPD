@@ -130,7 +130,7 @@ Training data must be in **verl parquet format** (see [verl data docs](verl/docs
 
 ### Math (DeepMath-103K)
 
-Convert [DeepMath-103K](https://huggingface.co/datasets/zhibinni/DeepMath-103K) to parquet and place at:
+Convert [DeepMath-103K](https://huggingface.co/datasets/zwhe99/DeepMath-103K) to parquet and place at:
 
 ```
 data/math/train.parquet    # training set
@@ -167,7 +167,6 @@ Each line: `{"problem": "...", "answer": "..."}`.
 ## 🏋️ Training
 
 Run from the **repository root**. Scripts auto-detect paths relative to the repo.
-
 ### Math
 
 Starts a local math-verify HTTP server, then launches PUST training on 8 GPUs:
