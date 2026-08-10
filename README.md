@@ -1,5 +1,11 @@
-```bash
-cd verl
+# Math Domain
 
-bash examples/H-OPD/run_qwen3-1_7b_qwen3-4b_math.sh
+```bash
+bash verl/examples/POPD/popd_qwen3-8b_math.sh
+```
+
+# Code Domain
+
+```bash
+bash verl/examples/POPD/popd_qwen3-8b_code.sh
 ```

@@ -1801,7 +1801,7 @@ class RayPPOTrainer:
     def _get_hetero_update_mode(self):
         hd_cfg = self.config.algorithm.hetero_distill
 
-        use_grpo = bool(hd_cfg.get("use_grpo", True))
+        use_grpo = bool(hd_cfg.get("use_grpo", False))
         use_opd = bool(hd_cfg.get("use_opd", True))
         update_mode = hd_cfg.get("update_mode", "both")
         print('[DEBUG] update_mode: ', update_mode, type(update_mode))
