@@ -15,23 +15,26 @@ export RAY_memory_usage_threshold=0.99
 
 
 student_model_name="Qwen3-8B"
-teacher_model_name="Qwen3-4B-Non-Thinking-RL-Code-Step300" # code proxy expert
-teacher_base_model_name="Qwen3-4B"                         # proxy base
+teacher_model_name="Qwen3-4B-Non-Thinking-RL-Math-Step1200" # proxy expert
+teacher_base_model_name="Qwen3-4B"           # proxy base
 student_tag="Qwen3-8B"
-teacher_tag="4B_CodeRL"
-ability=Code
-
-student_rollout_n=1
+teacher_tag="4B_Math_RL_Step500"
+ability=Math
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERL_ROOT="${REPO_ROOT}/verl"
+
+# Auto-start math verify HTTP server (Ray workers call it remotely; do not run math_verify in-process).
+source "${REPO_ROOT}/math_eval_server/start_math_verify_server.sh"
+start_math_verify_server "${REPO_ROOT}" || exit 1
+trap stop_math_verify_server EXIT
+
 cd "${VERL_ROOT}"
 export PYTHONPATH="${VERL_ROOT}:${PYTHONPATH:-}"
+export MATH_VERIFY_SERVER_URL
 
-dataset_root="./data"
-train_files=${dataset_root}/Eurus/code_train.parquet
-test_files=${dataset_root}/Eurus/code_validation.parquet
-code_reward_path=${VERL_ROOT}/verl/utils/reward_score/code_eval_reward/__init__.py
+test_files=./data/math/test.parquet
+train_files=./data/math/train.parquet
 
 student_model_path="./models/${student_model_name}"
 teacher_model_path="./models/${teacher_model_name}"
@@ -40,7 +43,8 @@ teacher_base_model_path="./models/${teacher_base_model_name}"
 today=$(date +%m%d_%H%M)
 
 opd_top_k=0
-lambda_vals=1.0
+lambda_vals=1.0    # lambda value for the lambda-based reward function
+student_rollout_n=1
 
 # actor param offload: set false when GPU memory allows (skips actor CPU<->GPU each step)
 actor_param_offload=true
@@ -50,11 +54,10 @@ opd_parallel_student_base=false
 
 
 # validation config
-val_n=4
-val_metric_group=code_avg
-val_metric_sources=taco,apps,codecontests,codeforces
+val_n=16
+val_metric_group=math_avg
+val_metric_sources=AIME2024,AIME2025,AIME2026,SMT2025,CMIMC2025,HMMT2025FEB,HMMT2025NOV,HMMT2026FEB
 val_metric_sources_hydra="[${val_metric_sources}]"
-code_eval_workers=32
 
 # base learning rate
 lr=1e-6
@@ -63,9 +66,10 @@ n_node=1
 n_gpu=8
 
 
-project_name=PUST_Code@${val_n}
+project_name=POPD_Math@${val_n}
 
 resume_path=""
+
 extra_args=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -103,7 +107,7 @@ batch_size_to_bool() {
     fi
 }
 
-output_model_name="${student_tag}-T${teacher_tag}_Lam${lambda_vals}-n${student_rollout_n}"
+output_model_name="${student_tag}-T${teacher_tag}_Lam${lambda_vals}"
 
 resume_args=()
 if [[ -n "$resume_path" ]]; then
@@ -114,13 +118,12 @@ if [[ -n "$resume_path" ]]; then
         trainer.resume_from_path="$resume_path"
     )
 else
-    experiment_name="Code_${output_model_name}_${today}"
+    experiment_name="${output_model_name}_${today}"
     output_path="./models/saved_models/${project_name}/${experiment_name}"
 fi
 
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
-
 
 unset RAY_ADDRESS
 unset RAY_NAMESPACE
@@ -138,15 +141,14 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.hetero_distill.opd_parallel_student_base=$opd_parallel_student_base \
     data.train_files=$train_files \
     data.val_files=$test_files \
-    data.train_batch_size=256 \
-    data.max_prompt_length=2048 \
+    data.train_batch_size=1024 \
+    data.max_prompt_length=1024 \
     data.max_response_length=16384 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=True \
     data.seed=3412 \
     data.return_raw_chat=True \
-    data.dataloader_num_workers=0 \
     +data.apply_chat_template_kwargs.enable_thinking=false \
     actor_rollout_ref.model.path=$student_model_path \
     +actor_rollout_ref.model.base_model_path=$student_model_path \
@@ -175,10 +177,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
     actor_rollout_ref.rollout.val_kwargs.n=$val_n \
     actor_rollout_ref.rollout.calculate_log_probs=false \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.use_kl_loss=true \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_coef=0 \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     actor_rollout_ref.actor.loss_agg_mode="seq-mean-token-mean" \
     +actor_rollout_ref.actor.grpo_lr_scale=$grpo_lr_scale \
@@ -186,13 +188,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.policy_loss.lambda_vals=$lambda_vals \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=false \
-    reward_model.reward_manager=batch \
-    custom_reward_function.path=$code_reward_path \
-    custom_reward_function.name=reward_func_batched \
-    +custom_reward_function.reward_kwargs.code_eval_workers=$code_eval_workers \
-    val_custom_reward_function.path=$code_reward_path \
-    val_custom_reward_function.name=reward_func_batched \
-    val_custom_reward_function.reward_kwargs.code_eval_workers=$code_eval_workers \
+    reward_model.reward_manager=naive \
     trainer.critic_warmup=0 \
     trainer.val_before_train=false \
     trainer.logger='["console","wandb"]' \

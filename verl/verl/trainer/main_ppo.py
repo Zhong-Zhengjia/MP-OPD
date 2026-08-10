@@ -292,7 +292,7 @@ class TaskRunner:
             if tokenizers_need_cross_token_bridge(tokenizer, ref_tokenizer):
                 print(
                     "Primary and ref tokenizers differ; cross-tokenizer text bridge "
-                    "and common-token OPD mask will be enabled during PUST/OPD."
+                    "and common-token OPD mask will be enabled during POPD/OPD."
                 )
 
         reward_fn = load_reward_manager(

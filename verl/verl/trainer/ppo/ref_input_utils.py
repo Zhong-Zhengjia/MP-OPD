@@ -15,7 +15,7 @@
 Utilities for preparing reference / proxy model inputs when the ref model uses a
 different tokenizer, chat template, or both.
 
-Phase 0/1 cross-tokenizer PUST:
+Phase 0/1 cross-tokenizer POPD:
   - Text-bridge responses: primary decode -> ref encode
   - Common-token mask on aligned primary response positions
   - Teacher log-prob alignment back to primary response length
@@ -112,7 +112,7 @@ def prepare_ref_model_inputs(
     responses are reused from the primary rollout as before.
 
     When ``cross_token_bridge`` is True (Phase 0/1), responses are bridged through text:
-      primary decode -> ref encode, and ``cross_token_opd_mask`` is added for PUST.
+      primary decode -> ref encode, and ``cross_token_opd_mask`` is added for POPD.
     """
     if apply_chat_template_kwargs is None:
         apply_chat_template_kwargs = {}
@@ -321,7 +321,7 @@ def align_ref_side_log_probs_to_primary(
 
 
 def align_teacher_log_probs_to_primary(batch: DataProto) -> tuple[DataProto, dict]:
-    """Backward-compatible wrapper used by PUST / hetero OPD."""
+    """Backward-compatible wrapper used by POPD / hetero OPD."""
     return align_ref_side_log_probs_to_primary(
         batch,
         keys=("teacher_log_probs", "teacher_base_log_probs"),
@@ -336,7 +336,7 @@ def maybe_apply_sequence_level_opd_fallback(
 
     TODO(Phase 1+): When ``hetero/cross_token_common_ratio`` falls below
     ``common_ratio_threshold``, replace token-level advantages with a sequence-level
-    PUST signal broadcast across ``response_mask`` (for larger tokenizer gaps).
+    POPD signal broadcast across ``response_mask`` (for larger tokenizer gaps).
     """
     stats: dict[str, float] = {}
     if "cross_token_opd_mask" not in batch.batch:
@@ -351,7 +351,7 @@ def maybe_apply_sequence_level_opd_fallback(
         # TODO(Phase 1+): implement sequence-level fallback here.
         logger.warning(
             "cross_token_common_ratio=%.4f < threshold=%.2f; "
-            "sequence-level PUST fallback not implemented yet.",
+            "sequence-level POPD fallback not implemented yet.",
             common_ratio,
             common_ratio_threshold,
         )

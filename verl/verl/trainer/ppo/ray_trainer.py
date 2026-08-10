@@ -1622,13 +1622,13 @@ class RayPPOTrainer:
         )
 
     def _apply_pace_micro_reweight(self, batch: DataProto) -> dict[str, float]:
-        """Attach batch-conserving token lambda values for the PUST anchor term."""
+        """Attach batch-conserving token lambda values for the POPD anchor term."""
         if not self.pace_enabled or (not self.pace_micro_enabled and not self.pace_macro_enabled):
             return {}
 
         pace_cfg = self._pace_config()
         response_mask = batch.batch["response_mask"].float()
-        # response_mask excludes padding. Cross-token PUST additionally excludes
+        # response_mask excludes padding. Cross-token POPD additionally excludes
         # primary positions that cannot be aligned to a proxy token. Only these
         # positions participate in OPD loss or in PACE batch statistics.
         policy_mask = response_mask
@@ -1661,7 +1661,7 @@ class RayPPOTrainer:
         entropy = batch.batch["entropys"].detach().float()
         # TODO(PACE): for a shared tokenizer, replace this scalar proxy with
         # KL(pi_student || pi_teacher) from full distributions when available.
-        # Cross-tokenizer PUST only aligns log-probabilities of corresponding
+        # Cross-tokenizer POPD only aligns log-probabilities of corresponding
         # token positions; its teacher and student vocabularies differ, so the
         # full distributions are defined over different event spaces and an
         # exact token-level KL cannot be computed without a vocabulary mapping.
@@ -1987,7 +1987,7 @@ class RayPPOTrainer:
         opd_top_k = self.opd_top_k
         if self.use_cross_token_bridge and opd_top_k > 0:
             raise ValueError(
-                "cross-tokenizer PUST (Phase 0/1) does not support opd_top_k > 0. "
+                "cross-tokenizer POPD (Phase 0/1) does not support opd_top_k > 0. "
                 "Set algorithm.hetero_distill.opd_top_k=0 or use the same tokenizer."
             )
         if opd_top_k > 0:
@@ -2050,7 +2050,7 @@ class RayPPOTrainer:
         return batch, entropys, timing_metrics
 
     def _prepare_opd_update_batch(self, update_batch: DataProto) -> tuple[DataProto, dict]:
-        """PUST / hetero OPD update: student + base + teacher + teacher-base log probs."""
+        """POPD / hetero OPD update: student + base + teacher + teacher-base log probs."""
         update_batch, _, timing_metrics = self._prepare_opd_batch(
             update_batch,
             include_base=True,

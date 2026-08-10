@@ -78,9 +78,9 @@ policy_loss:
   # If true, uses multi-teacher distillation path (requires opd_teacher field in data)
   multi_teacher_distill: false
 
-  # PACE: adaptive PUST anchoring. Disabled by default to preserve legacy OPD.
+  # PACE: adaptive POPD anchoring. Disabled by default to preserve legacy OPD.
   pace_enable: false
-  # Token-level Soft-OR redistribution of the PUST anchor coefficient.
+  # Token-level Soft-OR redistribution of the POPD anchor coefficient.
   pace_micro_enable: false
   # Adam-style controller driven by the training rollout reward.
   pace_macro_enable: false

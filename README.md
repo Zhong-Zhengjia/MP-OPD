@@ -1,7 +1,7 @@
 <div align="center">
 
-<h1>PUST</h1>
-<h3>Proxy-Guided Update Signal Transfer for LLM Post-Training</h3>
+<h1>POPD</h1>
+<h3>Proxy OPD: On-Policy Distillation with Transferable Relative Proxy Update</h3>
 <p>Decoupling exploration from alignment for asynchronous, reusable, and cross-model post-training.</p>
 
 <p>
@@ -9,12 +9,12 @@
   &nbsp;
   <a href="https://huggingface.co/KnowledgeXLab/PUST-Experiments"><img src="https://img.shields.io/badge/Models-HuggingFace-FFD21E?style=flat-square&logo=huggingface&logoColor=yellow" height="28" alt="Hugging Face Models"/></a>
   &nbsp;
-  <a href="assets/PUST.pdf"><img src="https://img.shields.io/badge/PDF-Paper-red?style=flat-square&logo=adobeacrobatreader&logoColor=white" height="28" alt="PDF Paper"/></a>
+  <a href="assets/POPD.pdf"><img src="https://img.shields.io/badge/PDF-Paper-red?style=flat-square&logo=adobeacrobatreader&logoColor=white" height="28" alt="PDF Paper"/></a>
 </p>
 
 </div>
 
-> 💡 PUST decouples LLM post-training into **proxy exploration** → **update-signal extraction** → **signal transfer**. A lightweight proxy performs low-cost trial-and-error, while the primary model aligns to relative improvement signals.
+> 💡 POPD decouples LLM post-training into **proxy exploration** → **update-signal extraction** → **signal transfer**. A lightweight proxy performs low-cost trial-and-error, while the primary model aligns to relative improvement signals via on-policy distillation.
 
 
 
@@ -28,7 +28,7 @@
   <img src="assets/method.png" width="90%"/>
 </p>
 
-PUST extracts the relative improvement between the initial and optimized proxy policies:
+POPD extracts the relative improvement between the initial and optimized proxy policies:
 
 $$\Delta_\phi(a \mid s_t) = \log \frac{\pi_\phi^+(a \mid s_t)}{\pi_\phi(a \mid s_t)}$$
 
@@ -42,7 +42,7 @@ $$r_\lambda(a \mid s_t) = \Delta_\phi(a \mid s_t) - \lambda  \Delta_\theta(a \mi
 
 The primary model is optimized with:
 
-$$\mathcal{L}_{\mathrm{proxy}}(\theta) = -\mathbb{E}_{s_t \sim \mathcal{D}} \left[ \sum_{a \in \mathcal{V}} \pi_\theta(a \mid s_t) \left( \log \frac{\pi_\phi^+(a \mid s_t)}{\pi_\phi(a \mid s_t)} - \lambda \log \frac{\pi_\theta(a \mid s_t)}{\pi_{\mathrm{ref}}(a \mid s_t)} \right) \right]$$
+$$\mathcal{L}_{\mathrm{POPD}}(\theta) = -\mathbb{E}_{s_t \sim \mathcal{D}} \left[ \sum_{a \in \mathcal{V}} \pi_\theta(a \mid s_t) \left( \log \frac{\pi_\phi^+(a \mid s_t)}{\pi_\phi(a \mid s_t)} - \lambda \log \frac{\pi_\theta(a \mid s_t)}{\pi_{\mathrm{ref}}(a \mid s_t)} \right) \right]$$
 
 Here $\pi_\phi$, $\pi_\phi^+$, and $\pi_{\mathrm{ref}}$ are frozen; only $\pi_\theta$ is updated. A larger $\lambda$ yields more conservative transfer.
 
@@ -84,7 +84,7 @@ Pre-trained GRPO checkpoints are available on <a href="https://huggingface.co/Kn
 | Checkpoint | Role | Training |
 |:--|:--|:--|
 | [`Qwen3-1.7B-Math-GRPO-Steps500`](https://huggingface.co/KnowledgeXLab/PUST-Experiments/tree/main/Qwen3-1.7B-Math-GRPO-Steps500) | Proxy | DeepMath-103K · GRPO · 500 steps |
-| [`Qwen3-1.7B-Math-GRPO-Steps800`](https://huggingface.co/KnowledgeXLab/PUST-Experiments/tree/main/Qwen3-1.7B-Math-GRPO-Steps800) | Proxy | DeepMath-103K · GRPO · 800 steps |
+| [`Qwen3-1.7B-Math-GRPO-Steps800`](https://huggingface.co/KnowledgeXLab/PUST-Experiments/tree/main/Qwen3-1.7B-Math-GRPO-Steps800) | Proxy | DeepMath-103K · GRPO · 500 steps |
 | [`Qwen3-8B-Math-GRPO-Steps400`](https://huggingface.co/KnowledgeXLab/PUST-Experiments/tree/main/Qwen3-8B-Math-GRPO-Steps400) | Primary | DeepMath-103K · GRPO · 400 steps |
 
 
@@ -93,10 +93,10 @@ Pre-trained GRPO checkpoints are available on <a href="https://huggingface.co/Kn
 **Requirements:** Python ≥ 3.10, CUDA ≥ 12.4, 8× GPU recommended for the default scripts (Qwen3-8B with TP=8).
 
 ```bash
-git clone https://github.com/KnowledgeXLab/PUST.git
-cd PUST
+git clone https://github.com/KnowledgeXLab/POPD.git
+cd POPD
 
-# Core dependencies (verl + PUST training stack)
+# Core dependencies (verl + POPD training stack)
 pip install -r verl/requirements.txt
 pip install vllm pebble
 
@@ -167,18 +167,19 @@ Each line: `{"problem": "...", "answer": "..."}`.
 ## 🏋️ Training
 
 Run from the **repository root**. Scripts auto-detect paths relative to the repo.
+
 ### Math
 
-Starts a local math-verify HTTP server, then launches PUST training on 8 GPUs:
+Starts a local math-verify HTTP server, then launches POPD training on 8 GPUs:
 
 ```bash
-bash scripts/pust_qwen3-8b_math.sh
+bash scripts/popd_qwen3-8b_math.sh
 ```
 
 Resume from a checkpoint:
 
 ```bash
-bash scripts/pust_qwen3-8b_math.sh --resume_path ./models/saved_models/PUST_Math@16/<experiment_name>
+bash scripts/popd_qwen3-8b_math.sh --resume_path ./models/saved_models/POPD_Math@16/<experiment_name>
 ```
 
 Key knobs (edit at the top of the script):
@@ -192,22 +193,22 @@ Key knobs (edit at the top of the script):
 | `n_gpu` | `8` | GPUs per node |
 | `val_n` | `16` | Samples per validation prompt |
 
-Checkpoints are saved to `./models/saved_models/PUST_Math@<val_n>/<experiment_name>/`.
+Checkpoints are saved to `./models/saved_models/POPD_Math@<val_n>/<experiment_name>/`.
 
 ### Code
 
 ```bash
-bash scripts/pust_qwen3-8b_code.sh
+bash scripts/popd_qwen3-8b_code.sh
 ```
 
 Code training uses in-process parallel code execution (no HTTP verify server). Key knobs mirror the math script; reward is computed via `verl/verl/utils/reward_score/code_eval_reward/`.
 
-Checkpoints: `./models/saved_models/PUST_Code@<val_n>/<experiment_name>/`.
+Checkpoints: `./models/saved_models/POPD_Code@<val_n>/<experiment_name>/`.
 
 Extra Hydra overrides can be appended, e.g.:
 
 ```bash
-bash scripts/pust_qwen3-8b_math.sh actor_rollout_ref.actor.policy_loss.lambda_vals=1.5 trainer.total_epochs=1
+bash scripts/popd_qwen3-8b_math.sh actor_rollout_ref.actor.policy_loss.lambda_vals=1.5 trainer.total_epochs=1
 ```
 
 
