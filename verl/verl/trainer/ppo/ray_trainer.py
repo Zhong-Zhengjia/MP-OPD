@@ -68,8 +68,6 @@ from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
-from save_debug_sample import save_dataproto_single_sample_with_json_preview
-
 
 @dataclass
 class ResourcePoolManager:
