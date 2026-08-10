@@ -14,7 +14,7 @@
 
 </div>
 
-> 💡 P-OPD decouples LLM post-training into **proxy exploration** → **update-signal extraction** → **signal transfer**. A lightweight proxy performs low-cost trial-and-error, while the primary model aligns to relative improvement signals via on-policy distillation.
+> 💡 P-OPD decouples LLM post-training into **proxy exploration** → **update-signal extraction** → **signal transfer**. A lightweight proxy performs low-cost trial-and-error, while the target model aligns to relative improvement signals via on-policy distillation.
 
 
 
@@ -32,15 +32,15 @@ P-OPD extracts the relative improvement between the initial and optimized proxy 
 
 $$\Delta_\phi(a \mid s_t) = \log \frac{\pi_\phi^+(a \mid s_t)}{\pi_\phi(a \mid s_t)}$$
 
-The primary model's absorbed update is measured relative to its frozen anchor:
+The target model's absorbed update is measured relative to its frozen anchor:
 
 $$\Delta_\theta(a \mid s_t) = \log \frac{\pi_\theta(a \mid s_t)}{\pi_{\mathrm{ref}}(a \mid s_t)}$$
 
-The calibration coefficient $\lambda$ prevents the primary model from repeatedly over-applying a static proxy signal:
+The calibration coefficient $\lambda$ prevents the target model from repeatedly over-applying a static proxy signal:
 
 $$r_\lambda(a \mid s_t) = \Delta_\phi(a \mid s_t) - \lambda  \Delta_\theta(a \mid s_t)$$
 
-The primary model is optimized with:
+The target model is optimized with:
 
 $$\mathcal{L}_{\mathrm{P-OPD}}(\theta) = -\mathbb{E}_{s_t \sim \mathcal{D}} \left[ \sum_{a \in \mathcal{V}} \pi_\theta(a \mid s_t) \left( \log \frac{\pi_\phi^+(a \mid s_t)}{\pi_\phi(a \mid s_t)} - \lambda \log \frac{\pi_\theta(a \mid s_t)}{\pi_{\mathrm{ref}}(a \mid s_t)} \right) \right]$$
 
@@ -50,8 +50,8 @@ Here $\pi_\phi$, $\pi_\phi^+$, and $\pi_{\mathrm{ref}}$ are frozen; only $\pi_\t
 
 Evaluated with Qwen3 models on DeepMath-103K (math) and Eurus-RL-Code (code):
 
-- **Weak-to-strong transfer:** 1.7B / 4B proxy signals improve an 8B primary model.
-- **Reusable signals:** the same signal transfers to primary models at different scales in 50 steps.
+- **Weak-to-strong transfer:** 1.7B / 4B proxy signals improve an 8B target model.
+- **Reusable signals:** the same signal transfers to target models at different scales in 50 steps.
 - **Multi-hop transfer:** signals remain useful across sequences such as 4B → 1.7B → 8B.
 
 <p align="center">
@@ -87,7 +87,7 @@ Pre-trained GRPO checkpoints are available on <a href="https://huggingface.co/Kn
 |:--|:--|:--|
 | [`Qwen3-1.7B-Math-GRPO-Steps500`](https://huggingface.co/KnowledgeXLab/PUST-Experiments/tree/main/Qwen3-1.7B-Math-GRPO-Steps500) | Proxy | DeepMath-103K · GRPO · 500 steps |
 | [`Qwen3-1.7B-Math-GRPO-Steps800`](https://huggingface.co/KnowledgeXLab/PUST-Experiments/tree/main/Qwen3-1.7B-Math-GRPO-Steps800) | Proxy | DeepMath-103K · GRPO · 500 steps |
-| [`Qwen3-8B-Math-GRPO-Steps400`](https://huggingface.co/KnowledgeXLab/PUST-Experiments/tree/main/Qwen3-8B-Math-GRPO-Steps400) | Primary | DeepMath-103K · GRPO · 400 steps |
+| [`Qwen3-8B-Math-GRPO-Steps400`](https://huggingface.co/KnowledgeXLab/PUST-Experiments/tree/main/Qwen3-8B-Math-GRPO-Steps400) | Target | DeepMath-103K · GRPO · 400 steps |
 
 
 ## 🛠️ Installation
@@ -110,7 +110,7 @@ Place base models and proxy checkpoints under `./models/` (see [Model Weights](#
 
 ```
 models/
-├── Qwen3-8B/                          # primary model
+├── Qwen3-8B/                          # target model
 ├── Qwen3-4B/                           # proxy base
 ├── Qwen3-4B-Non-Thinking-RL-Math-Step1200/   # math proxy expert (π_φ⁺)
 └── Qwen3-4B-Non-Thinking-RL-Code-Step300/    # code proxy expert
@@ -189,7 +189,7 @@ Key knobs (edit at the top of the script):
 | Variable | Default | Meaning |
 |:--|:--|:--|
 | `lambda_vals` | `1.0` | Calibration coefficient λ |
-| `student_model_name` | `Qwen3-8B` | Primary model |
+| `student_model_name` | `Qwen3-8B` | Target model |
 | `teacher_model_name` | `Qwen3-4B-Non-Thinking-RL-Math-Step1200` | Proxy expert π_φ⁺ |
 | `teacher_base_model_name` | `Qwen3-4B` | Proxy base π_φ |
 | `n_gpu` | `8` | GPUs per node |
