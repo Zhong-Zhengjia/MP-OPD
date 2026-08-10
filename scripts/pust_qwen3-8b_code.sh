@@ -23,9 +23,7 @@ ability=Code
 
 student_rollout_n=1
 
-# sbatch copies the script to /var/spool/slurmd/...; BASH_SOURCE is unreliable there.
-# SLURM_SUBMIT_DIR is the directory where sbatch was invoked (repo root).
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERL_ROOT="${REPO_ROOT}/verl"
 cd "${VERL_ROOT}"
 export PYTHONPATH="${VERL_ROOT}:${PYTHONPATH:-}"
@@ -116,17 +114,13 @@ if [[ -n "$resume_path" ]]; then
         trainer.resume_from_path="$resume_path"
     )
 else
-    experiment_name="Code_${output_model_name}_G${use_grpo}_O${use_opd}_${today}"
+    experiment_name="Code_${output_model_name}_${today}"
     output_path="./models/saved_models/${project_name}/${experiment_name}"
 fi
 
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
 
-
-# Avoid DataLoader workers colliding with ProcessPoolExecutor code reward.
-# export TMPDIR="${SLURM_TMPDIR:-/tmp/ray_code_reward_${USER}_${SLURM_JOB_ID:-local}}"
-# mkdir -p "$TMPDIR"
 
 unset RAY_ADDRESS
 unset RAY_NAMESPACE
@@ -136,8 +130,6 @@ unset RAY_JOB_ID
 unset RAY_HEAD_IP
 unset RAY_PORT
 
-export RAY_TMPDIR=/tmp/ray_${USER}_${SLURM_JOB_ID}
-mkdir -p "${RAY_TMPDIR}"
 
 python3 -m verl.trainer.main_ppo \
     +algorithm.train_mode=heterogeneous_distill \

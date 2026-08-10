@@ -21,9 +21,7 @@ student_tag="Qwen3-8B"
 teacher_tag="4B_Math_RL_Step500"
 ability=Math
 
-# sbatch copies the script to /var/spool/slurmd/...; BASH_SOURCE is unreliable there.
-# SLURM_SUBMIT_DIR is the directory where sbatch was invoked (repo root).
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERL_ROOT="${REPO_ROOT}/verl"
 
 # Auto-start math verify HTTP server (Ray workers call it remotely; do not run math_verify in-process).

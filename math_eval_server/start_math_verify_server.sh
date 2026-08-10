@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Source this file from Slurm/training scripts to auto-start the math verify HTTP server.
+# Source this file from training scripts to auto-start the math verify HTTP server.
 #
 # Usage:
 #   source "${REPO_ROOT}/math_eval_server/start_math_verify_server.sh"
@@ -11,17 +11,13 @@ _math_verify_log_file=""
 
 _math_verify_resolve_log_file() {
     local repo_root="$1"
-    local log_dir="${MATH_VERIFY_LOG_DIR:-${repo_root}/logs/w2s_math}"
+    local log_dir="${MATH_VERIFY_LOG_DIR:-${repo_root}/logs/math_verify}"
     mkdir -p "${log_dir}"
     if [[ -n "${MATH_VERIFY_LOG_FILE:-}" ]]; then
         echo "${MATH_VERIFY_LOG_FILE}"
         return 0
     fi
-    if [[ -n "${SLURM_JOB_ID:-}" ]]; then
-        echo "${log_dir}/math_verify_${SLURM_JOB_ID}.log"
-    else
-        echo "${log_dir}/math_verify_local_$$.log"
-    fi
+    echo "${log_dir}/math_verify_$$.log"
 }
 
 _math_verify_health_ok() {
@@ -78,13 +74,7 @@ start_math_verify_server() {
     fi
 
     export MATH_VERIFY_HOST="${MATH_VERIFY_HOST:-0.0.0.0}"
-    if [[ -z "${MATH_VERIFY_PORT:-}" ]]; then
-        if [[ -n "${SLURM_JOB_ID:-}" ]]; then
-            export MATH_VERIFY_PORT=$((7683 + SLURM_JOB_ID % 1000))
-        else
-            export MATH_VERIFY_PORT=7683
-        fi
-    fi
+    export MATH_VERIFY_PORT="${MATH_VERIFY_PORT:-7683}"
 
     local node_ip
     node_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
