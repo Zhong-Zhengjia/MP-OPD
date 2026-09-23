@@ -14,6 +14,12 @@
 
 </div>
 
+> This is the MP-OPD development fork. See [docs/MP-OPD.md](docs/MP-OPD.md).
+> Original P-OPD behavior remains available unless
+> `algorithm.train_mode=multi_prompt_distill` is selected.
+
+> **Validation environment:** This workstation does not contain the project runtime environment or model weights. Local work is limited to repository/static checks. PyTorch/verl/Ray/FSDP/vLLM tests, GPU integration, and training smoke tests must be run after deploying the code to the configured server; until then they are reported as not run.
+
 > 💡 P-OPD decouples LLM post-training into **proxy exploration** → **update-signal extraction** → **signal transfer**. A lightweight proxy performs low-cost trial-and-error, while the target model aligns to relative improvement signals via on-policy distillation.
 
 
