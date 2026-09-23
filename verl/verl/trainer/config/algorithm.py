@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "MPOPDConfig", "RolloutCorrectionConfig"]
 
 
 @dataclass
@@ -331,12 +331,58 @@ class RolloutCorrectionConfig(BaseConfig):
 
 
 @dataclass
+class MPOPDConfig(BaseConfig):
+    """Configuration for Multi-Prompt Expert On-Policy Distillation."""
+
+    expert_names: list[str] = field(
+        default_factory=lambda: ["chasing", "long_term", "repurchase", "generalized"]
+    )
+    expert_instructions: dict[str, str] = field(
+        default_factory=lambda: {
+            "chasing": "加强关注近期高强度兴趣及其延续性",
+            "long_term": "加强关注跨时间窗口稳定出现的长期偏好",
+            "repurchase": "加强关注重复购买、消耗周期和历史复购间隔",
+            "generalized": "加强关注相邻品类和可迁移的泛化兴趣",
+        }
+    )
+    top_k: int = 10
+    expert_temperature: float = 1.0
+    token_temperature: float = 1.0
+    lambda_value: float = 1.0
+    expert_priors: Optional[list[float]] = None
+    expert_forward_micro_batch_size: int = 0
+    skip_samples_without_active_experts: bool = True
+    max_expert_prompt_length: int = 4096
+
+    def __post_init__(self):
+        if not self.expert_names or len(set(self.expert_names)) != len(self.expert_names):
+            raise ValueError("expert_names must be non-empty and unique")
+        if set(self.expert_instructions) != set(self.expert_names):
+            raise ValueError("expert_instructions keys must exactly match expert_names")
+        if any(not value.strip() for value in self.expert_instructions.values()):
+            raise ValueError("expert instructions must be non-empty")
+        if self.top_k <= 0:
+            raise ValueError("top_k must be positive")
+        if min(self.expert_temperature, self.token_temperature, self.lambda_value) <= 0:
+            raise ValueError("temperatures and lambda_value must be positive")
+        if self.expert_forward_micro_batch_size < 0:
+            raise ValueError("expert_forward_micro_batch_size must be non-negative")
+        if self.max_expert_prompt_length <= 0:
+            raise ValueError("max_expert_prompt_length must be positive")
+        if self.expert_priors is not None:
+            if len(self.expert_priors) != len(self.expert_names) or any(value <= 0 for value in self.expert_priors):
+                raise ValueError("expert_priors must be positive and match expert_names")
+
+
+@dataclass
 class AlgoConfig(BaseConfig):
     """Configuration for the algorithm.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
+        train_mode (str): Training loop mode. MP-OPD uses "multi_prompt_distill".
+        mp_opd (MPOPDConfig): Multi-prompt expert distillation configuration.
         gamma (float): Discount factor for future rewards.
         lam (float): Trade-off between bias and variance in the GAE estimator.
         adv_estimator (str): Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
@@ -363,6 +409,8 @@ class AlgoConfig(BaseConfig):
             RolloutCorrectionConfig automatically.
     """
 
+    train_mode: str = "ppo"
+    mp_opd: MPOPDConfig = field(default_factory=MPOPDConfig)
     gamma: float = 1.0
     lam: float = 1.0
     adv_estimator: str = "gae"

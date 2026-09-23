@@ -102,6 +102,54 @@ algorithm:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.trainer.config.AlgoConfig
 
+  # Training mode; MP-OPD uses multi_prompt_distill
+  train_mode: ppo
+
+  # Multi-Prompt Expert On-Policy Distillation configuration
+  mp_opd:
+
+    # Ordered expert axis used by prompt packing and tensor fusion
+    expert_names: [chasing, long_term, repurchase, generalized]
+
+    # Default focus instruction for each configured expert
+    expert_instructions:
+
+      # Focus instruction for recent high-intensity interests
+      chasing: "加强关注近期高强度兴趣及其延续性"
+
+      # Focus instruction for stable long-term interests
+      long_term: "加强关注跨时间窗口稳定出现的长期偏好"
+
+      # Focus instruction for repeat-purchase behavior
+      repurchase: "加强关注重复购买、消耗周期和历史复购间隔"
+
+      # Focus instruction for generalized adjacent interests
+      generalized: "加强关注相邻品类和可迁移的泛化兴趣"
+
+    # Number of current-student token candidates scored by every expert
+    top_k: 10
+
+    # Temperature for the expert-axis softmax over absolute deltas
+    expert_temperature: 1.0
+
+    # Temperature for the token-axis target softmax
+    token_temperature: 1.0
+
+    # Scale applied to the signed fused expert delta
+    lambda_value: 1.0
+
+    # Optional positive prior per expert; null means uniform priors
+    expert_priors: null
+
+    # Expert forward chunk size; zero selects the worker default
+    expert_forward_micro_batch_size: 0
+
+    # Skip the MP-OPD loss for samples where every expert is unavailable
+    skip_samples_without_active_experts: true
+
+    # Maximum token length allowed for a specialized expert prompt
+    max_expert_prompt_length: 4096
+
   # Discount factor for future rewards
   gamma: 1.0
 
