@@ -237,10 +237,11 @@ class TaskRunner:
                 self.mapping[Role.RewardModel] = "global_pool"
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
-        """Add reference policy worker if KL loss or KL reward is used."""
+        """Add the reference policy worker when KL or MP-OPD needs it."""
         from verl.trainer.ppo.ray_trainer import Role
 
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+        needs_mp_expert = config.algorithm.get("train_mode", "ppo") == "multi_prompt_distill"
+        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss or needs_mp_expert:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 
@@ -262,10 +263,11 @@ class TaskRunner:
         self.add_reward_model_worker(config)
         self.add_ref_policy_worker(config, actor_rollout_cls)
 
+        is_mp_opd = config.algorithm.get("train_mode", "ppo") == "multi_prompt_distill"
         validate_config(
             config=config,
             use_reference_policy=need_reference_policy(self.role_worker_mapping),
-            use_critic=need_critic(config),
+            use_critic=need_critic(config) and not is_mp_opd,
         )
 
         local_path = copy_to_local(

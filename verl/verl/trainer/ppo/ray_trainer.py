@@ -49,6 +49,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.expert_prompt_utils import attach_expert_prompt_tensors, prepare_expert_prompt_inputs
 from verl.trainer.ppo.metric_utils import (
     add_macro_average_val_metrics,
     compute_data_metrics,
@@ -371,6 +372,10 @@ class RayPPOTrainer:
         # training mode
         self.train_mode = self.config.algorithm.get("train_mode", "ppo")
         self.is_hetero_distill = self.train_mode == "heterogeneous_distill"
+        self.is_mp_opd = self.train_mode == "multi_prompt_distill"
+        self.mp_opd_config = self.config.algorithm.mp_opd
+        if self.is_mp_opd:
+            self._validate_mpopd_setup()
 
         hetero_cfg = self.config.algorithm.get("hetero_distill", {})
         print(hetero_cfg)
@@ -404,7 +409,7 @@ class RayPPOTrainer:
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
         self.use_rm = need_reward_model(self.role_worker_mapping)
-        self.use_critic = need_critic(self.config)
+        self.use_critic = need_critic(self.config) and not self.is_mp_opd
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -412,9 +417,11 @@ class RayPPOTrainer:
             experiment_name=self.config.trainer.experiment_name,
         )
 
-        # if ref_in_actor is True, the reference policy will be actor without lora applied
+        # MP-OPD uses the frozen expert already hosted by the actor-rollout-ref worker.
+        # LoRA mode also obtains its reference policy from that colocated worker.
         self.ref_in_actor = (
-            config.actor_rollout_ref.model.get("lora_rank", 0) > 0
+            self.is_mp_opd
+            or config.actor_rollout_ref.model.get("lora_rank", 0) > 0
             or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
         )
 
@@ -426,6 +433,31 @@ class RayPPOTrainer:
         self.teacher_rollout_wg = None
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _validate_mpopd_setup(self) -> None:
+        """Reject MP-OPD configurations that cannot share token candidate IDs safely."""
+        if int(self.mp_opd_config.top_k) <= 0:
+            raise ValueError("MP-OPD top_k must be positive")
+        if not bool(self.config.data.get("return_raw_chat", False)):
+            raise ValueError("MP-OPD requires data.return_raw_chat=true")
+
+        actor_base_path = self.config.actor_rollout_ref.model.get("base_model_path", None)
+        if not actor_base_path:
+            raise ValueError("MP-OPD requires actor_rollout_ref.model.base_model_path")
+
+        ref_model = self.config.actor_rollout_ref.ref.get("model", None)
+        ref_model_path = ref_model.get("path", None) if ref_model is not None else None
+        if not ref_model_path:
+            raise ValueError("MP-OPD requires a reference expert model path")
+        if self.ref_tokenizer is None:
+            raise ValueError("MP-OPD requires a reference tokenizer")
+        if self.use_cross_token_bridge:
+            raise ValueError("MP-OPD does not support a cross-token tokenizer bridge")
+
+        student_vocab = self.tokenizer.get_vocab()
+        teacher_vocab = self.ref_tokenizer.get_vocab()
+        if student_vocab != teacher_vocab:
+            raise ValueError("MP-OPD student and reference vocabularies must be identical")
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -2057,7 +2089,161 @@ class RayPPOTrainer:
         )
         return update_batch, timing_metrics
 
+    def _prepare_mpopd_update_batch(self, batch: DataProto) -> tuple[DataProto, dict]:
+        """Attach specialized prompts and request all frozen MP-OPD probabilities."""
+        clean_input_ids = batch.batch["input_ids"].clone()
+        packed = prepare_expert_prompt_inputs(batch, self.ref_tokenizer, self.mp_opd_config)
+        update_batch = attach_expert_prompt_tensors(batch, packed)
+        if not torch.equal(update_batch.batch["input_ids"], clean_input_ids):
+            raise RuntimeError("MP-OPD expert prompt packing modified the clean student inputs")
+        if "expert_contexts" in update_batch.non_tensor_batch:
+            raise RuntimeError("raw MP-OPD expert contexts must not cross the worker RPC boundary")
+
+        update_batch.meta_info.update(
+            {
+                "top_k": int(self.mp_opd_config.top_k),
+                "num_experts": len(self.mp_opd_config.expert_names),
+                "expert_forward_micro_batch_size": int(
+                    self.mp_opd_config.expert_forward_micro_batch_size
+                ),
+                "temperature": float(self.config.actor_rollout_ref.rollout.temperature),
+                "mpopd_expert_temperature": float(self.mp_opd_config.expert_temperature),
+                "mpopd_token_temperature": float(self.mp_opd_config.token_temperature),
+                "mpopd_lambda_value": float(self.mp_opd_config.lambda_value),
+                "mpopd_expert_priors": self.mp_opd_config.expert_priors,
+            }
+        )
+        probability_output = self.actor_rollout_wg.prepare_mpopd_log_probs(update_batch)
+        preparation_metrics = reduce_metrics(probability_output.meta_info.get("metrics", {}))
+        return update_batch.union(probability_output), preparation_metrics
+
+    def _run_mpopd_step(self, batch: DataProto, metrics: dict, timing_raw: dict) -> dict:
+        """Run one reward-free clean-rollout and multi-prompt distillation update."""
+        prompt_metadata = {
+            key: copy.deepcopy(batch.non_tensor_batch[key])
+            for key in ("raw_prompt", "expert_contexts")
+            if key in batch.non_tensor_batch
+        }
+        batch.meta_info.update(
+            {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "do_sample": True,
+                "validate": False,
+                "global_steps": getattr(self, "global_steps", 0),
+            }
+        )
+        with marked_timer("gen", timing_raw, color="red"):
+            update_batch = self.actor_rollout_wg.generate_sequences(batch)
+        for key, values in prompt_metadata.items():
+            if len(update_batch) == len(values):
+                update_batch.non_tensor_batch[key] = values
+            elif len(values) and len(update_batch) % len(values) == 0:
+                update_batch.non_tensor_batch[key] = np.repeat(
+                    values, len(update_batch) // len(values), axis=0
+                )
+            else:
+                raise ValueError(
+                    f"MP-OPD rollout batch size {len(update_batch)} cannot be aligned with {key} "
+                    f"batch size {len(values)}"
+                )
+        update_batch.check_consistency()
+        update_batch = self._ensure_response_mask(update_batch)
+        update_batch.meta_info["global_token_num"] = torch.sum(
+            update_batch.batch["attention_mask"], dim=-1
+        ).tolist()
+        metrics["mpopd/response_length_mean"] = (
+            update_batch.batch["response_mask"].sum(dim=-1).float().mean().item()
+        )
+
+        with marked_timer("mpopd_prep", timing_raw, color="cyan"):
+            update_batch, preparation_metrics = self._prepare_mpopd_update_batch(update_batch)
+        metrics.update(preparation_metrics)
+
+        with marked_timer("update_mpopd", timing_raw, color="purple"):
+            actor_output = self.actor_rollout_wg.update_actor_mpopd(update_batch)
+        actor_metrics = reduce_metrics(actor_output.meta_info.get("metrics", {}))
+        metrics.update(actor_metrics)
+        return metrics
+
+    def _fit_mpopd(self):
+        """Train only with MP-OPD while retaining checkpoint and validation cadence."""
+        from verl.utils.tracking import Tracking
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        self.global_steps = 0
+        self._load_checkpoint()
+
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            val_metrics = self._validate()
+            if val_metrics:
+                pprint(f"Initial validation metrics: {val_metrics}")
+                logger.log(data=val_metrics, step=self.global_steps)
+            if self.config.trainer.get("val_only", False):
+                return
+
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="MP-OPD Progress")
+        self.global_steps += 1
+        last_val_metrics = None
+        self.max_steps_duration = 0
+
+        for epoch in range(self.config.trainer.total_epochs):
+            for batch_dict in self.train_dataloader:
+                metrics = {}
+                timing_raw = {}
+                batch = DataProto.from_single_dict(batch_dict)
+                is_last_step = self.global_steps >= self.total_training_steps
+
+                if self._is_empty_dataproto(batch):
+                    metrics["mpopd/skip_empty_batch"] = 1
+                else:
+                    with marked_timer("step", timing_raw):
+                        self._run_mpopd_step(batch, metrics, timing_raw)
+
+                        if (
+                            self.val_reward_fn is not None
+                            and self.config.trainer.test_freq > 0
+                            and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                        ):
+                            with marked_timer("testing", timing_raw, color="green"):
+                                val_metrics = self._validate()
+                            if is_last_step:
+                                last_val_metrics = val_metrics
+                            metrics.update(val_metrics)
+
+                        if self.config.trainer.save_freq > 0 and (
+                            is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                        ):
+                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                self._save_checkpoint(metrics=metrics)
+
+                step_duration = timing_raw.get("step", 0.0)
+                self.max_steps_duration = max(self.max_steps_duration, step_duration)
+                metrics.update(
+                    {
+                        "training/global_step": self.global_steps,
+                        "training/epoch": epoch,
+                    }
+                )
+                logger.log(data=metrics, step=self.global_steps)
+                progress_bar.update(1)
+                self.global_steps += 1
+
+                if is_last_step:
+                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    progress_bar.close()
+                    return
+
     def fit(self):
+        if self.is_mp_opd:
+            return self._fit_mpopd()
+
         from omegaconf import OmegaConf
         from pprint import pprint
         from tqdm import tqdm
