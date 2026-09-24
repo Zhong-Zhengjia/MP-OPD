@@ -183,7 +183,7 @@ def _worker_and_batch(*, empty_experts=False, invalid_ids=False):
     worker._is_ref = True
     worker._is_lora = False
     worker._is_offload_param = False
-    worker.world_size = 1
+    worker._world_size = 1
     worker.ulysses_sharding_manager = nullcontext()
     worker.actor = _FakeActor(calls, invalid_ids=invalid_ids)
     worker.base_policy = _FakeScorer(calls, "student_base")

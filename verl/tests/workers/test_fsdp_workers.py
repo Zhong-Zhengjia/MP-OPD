@@ -28,6 +28,8 @@ def test_actor_rollout_ref_worker_actor_ref_model():
     config_str = """
     model:
       path: Qwen/Qwen2.5-0.5B-Instruct
+      override_config:
+        attn_implementation: eager
     actor:
       _target_: verl.workers.config.FSDPActorConfig
       strategy: fsdp
