@@ -27,18 +27,24 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    build_mpopd_target,
+    compute_mpopd_kl_loss,
+    get_policy_loss_fn,
+    kl_penalty,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
+from verl.utils.torch_functional import logprobs_from_logits, topk_logprobs_from_logits
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
-from verl.utils.torch_functional import logprobs_from_logits, topk_logprobs_from_logits
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -1262,6 +1268,235 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, {"actor/grad_norm": 0.0})
 
         self.actor_optimizer.zero_grad()
+        return metrics
+
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def update_policy_mpopd(self, data: DataProto):
+        """Update only the student from detached multi-prompt expert targets."""
+        self.actor_module.train()
+
+        temperature = data.meta_info["temperature"]
+        expert_temperature = data.meta_info["mpopd_expert_temperature"]
+        token_temperature = data.meta_info["mpopd_token_temperature"]
+        lambda_value = data.meta_info["mpopd_lambda_value"]
+        expert_priors = data.meta_info.get("mpopd_expert_priors")
+
+        select_keys = [
+            "responses",
+            "response_mask",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "student_topk_ids",
+            "old_log_probs",
+            "student_base_topk_log_probs",
+            "teacher_base_topk_log_probs",
+            "specialized_expert_topk_log_probs",
+            "expert_mask",
+        ]
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+        mini_batches = data.split(self.config.ppo_mini_batch_size)
+
+        mpopd_lr_scale = float(self.config.get("mpopd_lr_scale", 1.0))
+        metrics = {}
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        collective_device = next(self.actor_module.parameters()).device
+
+        @torch.no_grad()
+        def masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+            mask = mask.to(device=value.device, dtype=value.dtype)
+            while mask.ndim < value.ndim:
+                mask = mask.unsqueeze(-1)
+            mask = mask.expand_as(value)
+            return torch.where(mask.bool(), value, torch.zeros_like(value)).sum() / mask.sum().clamp_min(1.0)
+
+        @torch.no_grad()
+        def any_rank(local_value: bool) -> bool:
+            flag = torch.tensor(int(local_value), device=collective_device, dtype=torch.int32)
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+            return bool(flag.item())
+
+        for _ in range(self.config.ppo_epochs):
+            for mini_batch in mini_batches:
+                model_batch = mini_batch.batch
+                target = build_mpopd_target(
+                    model_batch["specialized_expert_topk_log_probs"].float(),
+                    model_batch["teacher_base_topk_log_probs"].float(),
+                    model_batch["student_base_topk_log_probs"].float(),
+                    model_batch["expert_mask"],
+                    expert_temperature=expert_temperature,
+                    token_temperature=token_temperature,
+                    lambda_value=lambda_value,
+                    expert_priors=expert_priors,
+                )
+                finite_target_values = (
+                    target.target_probs,
+                    target.target_log_probs,
+                    target.expert_weights,
+                    target.fused_delta,
+                )
+                target_is_finite = all(bool(torch.isfinite(value).all()) for value in finite_target_values)
+                target_is_normalized = bool(
+                    torch.allclose(
+                        target.target_probs.sum(dim=-1),
+                        torch.ones_like(target.target_probs[..., 0]),
+                        atol=1e-5,
+                        rtol=1e-5,
+                    )
+                )
+                if any_rank(not target_is_finite or not target_is_normalized):
+                    if not target_is_finite:
+                        detail = "contains NaN or Inf"
+                    elif not target_is_normalized:
+                        detail = "probabilities do not sum to one"
+                    else:
+                        detail = "is invalid on another data-parallel rank"
+                    raise FloatingPointError(f"MP-OPD target {detail}")
+
+                model_batch["mpopd_target_probs"] = target.target_probs
+                model_batch["mpopd_valid_samples"] = target.valid_samples
+                response_mask = model_batch["response_mask"]
+                valid_token_mask = response_mask.bool() & target.valid_samples[:, None]
+                total_valid_tokens = valid_token_mask.sum()
+                global_has_valid_tokens = any_rank(bool(total_valid_tokens.item() > 0))
+                unavailable_count = (~target.valid_samples).sum().item()
+                top_k = model_batch["student_topk_ids"].shape[-1]
+
+                target_entropy = -(target.target_probs * target.target_log_probs).sum(dim=-1)
+                weight_log = torch.where(
+                    target.expert_weights > 0,
+                    target.expert_weights.clamp_min(torch.finfo(target.expert_weights.dtype).tiny).log(),
+                    torch.zeros_like(target.expert_weights),
+                )
+                expert_weight_entropy = -(target.expert_weights * weight_log).sum(dim=-1)
+                max_expert_weight = target.expert_weights.max(dim=-1).values
+                candidate_mask = valid_token_mask.unsqueeze(-1).expand_as(target.fused_delta)
+
+                enabled = model_batch["expert_mask"].bool()[:, None, None, :]
+                positive = ((target.expert_delta > 0) & enabled).any(dim=-1)
+                negative = ((target.expert_delta < 0) & enabled).any(dim=-1)
+                conflict = (positive & negative).to(target.fused_delta.dtype)
+
+                mini_metrics = {
+                    "actor/mpopd_target_entropy": masked_mean(target_entropy, valid_token_mask).item(),
+                    "actor/mpopd_expert_weight_entropy": masked_mean(
+                        expert_weight_entropy, candidate_mask
+                    ).item(),
+                    "actor/mpopd_max_expert_weight": masked_mean(
+                        max_expert_weight, candidate_mask
+                    ).item(),
+                    "actor/mpopd_fused_delta_mean": masked_mean(
+                        target.fused_delta, candidate_mask
+                    ).item(),
+                    "actor/mpopd_fused_delta_abs_mean": masked_mean(
+                        target.fused_delta.abs(), candidate_mask
+                    ).item(),
+                    "actor/mpopd_conflict_rate": masked_mean(conflict, candidate_mask).item(),
+                    "actor/mpopd_all_experts_unavailable_count": float(unavailable_count),
+                    "actor/mpopd_top_k": float(top_k),
+                }
+
+                self.actor_optimizer.zero_grad()
+                did_backward = False
+                kl_numerator = 0.0
+                student_entropy_numerator = 0.0
+
+                if global_has_valid_tokens:
+                    forward_batch = mini_batch.select(
+                        batch_keys=[
+                            "responses",
+                            "response_mask",
+                            "input_ids",
+                            "attention_mask",
+                            "position_ids",
+                            "student_topk_ids",
+                            "mpopd_target_probs",
+                            "mpopd_valid_samples",
+                        ],
+                        non_tensor_batch_keys=non_tensor_select_keys,
+                    )
+                    if self.config.use_dynamic_bsz:
+                        max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                        micro_batches, _ = prepare_dynamic_batch(forward_batch, max_token_len=max_token_len)
+                    else:
+                        micro_batches = forward_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                    for micro_batch in micro_batches:
+                        micro_batch = micro_batch.to(get_device_id())
+                        model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                        micro_valid_mask = (
+                            model_inputs["response_mask"].bool()
+                            & model_inputs["mpopd_valid_samples"][:, None]
+                        )
+                        micro_valid_tokens = micro_valid_mask.sum()
+
+                        _, _, student_topk_log_probs = self._forward_micro_batch(
+                            model_inputs,
+                            temperature=temperature,
+                            calculate_entropy=False,
+                            return_topk_log_probs=True,
+                        )
+                        student_is_finite = bool(torch.isfinite(student_topk_log_probs).all())
+                        if any_rank(not student_is_finite):
+                            raise FloatingPointError("MP-OPD student log probabilities contain NaN or Inf")
+
+                        loss = compute_mpopd_kl_loss(
+                            student_topk_log_probs,
+                            model_inputs["mpopd_target_probs"],
+                            model_inputs["response_mask"],
+                            model_inputs["mpopd_valid_samples"],
+                        )
+                        loss_is_finite = bool(torch.isfinite(loss))
+                        if any_rank(not loss_is_finite):
+                            raise FloatingPointError("MP-OPD loss contains NaN or Inf")
+
+                        if int(total_valid_tokens.item()) > 0:
+                            loss_scale = micro_valid_tokens.to(device=loss.device, dtype=loss.dtype) / (
+                                total_valid_tokens.to(device=loss.device, dtype=loss.dtype)
+                            )
+                        else:
+                            loss_scale = loss.new_tensor(1.0)
+                        scaled_loss = loss * loss_scale
+                        if self.scaler is not None:
+                            self.scaler.scale(scaled_loss).backward()
+                        else:
+                            scaled_loss.backward()
+                        did_backward = True
+
+                        with torch.no_grad():
+                            student_log_probs = torch.log_softmax(student_topk_log_probs, dim=-1)
+                            student_probs = student_log_probs.exp()
+                            student_entropy = -(student_probs * student_log_probs).sum(dim=-1)
+                            kl_numerator += loss.detach().item() * micro_valid_tokens.item()
+                            student_entropy_numerator += (
+                                student_entropy * micro_valid_mask.to(student_entropy.dtype)
+                            ).sum().item()
+
+                if did_backward:
+                    grad_norm = self._optimizer_step(lr_scale=mpopd_lr_scale)
+                    grad_norm_value = grad_norm.detach().item()
+                    denominator = total_valid_tokens.item()
+                    if denominator > 0:
+                        mini_metrics["actor/mpopd_kl_loss"] = kl_numerator / denominator
+                        mini_metrics["actor/mpopd_student_topk_entropy"] = (
+                            student_entropy_numerator / denominator
+                        )
+                    else:
+                        mini_metrics["actor/mpopd_kl_loss"] = 0.0
+                        mini_metrics["actor/mpopd_student_topk_entropy"] = 0.0
+                else:
+                    grad_norm_value = 0.0
+                    mini_metrics["actor/mpopd_kl_loss"] = 0.0
+                    mini_metrics["actor/mpopd_student_topk_entropy"] = 0.0
+
+                mini_metrics["actor/grad_norm"] = grad_norm_value
+                append_to_dict(metrics, mini_metrics)
+
+        self.actor_optimizer.zero_grad(set_to_none=True)
         return metrics
 
 

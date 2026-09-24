@@ -205,6 +205,24 @@ class TestActorConfig(unittest.TestCase):
         )
         self.assertIsNotNone(config)  # Should not raise an exception
 
+    def test_mpopd_lr_scale_defaults_to_one_and_accepts_override(self):
+        from hydra import compose, initialize_config_dir
+
+        optim = OptimizerConfig(lr=0.1)
+        default = ActorConfig(strategy="fsdp", use_dynamic_bsz=True, optim=optim)
+        overridden = ActorConfig(
+            strategy="fsdp",
+            use_dynamic_bsz=True,
+            optim=optim,
+            mpopd_lr_scale=0.25,
+        )
+
+        self.assertEqual(default.mpopd_lr_scale, 1.0)
+        self.assertEqual(overridden.mpopd_lr_scale, 0.25)
+        with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config/actor")):
+            cfg = compose(config_name="actor", overrides=["strategy=fsdp", "mpopd_lr_scale=0.25"])
+        self.assertEqual(cfg.mpopd_lr_scale, 0.25)
+
     def test_fsdp_actor_config_validation_exceptions(self):
         """Test that FSDPActorConfig.validate() raises appropriate validation exceptions."""
         optim = OptimizerConfig(lr=0.1)

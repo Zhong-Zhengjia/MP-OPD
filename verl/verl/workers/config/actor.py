@@ -122,6 +122,7 @@ class ActorConfig(BaseConfig):
         use_torch_compile (bool): Whether to use torch.compile for optimization.
         kl_loss_coef (float): KL divergence loss coefficient.
         kl_loss_type (str): Type of KL loss to use.
+        mpopd_lr_scale (float): Temporary optimizer learning-rate scale for MP-OPD updates.
         ppo_epochs (int): Number of PPO epochs per training step.
         shuffle (bool): Whether to shuffle data during training.
         checkpoint (CheckpointConfig): Configuration for checkpointing.
@@ -168,6 +169,7 @@ class ActorConfig(BaseConfig):
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     grpo_lr_scale: float = 1.0
     opd_lr_scale: float = 0.2
+    mpopd_lr_scale: float = 1.0
     use_pos_delta_logp_mask: bool = False
 
     def __post_init__(self):

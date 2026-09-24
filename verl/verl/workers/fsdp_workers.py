@@ -2024,6 +2024,57 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="actor_update_mpopd")
+    def update_actor_mpopd(self, data: DataProto):
+        """Run one MP-OPD student update while keeping all probability sources frozen."""
+        if not self._is_actor or self.actor is None:
+            raise RuntimeError("MP-OPD update requires the student actor")
+        if self.base_policy is None:
+            raise RuntimeError("MP-OPD update requires the frozen student base")
+        if self.ref_policy is None:
+            raise RuntimeError("MP-OPD update requires the frozen teacher expert")
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(
+                optimizer=self.actor_optimizer,
+                device_id=get_device_id(),
+            )
+
+        try:
+            with self.ulysses_sharding_manager:
+                data = self._set_actor_log_prob_meta_info(data.to("cpu"))
+                with Timer(name="update_policy_mpopd", logger=None) as timer:
+                    metrics = self.actor.update_policy_mpopd(data=data)
+
+                metrics = reduce_metrics(metrics)
+                metrics["timing/update_policy_mpopd_s"] = timer.last
+
+                if self.actor_lr_scheduler is not None:
+                    lr = self.actor_lr_scheduler.get_last_lr()[0]
+                    metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+                    self.actor_lr_scheduler.step()
+
+                output = DataProto(meta_info={"metrics": metrics}).to("cpu")
+        finally:
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                log_gpu_memory_usage(
+                    "After offload actor model during update_actor_mpopd",
+                    logger=logger,
+                )
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+                log_gpu_memory_usage(
+                    "After offload actor optimizer during update_actor_mpopd",
+                    logger=logger,
+                )
+
+        return output
+
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
