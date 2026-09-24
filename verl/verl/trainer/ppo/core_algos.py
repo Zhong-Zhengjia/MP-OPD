@@ -18,9 +18,17 @@ The function implemented in this file should be used by trainer with different d
 implement PPO-like algorithms.
 """
 
-__all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
+__all__ = [
+    "AdvantageEstimator",
+    "MPOPDTarget",
+    "build_mpopd_target",
+    "compute_mpopd_kl_loss",
+    "get_adv_estimator_fn",
+    "register_adv_est",
+]
 
 from collections import defaultdict
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional
 
@@ -83,6 +91,170 @@ def get_policy_loss_fn(name):
             f"Unsupported loss mode: {loss_name}. Supported modes are: {list(POLICY_LOSS_REGISTRY.keys())}"
         )
     return POLICY_LOSS_REGISTRY[loss_name]
+
+
+@dataclass
+class MPOPDTarget:
+    """Detached intermediate values produced by the two-stage MP-OPD target builder."""
+
+    target_probs: torch.Tensor
+    target_log_probs: torch.Tensor
+    anchor_probs: torch.Tensor
+    expert_weights: torch.Tensor
+    expert_delta: torch.Tensor
+    fused_delta: torch.Tensor
+    valid_samples: torch.Tensor
+
+
+def _validate_mpopd_target_inputs(
+    specialized_expert_log_probs: torch.Tensor,
+    teacher_base_log_probs: torch.Tensor,
+    student_base_log_probs: torch.Tensor,
+    expert_mask: torch.Tensor,
+) -> tuple[int, int, int, int]:
+    if specialized_expert_log_probs.ndim != 4:
+        raise ValueError(
+            "specialized_expert_log_probs must have shape [batch, response, top_k, experts], "
+            f"got {tuple(specialized_expert_log_probs.shape)}"
+        )
+    batch_size, response_length, top_k, num_experts = specialized_expert_log_probs.shape
+    expected_base_shape = (batch_size, response_length, top_k)
+    if tuple(teacher_base_log_probs.shape) != expected_base_shape:
+        raise ValueError(
+            f"teacher_base_log_probs must have shape {expected_base_shape}, "
+            f"got {tuple(teacher_base_log_probs.shape)}"
+        )
+    if tuple(student_base_log_probs.shape) != expected_base_shape:
+        raise ValueError(
+            f"student_base_log_probs must have shape {expected_base_shape}, "
+            f"got {tuple(student_base_log_probs.shape)}"
+        )
+    if tuple(expert_mask.shape) != (batch_size, num_experts):
+        raise ValueError(
+            f"expert_mask must have shape {(batch_size, num_experts)}, got {tuple(expert_mask.shape)}"
+        )
+    if top_k <= 0 or num_experts <= 0:
+        raise ValueError("top_k and expert dimensions must be non-empty")
+    if not all(
+        torch.is_floating_point(value)
+        for value in (specialized_expert_log_probs, teacher_base_log_probs, student_base_log_probs)
+    ):
+        raise TypeError("MP-OPD log probabilities must be floating-point tensors")
+    return batch_size, response_length, top_k, num_experts
+
+
+def _positive_float(value: float, name: str) -> float:
+    value = float(value)
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be positive and finite")
+    return value
+
+
+def build_mpopd_target(
+    specialized_expert_log_probs: torch.Tensor,
+    teacher_base_log_probs: torch.Tensor,
+    student_base_log_probs: torch.Tensor,
+    expert_mask: torch.Tensor,
+    *,
+    expert_temperature: float = 1.0,
+    token_temperature: float = 1.0,
+    lambda_value: float = 1.0,
+    expert_priors: torch.Tensor | list[float] | None = None,
+) -> MPOPDTarget:
+    """Fuse prompt-conditioned expert deltas into a detached top-k target distribution."""
+    _, _, _, num_experts = _validate_mpopd_target_inputs(
+        specialized_expert_log_probs,
+        teacher_base_log_probs,
+        student_base_log_probs,
+        expert_mask,
+    )
+    expert_temperature = _positive_float(expert_temperature, "expert_temperature")
+    token_temperature = _positive_float(token_temperature, "token_temperature")
+    lambda_value = _positive_float(lambda_value, "lambda_value")
+
+    with torch.no_grad():
+        expert_delta = specialized_expert_log_probs - teacher_base_log_probs.unsqueeze(-1)
+        routing_logits = expert_delta.abs() / expert_temperature
+
+        if expert_priors is not None:
+            priors = torch.as_tensor(
+                expert_priors,
+                dtype=routing_logits.dtype,
+                device=routing_logits.device,
+            )
+            if priors.ndim != 1 or priors.numel() != num_experts:
+                raise ValueError(f"expert_priors must contain exactly {num_experts} values")
+            if not torch.isfinite(priors).all() or bool((priors <= 0).any()):
+                raise ValueError("expert_priors must be positive and finite")
+            routing_logits = routing_logits + priors.log().view(1, 1, 1, num_experts)
+
+        mask = expert_mask.to(device=routing_logits.device, dtype=torch.bool)
+        expanded_mask = mask[:, None, None, :]
+        valid_samples = mask.any(dim=-1)
+        masked_logits = routing_logits.masked_fill(~expanded_mask, -torch.inf)
+        safe_logits = torch.where(
+            valid_samples[:, None, None, None],
+            masked_logits,
+            torch.zeros_like(masked_logits),
+        )
+        expert_weights = torch.softmax(safe_logits, dim=-1)
+        expert_weights = torch.where(expanded_mask, expert_weights, torch.zeros_like(expert_weights))
+        enabled_delta = torch.where(expanded_mask, expert_delta, torch.zeros_like(expert_delta))
+        fused_delta = (expert_weights * enabled_delta).sum(dim=-1)
+
+        anchor_probs = torch.softmax(student_base_log_probs, dim=-1)
+        target_logits = student_base_log_probs + fused_delta / (lambda_value * token_temperature)
+        target_log_probs = torch.log_softmax(target_logits, dim=-1)
+        target_probs = target_log_probs.exp()
+
+    return MPOPDTarget(
+        target_probs=target_probs.detach(),
+        target_log_probs=target_log_probs.detach(),
+        anchor_probs=anchor_probs.detach(),
+        expert_weights=expert_weights.detach(),
+        expert_delta=expert_delta.detach(),
+        fused_delta=fused_delta.detach(),
+        valid_samples=valid_samples.detach(),
+    )
+
+
+def compute_mpopd_kl_loss(
+    student_topk_log_probs: torch.Tensor,
+    target_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    valid_samples: torch.Tensor,
+) -> torch.Tensor:
+    """Compute token-mean KL(q || student) over valid MP-OPD samples."""
+    if student_topk_log_probs.ndim != 3:
+        raise ValueError(
+            "student_topk_log_probs must have shape [batch, response, top_k], "
+            f"got {tuple(student_topk_log_probs.shape)}"
+        )
+    if target_probs.shape != student_topk_log_probs.shape:
+        raise ValueError(
+            f"target_probs shape {tuple(target_probs.shape)} must match student shape "
+            f"{tuple(student_topk_log_probs.shape)}"
+        )
+    batch_size, response_length, _ = student_topk_log_probs.shape
+    if tuple(response_mask.shape) != (batch_size, response_length):
+        raise ValueError(
+            f"response_mask must have shape {(batch_size, response_length)}, got {tuple(response_mask.shape)}"
+        )
+    if tuple(valid_samples.shape) != (batch_size,):
+        raise ValueError(f"valid_samples must have shape {(batch_size,)}, got {tuple(valid_samples.shape)}")
+    if not torch.is_floating_point(student_topk_log_probs) or not torch.is_floating_point(target_probs):
+        raise TypeError("student_topk_log_probs and target_probs must be floating-point tensors")
+
+    target_probs = target_probs.detach().to(device=student_topk_log_probs.device)
+    student_log_probs = torch.log_softmax(student_topk_log_probs, dim=-1)
+    tiny = torch.finfo(target_probs.dtype).tiny
+    target_log_probs = target_probs.clamp_min(tiny).log()
+    token_kl = (target_probs * (target_log_probs - student_log_probs)).sum(dim=-1)
+
+    effective_mask = response_mask.to(device=token_kl.device, dtype=token_kl.dtype)
+    effective_mask = effective_mask * valid_samples.to(device=token_kl.device, dtype=token_kl.dtype)[:, None]
+    masked_kl = torch.where(effective_mask.bool(), token_kl, torch.zeros_like(token_kl))
+    return masked_kl.sum() / effective_mask.sum().clamp_min(1.0)
 
 
 class AdvantageEstimator(str, Enum):
