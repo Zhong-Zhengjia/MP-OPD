@@ -238,8 +238,8 @@ class TestActorConfig(unittest.TestCase):
             config.validate(n_gpus=8, train_batch_size=256, model_config=model_config)
         self.assertIn("you must enable `use_remove_padding`", str(cm.exception))
 
-    def test_actor_config_validate_method_exceptions(self):
-        """Test that ActorConfig.validate() raises appropriate validation exceptions."""
+    def test_actor_config_validate_allows_partial_mini_batch_and_checks_gpu_capacity(self):
+        """Partial mini-batches are supported, but the configured micro-batch must cover all GPUs."""
         optim = OptimizerConfig(lr=0.1)
         config = ActorConfig(
             strategy="fsdp",
@@ -250,9 +250,7 @@ class TestActorConfig(unittest.TestCase):
             optim=optim,
         )
 
-        with self.assertRaises(ValueError) as cm:
-            config.validate(n_gpus=8, train_batch_size=128)
-        self.assertIn("train_batch_size", str(cm.exception))
+        config.validate(n_gpus=8, train_batch_size=128)
 
         with self.assertRaises(ValueError) as cm:
             config.validate(n_gpus=16, train_batch_size=512)
