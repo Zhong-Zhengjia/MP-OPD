@@ -52,6 +52,7 @@ from verl import DataProto
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.trainer.ppo.expert_prompt_utils import ExpertPromptInputs
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
@@ -146,6 +147,132 @@ def reduce_metrics(metrics_dict):
         else:
             metrics[key] = float(np.mean(val))
     return metrics
+
+
+def build_flat_expert_dataproto(
+    source: DataProto,
+    packed: ExpertPromptInputs,
+    student_topk_ids: torch.Tensor,
+) -> DataProto:
+    """Build the valid-expert teacher batch without carrying raw privileged context."""
+    batch_size, _ = packed.expert_mask.shape
+    if len(source) != batch_size:
+        raise ValueError(f"source batch size {len(source)} does not match expert mask batch size {batch_size}")
+    if student_topk_ids.ndim != 3 or student_topk_ids.shape[0] != batch_size:
+        raise ValueError(
+            "student_topk_ids must have shape [batch, response, top_k] with batch size "
+            f"{batch_size}, got {tuple(student_topk_ids.shape)}"
+        )
+
+    flat_count = packed.flat_batch_indices.numel()
+    tensors = {
+        "input_ids": packed.input_ids,
+        "attention_mask": packed.attention_mask,
+        "position_ids": packed.position_ids,
+        "responses": packed.responses,
+        "response_mask": packed.response_mask,
+        "student_topk_ids": student_topk_ids.index_select(
+            0, packed.flat_batch_indices.to(device=student_topk_ids.device)
+        ),
+    }
+    if any(value.shape[0] != flat_count for value in tensors.values()):
+        raise ValueError("flat expert tensors and reversible indices must have equal lengths")
+    return DataProto.from_dict(tensors=tensors, meta_info=dict(source.meta_info))
+
+
+def restore_specialized_expert_log_probs(
+    flat_log_probs: torch.Tensor,
+    packed: ExpertPromptInputs,
+    batch_size: int,
+    num_experts: int,
+) -> torch.Tensor:
+    """Scatter valid expert scores back to ``[B,T,K,E]`` in configuration order."""
+    if flat_log_probs.ndim != 3:
+        raise ValueError(
+            f"flat_log_probs must have shape [valid_experts, response, top_k], got {tuple(flat_log_probs.shape)}"
+        )
+    flat_count, response_length, top_k = flat_log_probs.shape
+    if flat_count != packed.flat_batch_indices.numel() or flat_count != packed.flat_expert_indices.numel():
+        raise ValueError("flat_log_probs and reversible expert indices must have equal lengths")
+    if tuple(packed.expert_mask.shape) != (batch_size, num_experts):
+        raise ValueError(
+            f"expert_mask must have shape {(batch_size, num_experts)}, got {tuple(packed.expert_mask.shape)}"
+        )
+
+    restored = flat_log_probs.new_zeros((batch_size, response_length, top_k, num_experts))
+    if flat_count:
+        batch_indices = packed.flat_batch_indices.to(device=flat_log_probs.device)
+        expert_indices = packed.flat_expert_indices.to(device=flat_log_probs.device)
+        if bool((batch_indices < 0).any()) or bool((batch_indices >= batch_size).any()):
+            raise ValueError("flat batch index is outside the source batch")
+        if bool((expert_indices < 0).any()) or bool((expert_indices >= num_experts).any()):
+            raise ValueError("flat expert index is outside the configured expert count")
+        restored[batch_indices, :, :, expert_indices] = flat_log_probs
+    return restored
+
+
+def _packed_from_attached_expert_tensors(data: DataProto) -> ExpertPromptInputs:
+    required = {
+        "expert_input_ids",
+        "expert_attention_mask",
+        "expert_position_ids",
+        "expert_responses",
+        "expert_response_mask",
+        "expert_mask",
+    }
+    missing = sorted(required - set(data.batch.keys()))
+    if missing:
+        raise ValueError(f"missing attached expert prompt tensors: {', '.join(missing)}")
+
+    expert_mask = data.batch["expert_mask"].to(dtype=torch.bool)
+    if expert_mask.ndim != 2:
+        raise ValueError(f"expert_mask must have shape [batch, experts], got {tuple(expert_mask.shape)}")
+    batch_size, num_experts = expert_mask.shape
+    if batch_size != len(data):
+        raise ValueError(f"expert_mask batch size {batch_size} does not match input batch size {len(data)}")
+
+    indices = expert_mask.nonzero(as_tuple=False)
+    batch_indices = indices[:, 0]
+    expert_indices = indices[:, 1]
+
+    def select(name: str) -> torch.Tensor:
+        value = data.batch[name]
+        if value.shape[:2] != torch.Size((batch_size, num_experts)):
+            raise ValueError(
+                f"{name} must start with shape {(batch_size, num_experts)}, got {tuple(value.shape)}"
+            )
+        return value[batch_indices, expert_indices]
+
+    return ExpertPromptInputs(
+        input_ids=select("expert_input_ids"),
+        attention_mask=select("expert_attention_mask"),
+        position_ids=select("expert_position_ids"),
+        responses=select("expert_responses"),
+        response_mask=select("expert_response_mask"),
+        expert_mask=expert_mask,
+        flat_batch_indices=batch_indices,
+        flat_expert_indices=expert_indices,
+    )
+
+
+def _build_clean_mpopd_dataproto(
+    source: DataProto,
+    student_topk_ids: torch.Tensor,
+) -> DataProto:
+    required = ("input_ids", "attention_mask", "position_ids", "responses", "response_mask")
+    missing = [key for key in required if key not in source.batch]
+    if missing:
+        raise ValueError(f"missing clean MP-OPD tensors: {', '.join(missing)}")
+    tensors = {key: source.batch[key] for key in required}
+    tensors["student_topk_ids"] = student_topk_ids
+    non_tensors = {}
+    if "multi_modal_inputs" in source.non_tensor_batch:
+        non_tensors["multi_modal_inputs"] = source.non_tensor_batch["multi_modal_inputs"]
+    return DataProto.from_dict(
+        tensors=tensors,
+        non_tensors=non_tensors,
+        meta_info=dict(source.meta_info),
+    )
 
 
 class ActorRolloutRefWorker(Worker, DistProfilerExtension): 
@@ -858,11 +985,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 
         if self._is_ref:
+            ref_model_path = self.config.model.path
             ref_model = self.config.ref.get("model", None)
             if ref_model is not None:
-                ref_model_path = ref_model.get("path", None)
+                ref_model_path = ref_model.get("path", ref_model_path)
 
-            assert ref_model_path, "Please provide the checkpoint path of teacher model: `+actor_rollout_ref.ref.model.path`."
+            assert ref_model_path, (
+                "Please provide the checkpoint path of teacher model: "
+                "`+actor_rollout_ref.ref.model.path`."
+            )
 
             if self.rank == 0:
                 print("reference model:", ref_model_path)
@@ -870,7 +1001,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             local_path = copy_to_local(ref_model_path, use_shm=use_shm)
 
             # Keep the original ref FSDP model for log_prob / distillation-related computation
-            self.ref_module_fsdp = self._build_model_optimizer(
+            (
+                self.ref_module_fsdp,
+                _,
+                _,
+                self.ref_model_config,
+            ) = self._build_model_optimizer(
                 model_path=local_path,
                 fsdp_config=omega_conf_to_dataclass(self.config.ref.fsdp_config),
                 optim_config=None,
@@ -880,7 +1016,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 trust_remote_code=self.config.model.get("trust_remote_code", False),
                 use_liger=self.config.model.get("use_liger", False),
                 role="ref",
-            )[0]
+            )
+            ref_text_config = getattr(self.ref_model_config, "text_config", None)
+            self.ref_vocab_size = int(
+                getattr(self.ref_model_config, "vocab_size", None)
+                or getattr(ref_text_config, "vocab_size", 0)
+            )
+            if self.ref_vocab_size <= 0:
+                raise ValueError("Unable to determine teacher vocabulary size from the reference model config.")
 
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):
@@ -1502,6 +1645,150 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             output, _ = self.base_ref_policy.compute_log_prob(data=data, calculate_entropy=False)
         self._reshard_policy_module(self.base_ref_policy)
         return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="cyan", role="prepare_mpopd_log_probs")
+    def prepare_mpopd_log_probs(self, data: DataProto) -> DataProto:
+        """Prepare clean and specialized selected-token probabilities in collective-safe order."""
+        if not self._is_actor or self.actor is None:
+            raise RuntimeError("MP-OPD probability preparation requires the student actor")
+        if self.base_policy is None:
+            raise RuntimeError("MP-OPD probability preparation requires the frozen student base")
+        if self.ref_policy is None:
+            raise RuntimeError("MP-OPD probability preparation requires the frozen teacher base")
+
+        top_k = int(data.meta_info.get("top_k", 0))
+        if top_k <= 0:
+            raise ValueError("MP-OPD top_k must be positive")
+
+        packed = _packed_from_attached_expert_tensors(data)
+        batch_size, attached_expert_count = packed.expert_mask.shape
+        configured_expert_count = int(data.meta_info.get("num_experts", -1))
+        if configured_expert_count != attached_expert_count:
+            raise ValueError(
+                "MP-OPD expert count mismatch: "
+                f"metadata={configured_expert_count}, attached={attached_expert_count}"
+            )
+
+        ref_vocab_size = int(getattr(self, "ref_vocab_size", 0))
+        if ref_vocab_size <= 0:
+            raise RuntimeError("MP-OPD teacher vocabulary size is unavailable")
+
+        timing_metrics: dict[str, float] = {}
+        total_start = time.perf_counter()
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        actor_data = self._shallow_copy_dataproto(data)
+        actor_data.meta_info.update(
+            micro_batch_size=self.config.rollout.log_prob_micro_batch_size_per_gpu,
+            max_token_len=self.config.rollout.log_prob_max_token_len_per_gpu,
+            use_dynamic_bsz=self.config.rollout.log_prob_use_dynamic_bsz,
+            temperature=self.config.rollout.temperature,
+        )
+
+        try:
+            with self.ulysses_sharding_manager:
+                start = time.perf_counter()
+                _, student_topk_ids, old_log_probs = self.actor.compute_topk_ids_and_log_probs(
+                    data=actor_data,
+                    top_k=top_k,
+                )
+                timing_metrics["timing/mpopd_student_forward_s"] = time.perf_counter() - start
+                self._reshard_policy_module(self.actor)
+
+                if student_topk_ids.ndim != 3 or student_topk_ids.shape[0] != batch_size:
+                    raise ValueError(
+                        "student top-k IDs must have shape [batch, response, top_k], "
+                        f"got {tuple(student_topk_ids.shape)}"
+                    )
+                if student_topk_ids.shape[-1] != top_k:
+                    raise ValueError(
+                        f"student top-k ID width {student_topk_ids.shape[-1]} does not match top_k={top_k}"
+                    )
+                if student_topk_ids.numel() and (
+                    bool((student_topk_ids < 0).any())
+                    or bool((student_topk_ids >= ref_vocab_size).any())
+                ):
+                    raise ValueError(
+                        f"student top-k ID is outside the teacher vocabulary [0, {ref_vocab_size})"
+                    )
+
+                clean_data = _build_clean_mpopd_dataproto(data, student_topk_ids)
+                clean_data.meta_info.update(
+                    micro_batch_size=self.config.ref.log_prob_micro_batch_size_per_gpu,
+                    max_token_len=self.config.ref.log_prob_max_token_len_per_gpu,
+                    use_dynamic_bsz=self.config.ref.log_prob_use_dynamic_bsz,
+                    temperature=self.config.rollout.temperature,
+                    use_ref_inputs=False,
+                )
+                clean_data = clean_data.to("cpu")
+
+                start = time.perf_counter()
+                student_base_topk_log_probs = self.base_policy.compute_topk_log_probs_on_ids(data=clean_data)
+                timing_metrics["timing/mpopd_student_base_forward_s"] = time.perf_counter() - start
+                self._reshard_policy_module(self.base_policy)
+
+                start = time.perf_counter()
+                teacher_base_topk_log_probs = self.ref_policy.compute_topk_log_probs_on_ids(data=clean_data)
+                timing_metrics["timing/mpopd_teacher_base_forward_s"] = time.perf_counter() - start
+                self._reshard_policy_module(self.ref_policy)
+
+                flat_expert_data = build_flat_expert_dataproto(data, packed, student_topk_ids)
+                expert_micro_batch_size = int(data.meta_info.get("expert_forward_micro_batch_size", 0))
+                if expert_micro_batch_size <= 0:
+                    expert_micro_batch_size = int(self.config.ref.log_prob_micro_batch_size_per_gpu)
+                flat_expert_data.meta_info.update(
+                    micro_batch_size=expert_micro_batch_size,
+                    max_token_len=self.config.ref.log_prob_max_token_len_per_gpu,
+                    use_dynamic_bsz=self.config.ref.log_prob_use_dynamic_bsz,
+                    temperature=self.config.rollout.temperature,
+                    use_ref_inputs=False,
+                )
+                flat_expert_data = flat_expert_data.to("cpu")
+
+                start = time.perf_counter()
+                if len(flat_expert_data):
+                    flat_expert_log_probs = self.ref_policy.compute_topk_log_probs_on_ids(
+                        data=flat_expert_data
+                    )
+                    self._reshard_policy_module(self.ref_policy)
+                else:
+                    response_length = student_topk_ids.shape[1]
+                    flat_expert_log_probs = teacher_base_topk_log_probs.new_empty(
+                        (0, response_length, top_k)
+                    )
+                timing_metrics["timing/mpopd_specialized_expert_forward_s"] = (
+                    time.perf_counter() - start
+                )
+
+                specialized_expert_topk_log_probs = restore_specialized_expert_log_probs(
+                    flat_expert_log_probs,
+                    packed,
+                    batch_size=batch_size,
+                    num_experts=attached_expert_count,
+                )
+        finally:
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                log_gpu_memory_usage(
+                    "After offload actor model during prepare_mpopd_log_probs",
+                    logger=logger,
+                )
+
+        timing_metrics["timing/mpopd_prepare_total_s"] = time.perf_counter() - total_start
+        output = DataProto.from_dict(
+            tensors={
+                "student_topk_ids": student_topk_ids,
+                "old_log_probs": old_log_probs,
+                "student_base_topk_log_probs": student_base_topk_log_probs,
+                "teacher_base_topk_log_probs": teacher_base_topk_log_probs,
+                "specialized_expert_topk_log_probs": specialized_expert_topk_log_probs,
+                "expert_mask": packed.expert_mask,
+            },
+            meta_info={"metrics": timing_metrics},
+        )
+        return output.to("cpu")
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="cyan", role="prepare_opd_log_probs")
