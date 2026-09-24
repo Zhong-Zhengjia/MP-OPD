@@ -202,8 +202,8 @@ def test_fit_routes_only_multi_prompt_mode_to_mpopd(monkeypatch):
     legacy_trainer = RayPPOTrainer.__new__(RayPPOTrainer)
     legacy_trainer.is_mp_opd = False
     legacy_trainer.grpo_buffer = []
-    legacy_trainer.config = SimpleNamespace(
-        trainer=SimpleNamespace(project_name="p", experiment_name="e", logger=[])
+    legacy_trainer.config = OmegaConf.create(
+        {"trainer": {"project_name": "p", "experiment_name": "e", "logger": []}}
     )
     monkeypatch.setattr(
         "verl.utils.tracking.Tracking",
@@ -234,7 +234,7 @@ def _validation_trainer(*, vocab_matches=True, cross_bridge=False):
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (lambda trainer: setattr(trainer.mp_opd_config, "top_k", 0), "top_k"),
+        (lambda trainer: setattr(trainer, "mp_opd_config", SimpleNamespace(top_k=0)), "top_k"),
         (lambda trainer: trainer.config.data.update({"return_raw_chat": False}), "return_raw_chat"),
         (lambda trainer: trainer.config.actor_rollout_ref.model.update({"base_model_path": None}), "base_model"),
         (lambda trainer: trainer.config.actor_rollout_ref.ref.model.update({"path": None}), "reference expert"),
