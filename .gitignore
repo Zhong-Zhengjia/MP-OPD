@@ -127,6 +127,9 @@ log/
 
 .cursorignore
 
+# Local Git worktrees
+.worktrees/
+
 
 *.out
 
