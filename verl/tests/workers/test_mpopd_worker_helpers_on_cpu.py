@@ -21,6 +21,7 @@ import torch
 from omegaconf import OmegaConf
 
 from verl import DataProto
+from verl.trainer.ppo.core_algos import build_mpopd_target, compute_mpopd_kl_loss
 from verl.trainer.ppo.expert_prompt_utils import ExpertPromptInputs
 from verl.workers.fsdp_workers import (
     ActorRolloutRefWorker,
@@ -29,13 +30,11 @@ from verl.workers.fsdp_workers import (
 )
 
 
-def _packed(mask=None):
+def _packed(mask=None, *, response_length=2, sequence_length=5):
     if mask is None:
         mask = torch.tensor([[True, False, True], [False, True, False]])
     flat_indices = mask.nonzero(as_tuple=False)
     flat_count = flat_indices.shape[0]
-    response_length = 2
-    sequence_length = 5
     input_ids = torch.arange(flat_count * sequence_length, dtype=torch.long).reshape(flat_count, sequence_length) + 50
     responses = input_ids[:, -response_length:].clone()
     return ExpertPromptInputs(
@@ -50,11 +49,12 @@ def _packed(mask=None):
     )
 
 
-def _source_batch(packed=None):
-    batch_size = 2
-    response_length = 2
-    top_k = 2
-    clean_input_ids = torch.tensor([[1, 2, 11, 12], [3, 4, 21, 22]])
+def _source_batch(packed=None, *, response_length=2, top_k=2):
+    batch_size = 2 if packed is None else packed.expert_mask.shape[0]
+    prompt_length = 2
+    clean_input_ids = torch.arange(
+        1, batch_size * (prompt_length + response_length) + 1, dtype=torch.long
+    ).reshape(batch_size, prompt_length + response_length)
     tensors = {
         "input_ids": clean_input_ids,
         "attention_mask": torch.ones_like(clean_input_ids),
@@ -84,7 +84,7 @@ def _source_batch(packed=None):
         tensors=tensors,
         meta_info={
             "top_k": top_k,
-            "num_experts": 3,
+            "num_experts": 3 if packed is None else packed.expert_mask.shape[1],
             "expert_forward_micro_batch_size": 2,
         },
     )
@@ -166,17 +166,20 @@ class _FakeScorer:
         self.expert_name = expert_name
         self.actor_module = object()
         self.forward_calls = 0
+        self.clean_input_ids = []
 
     def compute_topk_log_probs_on_ids(self, data):
         self.forward_calls += 1
         is_expert = bool((data.batch["input_ids"][:, 0] >= 50).all())
+        if not is_expert:
+            self.clean_input_ids.append(data.batch["input_ids"].clone())
         self.calls.append(self.expert_name if is_expert else self.clean_name)
         batch_size, response_length, top_k = data.batch["student_topk_ids"].shape
         base = data.batch["input_ids"][:, 0].float().view(batch_size, 1, 1)
         return base.expand(batch_size, response_length, top_k).clone()
 
 
-def _worker_and_batch(*, empty_experts=False, invalid_ids=False):
+def _worker_and_batch(*, empty_experts=False, invalid_ids=False, mask=None, response_length=2, top_k=2):
     calls = []
     worker = ActorRolloutRefWorker.__new__(ActorRolloutRefWorker)
     worker._is_actor = True
@@ -204,9 +207,10 @@ def _worker_and_batch(*, empty_experts=False, invalid_ids=False):
             },
         }
     )
-    mask = torch.zeros(2, 3, dtype=torch.bool) if empty_experts else None
-    packed = _packed(mask)
-    return worker, _source_batch(packed), calls
+    if empty_experts:
+        mask = torch.zeros(2, 3, dtype=torch.bool)
+    packed = _packed(mask, response_length=response_length)
+    return worker, _source_batch(packed, response_length=response_length, top_k=top_k), calls
 
 
 def test_prepare_mpopd_runs_deterministic_shared_teacher_sequence_and_returns_exact_keys():
@@ -262,3 +266,37 @@ def test_selected_id_must_exist_in_teacher_vocabulary():
 
     with pytest.raises(ValueError, match="vocabulary"):
         worker.prepare_mpopd_log_probs(batch)
+
+
+def test_probability_preparation_builds_finite_four_expert_target_and_preserves_clean_inputs():
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    worker, batch, _ = _worker_and_batch(mask=mask, response_length=3, top_k=10)
+
+    output = worker.prepare_mpopd_log_probs(batch)
+    target = build_mpopd_target(
+        output.batch["specialized_expert_topk_log_probs"],
+        output.batch["teacher_base_topk_log_probs"],
+        output.batch["student_base_topk_log_probs"],
+        output.batch["expert_mask"],
+        expert_temperature=1.0,
+        token_temperature=1.0,
+        lambda_value=1.0,
+    )
+    student_topk_log_probs = torch.zeros(2, 3, 10, requires_grad=True)
+    loss = compute_mpopd_kl_loss(
+        student_topk_log_probs,
+        target.target_probs,
+        batch.batch["response_mask"],
+        target.valid_samples,
+    )
+    loss.backward()
+
+    assert output.batch["specialized_expert_topk_log_probs"].shape == (2, 3, 10, 4)
+    assert torch.allclose(target.target_probs.sum(dim=-1), torch.ones(2, 3))
+    assert torch.isfinite(loss)
+    assert student_topk_log_probs.grad is not None
+    assert not output.batch["student_base_topk_log_probs"].requires_grad
+    assert not output.batch["teacher_base_topk_log_probs"].requires_grad
+    assert not output.batch["specialized_expert_topk_log_probs"].requires_grad
+    assert torch.equal(worker.base_policy.clean_input_ids[0], worker.ref_policy.clean_input_ids[0])
+    assert torch.equal(worker.base_policy.clean_input_ids[0], batch.batch["input_ids"])

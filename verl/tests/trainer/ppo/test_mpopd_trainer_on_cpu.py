@@ -98,6 +98,7 @@ class FakeWorkerGroup:
     def __init__(self):
         self.calls = []
         self.clean_ids = None
+        self.last_non_tensor_batch = None
 
     def generate_sequences(self, batch):
         self.calls.append("generate_sequences")
@@ -108,6 +109,7 @@ class FakeWorkerGroup:
     def prepare_mpopd_log_probs(self, batch):
         self.calls.append("prepare_mpopd_log_probs")
         self.clean_ids = batch.batch["input_ids"].clone()
+        self.last_non_tensor_batch = dict(batch.non_tensor_batch)
         assert "expert_contexts" not in batch.non_tensor_batch
         assert 901 not in self.clean_ids
         assert batch.meta_info["top_k"] == 2
@@ -165,6 +167,7 @@ def test_step_call_order_and_does_not_compute_reward():
         "update_actor_mpopd",
     ]
     assert trainer.reward_fn.calls == []
+    assert "expert_contexts" not in trainer.actor_rollout_wg.last_non_tensor_batch
     assert metrics["actor/mpopd_all_experts_unavailable_count"] == 0
 
 
