@@ -155,7 +155,7 @@ def test_build_messages_copies_clean_prompt_and_only_adds_available_evidence():
     assert "must not leak" not in messages[-1]["content"]
 
 
-def test_prepare_flattens_valid_experts_in_sample_and_config_order_without_clean_prompt_mutation():
+def test_no_leakage_when_prepare_flattens_valid_experts_without_clean_prompt_mutation():
     tokenizer = FakeTokenizer()
     cfg = MPOPDConfig(
         expert_names=["chasing", "long_term", "repurchase"],
