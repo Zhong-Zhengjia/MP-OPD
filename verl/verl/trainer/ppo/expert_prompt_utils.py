@@ -181,13 +181,33 @@ def prepare_expert_prompt_inputs(
 
 
 def attach_expert_prompt_tensors(batch: DataProto, packed: ExpertPromptInputs) -> DataProto:
-    """Attach only tokenized expert inputs; raw contexts stay outside tensor RPC payloads."""
-    batch.batch["expert_input_ids"] = packed.input_ids
-    batch.batch["expert_attention_mask"] = packed.attention_mask
-    batch.batch["expert_position_ids"] = packed.position_ids
-    batch.batch["expert_responses"] = packed.responses
-    batch.batch["expert_response_mask"] = packed.response_mask
+    """Attach tokenized expert inputs with the source batch/expert axes intact."""
+    batch_size, expert_count = packed.expert_mask.shape
+    max_prompt_length = packed.input_ids.shape[1]
+    response_length = packed.responses.shape[1]
+    input_ids = torch.full(
+        (batch_size, expert_count, max_prompt_length),
+        0,
+        dtype=packed.input_ids.dtype,
+        device=packed.input_ids.device,
+    )
+    attention_mask = torch.zeros_like(input_ids)
+    position_ids = torch.zeros_like(input_ids)
+    responses = packed.responses.new_zeros((batch_size, expert_count, response_length))
+    response_mask = packed.response_mask.new_zeros((batch_size, expert_count, response_length))
+    for row, (batch_index, expert_index) in enumerate(
+        zip(packed.flat_batch_indices.tolist(), packed.flat_expert_indices.tolist(), strict=True)
+    ):
+        input_ids[batch_index, expert_index] = packed.input_ids[row]
+        attention_mask[batch_index, expert_index] = packed.attention_mask[row]
+        position_ids[batch_index, expert_index] = packed.position_ids[row]
+        responses[batch_index, expert_index] = packed.responses[row]
+        response_mask[batch_index, expert_index] = packed.response_mask[row]
+
+    batch.batch["expert_input_ids"] = input_ids
+    batch.batch["expert_attention_mask"] = attention_mask
+    batch.batch["expert_position_ids"] = position_ids
+    batch.batch["expert_responses"] = responses
+    batch.batch["expert_response_mask"] = response_mask
     batch.batch["expert_mask"] = packed.expert_mask
-    batch.batch["flat_expert_batch_indices"] = packed.flat_batch_indices
-    batch.batch["flat_expert_indices"] = packed.flat_expert_indices
     return batch

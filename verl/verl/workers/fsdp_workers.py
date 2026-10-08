@@ -1622,15 +1622,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             student_base_log_probs = self.base_policy.compute_topk_log_probs_on_ids(data=clean_data)
             teacher_base_log_probs = self.ref_policy.compute_topk_log_probs_on_ids(data=clean_data)
 
+            expert_mask = data.batch["expert_mask"].to(dtype=torch.bool)
+            flat_batch_indices, flat_expert_indices = torch.nonzero(expert_mask, as_tuple=True)
             packed = ExpertPromptInputs(
-                input_ids=data.batch["expert_input_ids"],
-                attention_mask=data.batch["expert_attention_mask"],
-                position_ids=data.batch["expert_position_ids"],
-                responses=data.batch["expert_responses"],
-                response_mask=data.batch["expert_response_mask"],
-                expert_mask=data.batch["expert_mask"],
-                flat_batch_indices=data.batch["flat_expert_batch_indices"],
-                flat_expert_indices=data.batch["flat_expert_indices"],
+                input_ids=data.batch["expert_input_ids"][flat_batch_indices, flat_expert_indices],
+                attention_mask=data.batch["expert_attention_mask"][flat_batch_indices, flat_expert_indices],
+                position_ids=data.batch["expert_position_ids"][flat_batch_indices, flat_expert_indices],
+                responses=data.batch["expert_responses"][flat_batch_indices, flat_expert_indices],
+                response_mask=data.batch["expert_response_mask"][flat_batch_indices, flat_expert_indices],
+                expert_mask=expert_mask,
+                flat_batch_indices=flat_batch_indices,
+                flat_expert_indices=flat_expert_indices,
             )
             flat_data = build_flat_expert_dataproto(data, packed, student_topk_ids)
             flat_data = self._set_mpopd_log_prob_meta_info(flat_data)
