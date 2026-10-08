@@ -460,6 +460,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         override_config_kwargs.update(override_model_config)
         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
+            vision_config = getattr(actor_model_config, "vision_config", None)
+            print(
+                "[VERL_MODEL_DEBUG]"
+                f" role={role}"
+                f" model_path={local_path}"
+                f" config_class={type(actor_model_config).__module__}.{type(actor_model_config).__name__}"
+                f" model_class={actor_module_class.__name__ if 'actor_module_class' in locals() else '<pending>'}"
+                f" vision_config_class={type(vision_config).__module__}.{type(vision_config).__name__ if vision_config is not None else '<none>'}"
+                f" vision_has_rope_parameters={hasattr(vision_config, 'rope_parameters') if vision_config is not None else False}"
+                f" vision_rope_parameters={getattr(vision_config, 'rope_parameters', '<MISSING>') if vision_config is not None else '<none>'}"
+            )
+        if self.rank == 0:
             print(f"[DEBUG] S Model config after override: {actor_model_config}")
 
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
