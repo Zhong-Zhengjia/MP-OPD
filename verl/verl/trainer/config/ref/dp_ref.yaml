@@ -10,10 +10,17 @@ defaults:
   # load the reference default config, then apply the fields in the current yaml
   - _self_
 
-# ref model is assumed to be identical to actor model. Specify model.path for using a different ref model.
+# ref model is assumed to be identical to actor model when path is null.
+# Specify model.path for using a different reference/teacher model.
 # Potential use case involves on policy distillation where we calculate KL divergence between student actor
-# and teacher ref
-model: null
+# and teacher ref.
+model:
+
+  # Reference model checkpoint path. Null means reuse the actor model path.
+  path: null
+
+  # Base model checkpoint path used by MP-OPD corrected reference rewards.
+  base_model_path: null
 
 # sequence parallel size
 # same as actor_rollout_ref.actor.ulysses_sequence_parallel_size if it exists, otherwise 1
