@@ -20,6 +20,7 @@ PROMPT_LENGTH="${MPOPD_SMOKE_PROMPT_LENGTH:-20000}"
 RESPONSE_LENGTH="${MPOPD_SMOKE_RESPONSE_LENGTH:-8192}"
 TOTAL_LENGTH="${MPOPD_SMOKE_TOTAL_LENGTH:-30000}"
 MAX_NUM_BATCHED_TOKENS="${MPOPD_SMOKE_MAX_NUM_BATCHED_TOKENS:-${TOTAL_LENGTH}}"
+EXPERT_PROMPT_LENGTH="${MPOPD_SMOKE_EXPERT_PROMPT_LENGTH:-20000}"
 PPO_MINI_BATCH_SIZE="${MPOPD_SMOKE_PPO_MINI_BATCH_SIZE:-8}"
 LOG_FILE="${MPOPD_SMOKE_LOG:-/tmp/mpopd-gpu-smoke-real.log}"
 
@@ -39,9 +40,10 @@ echo "  reference:  ${MPOPD_SMOKE_REF_MODEL}"
 echo "  parquet:    ${MPOPD_SMOKE_TRAIN_PARQUET}"
 echo "  GPUs:       ${GPU_COUNT}"
 echo "  prompt length: ${PROMPT_LENGTH}"
-echo "  response length: ${RESPONSE_LENGTH}"
-echo "  total length: ${TOTAL_LENGTH}"
-echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS}"
+  echo "  response length: ${RESPONSE_LENGTH}"
+  echo "  total length: ${TOTAL_LENGTH}"
+  echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS}"
+  echo "  expert prompt length: ${EXPERT_PROMPT_LENGTH}"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "  log:        ${LOG_FILE}"
 
@@ -55,6 +57,7 @@ python -m verl.trainer.main_ppo \
   algorithm.train_mode=multi_prompt_distill \
   algorithm.adv_estimator=grpo \
   algorithm.mp_opd.top_k="${TOP_K}" \
+  algorithm.mp_opd.max_expert_prompt_length="${EXPERT_PROMPT_LENGTH}" \
   data.train_files="${MPOPD_SMOKE_TRAIN_PARQUET}" \
   data.val_files="${MPOPD_SMOKE_TRAIN_PARQUET}" \
   data.train_batch_size="${TRAIN_SAMPLES}" \
