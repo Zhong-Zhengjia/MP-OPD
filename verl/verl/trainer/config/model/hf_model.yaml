@@ -9,6 +9,9 @@ _target_: verl.workers.config.HFModelConfig
 # path to the huggingface model
 path: ~/models/deepseek-llm-7b-chat
 
+# path to the base model used by MP-OPD student/reference updates
+base_model_path: null
+
 # config to the huggingface config. In case it is not the same as path
 hf_config_path: null
 
