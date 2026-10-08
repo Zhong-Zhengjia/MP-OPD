@@ -53,6 +53,7 @@ python -m verl.trainer.main_ppo \
   trainer.n_gpus_per_node="${GPU_COUNT}" \
   actor_rollout_ref.model.path="${MPOPD_SMOKE_MODEL}" \
   actor_rollout_ref.model.base_model_path="${MPOPD_SMOKE_MODEL}" \
+  actor_rollout_ref.model.override_config.attn_implementation=eager \
   actor_rollout_ref.ref.model.path="${MPOPD_SMOKE_REF_MODEL}" \
   actor_rollout_ref.actor.mpopd_lr_scale=1.0 \
   actor_rollout_ref.actor.use_dynamic_bsz=true \
