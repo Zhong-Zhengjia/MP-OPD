@@ -18,6 +18,7 @@ TRAIN_SAMPLES="${MPOPD_SMOKE_TRAIN_SAMPLES:-2}"
 TOP_K="${MPOPD_SMOKE_TOP_K:-3}"
 PROMPT_LENGTH="${MPOPD_SMOKE_PROMPT_LENGTH:-32768}"
 RESPONSE_LENGTH="${MPOPD_SMOKE_RESPONSE_LENGTH:-32}"
+MAX_NUM_BATCHED_TOKENS="${MPOPD_SMOKE_MAX_NUM_BATCHED_TOKENS:-32800}"
 PPO_MINI_BATCH_SIZE="${MPOPD_SMOKE_PPO_MINI_BATCH_SIZE:-8}"
 LOG_FILE="${MPOPD_SMOKE_LOG:-/tmp/mpopd-gpu-smoke-real.log}"
 
@@ -37,6 +38,7 @@ echo "  reference:  ${MPOPD_SMOKE_REF_MODEL}"
 echo "  parquet:    ${MPOPD_SMOKE_TRAIN_PARQUET}"
 echo "  GPUs:       ${GPU_COUNT}"
 echo "  prompt length: ${PROMPT_LENGTH}"
+echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS}"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "  log:        ${LOG_FILE}"
 
@@ -68,6 +70,7 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+  actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS}" \
   actor_rollout_ref.rollout.n=1 \
   actor_rollout_ref.rollout.response_length="${RESPONSE_LENGTH}" \
   trainer.total_epochs=1 \
