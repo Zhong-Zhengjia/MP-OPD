@@ -960,12 +960,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
 
-        # Build the vLLM rollout after all Hugging Face actor/reference models.
-        # vLLM registers its own Qwen3.5 config classes, which are not compatible
-        # with Transformers' Qwen3.5 vision config used by the reference model.
-        if self._is_rollout:
-            self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
-
         # Initialize base models for corrected reward computation
         # Actor's base model (for computing base_log_prob)
         self.base_policy = None
@@ -1032,6 +1026,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self._has_base_ref_model = True
             if self.rank == 0:
                 print(f"Ref base model initialized successfully from {ref_base_model_path}")
+
+        # Build the vLLM rollout only after all Hugging Face actor/reference/base
+        # models. vLLM registers its own Qwen3.5 config classes, which are not
+        # compatible with Transformers' Qwen3.5 vision config.
+        if self._is_rollout:
+            self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 
         if self._is_actor:
             if self.student_base_policy is None and self.base_policy is not None:
