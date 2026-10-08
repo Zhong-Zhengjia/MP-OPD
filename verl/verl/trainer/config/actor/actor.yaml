@@ -109,6 +109,9 @@ loss_agg_mode: token-mean
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
 
+# Learning-rate multiplier for MP-OPD student updates
+mpopd_lr_scale: 1.0
+
 # Whether to use KL loss instead of KL reward penalty. True for GRPO
 use_kl_loss: false
 
