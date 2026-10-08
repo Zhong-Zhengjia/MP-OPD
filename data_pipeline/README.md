@@ -37,6 +37,19 @@ Set `PYTHONPATH=MP-OPD/data_pipeline/src` when running without installing the
 package. Parquet conversion is available through the same CLI and requires
 `pyarrow` in the data-preparation environment.
 
+For the standard server layout, the complete train_1000 preparation and
+validation flow is:
+
+```bash
+bash scripts/prepare_train_1000.sh
+bash scripts/test_data_pipeline.sh
+```
+
+The preparation script accepts `SOURCE_JSONL`, `CLEAN_TEMPLATE`,
+`EXPERT_PROMPT_DIR`, `OUTPUT_JSONL`, and `VALIDATION_OUTPUT` environment
+overrides. It does not run `git pull`; update the repository explicitly before
+running it.
+
 ## Normalized row contract
 
 Each row contains `data_source`, `prompt`, `ability`, `reward_model`, and
