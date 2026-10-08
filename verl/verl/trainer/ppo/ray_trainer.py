@@ -27,7 +27,7 @@ import random
 import sqlite3
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pprint import pprint
 from typing import Optional
 import copy
@@ -49,6 +49,10 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.expert_prompt_utils import (
+    attach_expert_prompt_tensors,
+    prepare_expert_prompt_inputs,
+)
 from verl.trainer.ppo.metric_utils import (
     add_macro_average_val_metrics,
     compute_data_metrics,
@@ -370,7 +374,14 @@ class RayPPOTrainer:
 
         # training mode
         self.train_mode = self.config.algorithm.get("train_mode", "ppo")
+        self.is_mp_opd = self.train_mode == "multi_prompt_distill"
+        self.mp_opd_config = self.config.algorithm.get("mp_opd", {})
         self.is_hetero_distill = self.train_mode == "heterogeneous_distill"
+        if self.is_mp_opd:
+            if not self.config.data.get("return_raw_chat", False):
+                raise ValueError("MP-OPD requires data.return_raw_chat=true")
+            if self.use_cross_token_bridge:
+                raise ValueError("MP-OPD requires identical student and teacher tokenizers")
 
         hetero_cfg = self.config.algorithm.get("hetero_distill", {})
         print(hetero_cfg)
@@ -387,6 +398,8 @@ class RayPPOTrainer:
         if self.ref_base_model_path is not None:
             self.ref_base_model_path = self.ref_base_model_path.get("base_model_path", None)
         self.use_base_models = self.base_model_path is not None and self.ref_base_model_path is not None
+        if self.is_mp_opd and self.base_model_path is None:
+            raise ValueError("MP-OPD requires actor_rollout_ref.model.base_model_path")
         
         if self.use_base_models:
             print(f"Corrected reward enabled with base models:")
@@ -2057,12 +2070,89 @@ class RayPPOTrainer:
         )
         return update_batch, timing_metrics
 
+    def _prepare_mpopd_update_batch(self, batch: DataProto) -> tuple[DataProto, dict]:
+        """Pack expert prompts, score all clean/expert views, and return update tensors."""
+        mp_cfg = omega_conf_to_dataclass(self.mp_opd_config, dataclass_type=type(AlgoConfig().mp_opd))
+        packed = prepare_expert_prompt_inputs(batch, self.ref_tokenizer or self.tokenizer, mp_cfg)
+        batch = attach_expert_prompt_tensors(batch, packed)
+        batch.non_tensor_batch.pop("expert_contexts", None)
+        batch.meta_info.update(
+            {
+                "top_k": mp_cfg.top_k,
+                "num_experts": len(mp_cfg.expert_names),
+                "mp_opd_config": asdict(mp_cfg),
+            }
+        )
+        output = self.actor_rollout_wg.prepare_mpopd_log_probs(batch)
+        batch = batch.union(output)
+        return batch, reduce_metrics(output.meta_info.get("metrics", {}))
+
+    def _run_mpopd_step(self, batch: DataProto, metrics: dict, timing_raw: dict) -> dict:
+        """Run one clean rollout -> expert preparation -> student update step."""
+        batch.meta_info.update(
+            {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "do_sample": True,
+                "validate": False,
+                "global_steps": self.global_steps,
+            }
+        )
+        with marked_timer("gen", timing_raw, color="red"):
+            rollout_batch = self.actor_rollout_wg.generate_sequences(batch)
+        rollout_batch = self._ensure_response_mask(rollout_batch)
+        with marked_timer("mpopd_prep", timing_raw, color="cyan"):
+            update_batch, prep_metrics = self._prepare_mpopd_update_batch(rollout_batch)
+        metrics.update(merge_worker_metrics(prep_metrics, prefix="mpopd"))
+        with marked_timer("update_mpopd", timing_raw, color="purple"):
+            actor_output = self.actor_rollout_wg.update_actor_mpopd(update_batch)
+        actor_metrics = reduce_metrics(actor_output.meta_info.get("metrics", {}))
+        metrics.update(actor_metrics)
+        metrics["training/global_step"] = self.global_steps
+        metrics["training/actor_update_steps"] = getattr(self, "actor_update_steps", 0) + 1
+        self.actor_update_steps = metrics["training/actor_update_steps"]
+        return metrics
+
+    def _fit_mpopd(self):
+        from omegaconf import OmegaConf
+        from pprint import pprint
+        from tqdm import tqdm
+        from verl.utils.tracking import Tracking
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+        self.global_steps = 0
+        self._load_checkpoint()
+        progress_bar = tqdm(total=self.total_training_steps, desc="MP-OPD Progress")
+        for epoch in range(self.config.trainer.total_epochs):
+            for batch_dict in self.train_dataloader:
+                batch = DataProto.from_single_dict(batch_dict)
+                if self._is_empty_dataproto(batch):
+                    continue
+                metrics, timing_raw = {}, {}
+                with marked_timer("step", timing_raw):
+                    metrics = self._run_mpopd_step(batch, metrics, timing_raw)
+                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                logger.log(data=metrics, step=self.global_steps)
+                progress_bar.update(1)
+                self.global_steps += 1
+                if self.global_steps >= self.total_training_steps:
+                    progress_bar.close()
+                    return
+        progress_bar.close()
+
     def fit(self):
         from omegaconf import OmegaConf
         from pprint import pprint
         from tqdm import tqdm
         from verl.utils.tracking import Tracking
 
+        if self.is_mp_opd:
+            return self._fit_mpopd()
         if not hasattr(self, "grpo_buffer"):
             self._init_hetero_train_state()
 

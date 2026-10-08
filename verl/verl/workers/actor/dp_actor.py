@@ -27,7 +27,13 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    build_mpopd_target,
+    compute_mpopd_kl_loss,
+    get_policy_loss_fn,
+    kl_penalty,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -1261,6 +1267,109 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     append_to_dict(metrics, {"actor/grad_norm": 0.0})
 
+        self.actor_optimizer.zero_grad()
+        return metrics
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def update_policy_mpopd(self, data: DataProto):
+        """Update only the student against the detached fused top-k target."""
+        required = (
+            "student_topk_ids",
+            "student_base_topk_log_probs",
+            "teacher_base_topk_log_probs",
+            "specialized_expert_topk_log_probs",
+            "expert_mask",
+            "response_mask",
+        )
+        missing = [key for key in required if key not in data.batch]
+        if missing:
+            raise ValueError(f"MP-OPD update batch is missing tensors: {missing}")
+        self.actor_module.train()
+        temperature = data.meta_info["temperature"]
+        mp_cfg = data.meta_info["mp_opd_config"]
+        select_keys = [
+            "responses",
+            "response_mask",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            *required[:-1],
+        ]
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch
+        data = data.select(
+            batch_keys=select_keys,
+            non_tensor_batch_keys=["multi_modal_inputs"] if has_multi_modal_inputs else [],
+        )
+        mini_batches = data.split(self.config.ppo_mini_batch_size)
+        metrics = {}
+        for _ in range(self.config.ppo_epochs):
+            for mini_batch in mini_batches:
+                if self.config.use_dynamic_bsz:
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                else:
+                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                self.actor_optimizer.zero_grad()
+                grad_accum = max(1, len(micro_batches))
+                for micro_batch in micro_batches:
+                    micro_batch = micro_batch.to(get_device_id())
+                    model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                    response_mask = model_inputs["response_mask"]
+                    target = build_mpopd_target(
+                        model_inputs["specialized_expert_topk_log_probs"],
+                        model_inputs["teacher_base_topk_log_probs"],
+                        model_inputs["student_base_topk_log_probs"],
+                        model_inputs["expert_mask"],
+                        expert_temperature=float(mp_cfg["expert_temperature"]),
+                        token_temperature=float(mp_cfg["token_temperature"]),
+                        lambda_value=float(mp_cfg["lambda_value"]),
+                        expert_priors=mp_cfg.get("expert_priors"),
+                    )
+                    if not torch.isfinite(target.target_probs).all():
+                        raise FloatingPointError("MP-OPD target contains non-finite probabilities")
+                    _, _, student_log_probs = self._forward_micro_batch(
+                        model_inputs,
+                        temperature=temperature,
+                        calculate_entropy=False,
+                        return_topk_log_probs=True,
+                    )
+                    loss = compute_mpopd_kl_loss(
+                        student_log_probs,
+                        target.target_probs,
+                        response_mask,
+                        target.valid_samples,
+                    )
+                    if not torch.isfinite(loss):
+                        raise FloatingPointError("MP-OPD loss is non-finite")
+                    scale = response_mask.shape[0] / self.config.ppo_mini_batch_size if self.config.use_dynamic_bsz else 1 / grad_accum
+                    (loss * scale).backward()
+                    with torch.no_grad():
+                        active = target.valid_samples
+                        weights = target.expert_weights
+                        valid_weights = weights[active]
+                        if valid_weights.numel():
+                            weight_entropy = -(valid_weights.clamp_min(1e-12) * valid_weights.clamp_min(1e-12).log()).sum(-1).mean()
+                            max_weight = valid_weights.max(-1).values.mean()
+                        else:
+                            weight_entropy = weights.sum() * 0
+                            max_weight = weights.sum() * 0
+                        append_to_dict(
+                            metrics,
+                            {
+                                "actor/mpopd_kl_loss": loss.detach().item() * scale,
+                                "actor/mpopd_target_entropy": (-(target.target_probs * target.target_log_probs).sum(-1).mean()).item(),
+                                "actor/mpopd_student_topk_entropy": (-(student_log_probs.detach().softmax(-1) * student_log_probs.detach().log_softmax(-1)).sum(-1).mean()).item(),
+                                "actor/mpopd_expert_weight_entropy": weight_entropy.item(),
+                                "actor/mpopd_max_expert_weight": max_weight.item(),
+                                "actor/mpopd_fused_delta_mean": target.fused_delta.mean().item(),
+                                "actor/mpopd_fused_delta_abs_mean": target.fused_delta.abs().mean().item(),
+                                "actor/mpopd_conflict_rate": (target.expert_delta < 0).float().mean().item(),
+                                "actor/mpopd_all_experts_unavailable_count": (~target.valid_samples).sum().item(),
+                                "actor/mpopd_top_k": student_log_probs.shape[-1],
+                            },
+                        )
+                grad_norm = self._optimizer_step(lr_scale=float(self.config.get("mpopd_lr_scale", 1.0)))
+                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
         self.actor_optimizer.zero_grad()
         return metrics
 

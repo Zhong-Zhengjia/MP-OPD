@@ -240,7 +240,8 @@ class TaskRunner:
         """Add reference policy worker if KL loss or KL reward is used."""
         from verl.trainer.ppo.ray_trainer import Role
 
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+        needs_mp_expert = config.algorithm.get("train_mode", "ppo") == "multi_prompt_distill"
+        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss or needs_mp_expert:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 

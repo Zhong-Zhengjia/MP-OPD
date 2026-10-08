@@ -139,7 +139,7 @@ def prepare_expert_prompt_inputs(
     )
     batch_size = responses.shape[0]
     expert_mask = torch.zeros((batch_size, len(config.expert_names)), dtype=torch.bool)
-    prompt_response_rows: list[torch.Tensor] = []
+    prompt_rows: list[torch.Tensor] = []
     flat_batch: list[int] = []
     flat_expert: list[int] = []
     for batch_index in range(batch_size):
@@ -159,11 +159,14 @@ def prepare_expert_prompt_inputs(
             if prompt_ids.numel() > config.max_expert_prompt_length:
                 continue
             expert_mask[batch_index, expert_index] = True
-            prompt_response_rows.append(torch.cat((prompt_ids, valid_response.to(dtype=torch.long))))
+            # The policy helpers append/score ``responses`` separately. Keep
+            # expert_input_ids as prompt-only tensors, just like the clean
+            # rollout batch.
+            prompt_rows.append(prompt_ids)
             flat_batch.append(batch_index)
             flat_expert.append(expert_index)
 
-    input_ids, attention_mask = _left_pad(prompt_response_rows, tokenizer.pad_token_id)
+    input_ids, attention_mask = _left_pad(prompt_rows, tokenizer.pad_token_id)
     position_ids = compute_position_id_with_mask(attention_mask)
     return ExpertPromptInputs(
         input_ids=input_ids,
