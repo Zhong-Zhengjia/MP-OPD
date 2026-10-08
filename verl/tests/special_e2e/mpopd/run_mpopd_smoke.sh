@@ -16,6 +16,7 @@ GPU_COUNT="${MPOPD_SMOKE_GPU_COUNT:-8}"
 CUDA_VISIBLE_DEVICES_OVERRIDE="${MPOPD_SMOKE_CUDA_VISIBLE_DEVICES:-}"
 TRAIN_SAMPLES="${MPOPD_SMOKE_TRAIN_SAMPLES:-2}"
 TOP_K="${MPOPD_SMOKE_TOP_K:-3}"
+PROMPT_LENGTH="${MPOPD_SMOKE_PROMPT_LENGTH:-16384}"
 RESPONSE_LENGTH="${MPOPD_SMOKE_RESPONSE_LENGTH:-32}"
 PPO_MINI_BATCH_SIZE="${MPOPD_SMOKE_PPO_MINI_BATCH_SIZE:-8}"
 LOG_FILE="${MPOPD_SMOKE_LOG:-/tmp/mpopd-gpu-smoke-real.log}"
@@ -35,6 +36,7 @@ echo "  student:    ${MPOPD_SMOKE_MODEL}"
 echo "  reference:  ${MPOPD_SMOKE_REF_MODEL}"
 echo "  parquet:    ${MPOPD_SMOKE_TRAIN_PARQUET}"
 echo "  GPUs:       ${GPU_COUNT}"
+echo "  prompt length: ${PROMPT_LENGTH}"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "  log:        ${LOG_FILE}"
 
@@ -52,6 +54,7 @@ python -m verl.trainer.main_ppo \
   data.val_files="${MPOPD_SMOKE_TRAIN_PARQUET}" \
   data.train_batch_size="${TRAIN_SAMPLES}" \
   data.train_max_samples="${TRAIN_SAMPLES}" \
+  data.max_prompt_length="${PROMPT_LENGTH}" \
   data.max_response_length="${RESPONSE_LENGTH}" \
   data.return_raw_chat=true \
   trainer.n_gpus_per_node="${GPU_COUNT}" \
