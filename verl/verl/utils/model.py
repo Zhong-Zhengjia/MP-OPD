@@ -36,15 +36,11 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
-try:
-    # Transformers v5 renamed this auto class.
-    from transformers import AutoModelForVision2Seq
-except ImportError:
-    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from verl.models.registry import ModelRegistry
 from verl.utils.import_utils import is_trl_available
+from verl.utils.transformers_compat import AutoModelForVision2Seq
 
 
 class LambdaLayer(nn.Module):

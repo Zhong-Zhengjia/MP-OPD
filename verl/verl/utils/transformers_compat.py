@@ -39,7 +39,7 @@ except ImportError:
 @lru_cache
 def is_transformers_version_in_range(min_version: Optional[str] = None, max_version: Optional[str] = None) -> bool:
     try:
-        # Get the installed version of the transformers library
+        # Get the installed version of transformers library
         transformers_version_str = importlib.metadata.version("transformers")
     except importlib.metadata.PackageNotFoundError as e:
         raise ModuleNotFoundError("The `transformers` package is not installed.") from e
@@ -55,3 +55,10 @@ def is_transformers_version_in_range(min_version: Optional[str] = None, max_vers
         upper_bound_check = transformers_version <= version.parse(max_version)
 
     return lower_bound_check and upper_bound_check
+
+
+# Transformers v5 renamed this auto model class.
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq

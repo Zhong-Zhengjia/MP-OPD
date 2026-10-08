@@ -395,10 +395,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             AutoModel,
             AutoModelForCausalLM,
             AutoModelForImageTextToText,
-            AutoModelForVision2Seq,
         )
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
+        from verl.utils.transformers_compat import AutoModelForVision2Seq
         from verl.utils.torch_dtypes import PrecisionType
 
         assert role in ["actor", "ref"]
@@ -1985,8 +1985,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             AutoModel,
             AutoModelForCausalLM,
             AutoModelForImageTextToText,
-            AutoModelForVision2Seq,
         )
+        from verl.utils.transformers_compat import AutoModelForVision2Seq
 
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)

@@ -332,7 +332,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                         auto_model_cls = AutoModelForImageTextToText
                     else:
                         # transformers < 4.54.0 uses AutoModelForVision2Seq
-                        from transformers import AutoModelForVision2Seq
+                        from verl.utils.transformers_compat import AutoModelForVision2Seq
 
                         auto_model_cls = AutoModelForVision2Seq
                 else:
