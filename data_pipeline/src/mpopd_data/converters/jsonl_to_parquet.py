@@ -34,3 +34,27 @@ def write_parquet(rows: Iterable[dict], output_path: Path) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, output_path)
     return len(materialized)
+
+
+def convert_jsonl_to_parquet(input_path: Path, output_path: Path, limit: int | None = None) -> int:
+    """Convert normalized JSONL rows to a verl-compatible Parquet file."""
+    rows = []
+    with input_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            rows.append(json.loads(line))
+            if limit is not None and len(rows) >= limit:
+                break
+    return write_parquet(rows, output_path)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--limit", type=int, default=None)
+    args = parser.parse_args()
+    print(convert_jsonl_to_parquet(args.input, args.output, args.limit))
