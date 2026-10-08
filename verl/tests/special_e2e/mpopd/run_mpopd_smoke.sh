@@ -13,6 +13,7 @@ VERL_ROOT="${REPO_ROOT}/verl"
 : "${MPOPD_SMOKE_TRAIN_PARQUET:?Set MPOPD_SMOKE_TRAIN_PARQUET to a small MP-OPD parquet file}"
 
 GPU_COUNT="${MPOPD_SMOKE_GPU_COUNT:-8}"
+CUDA_VISIBLE_DEVICES_OVERRIDE="${MPOPD_SMOKE_CUDA_VISIBLE_DEVICES:-}"
 TRAIN_SAMPLES="${MPOPD_SMOKE_TRAIN_SAMPLES:-2}"
 TOP_K="${MPOPD_SMOKE_TOP_K:-3}"
 RESPONSE_LENGTH="${MPOPD_SMOKE_RESPONSE_LENGTH:-32}"
@@ -24,6 +25,9 @@ export PYTHONPATH="${VERL_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export HYDRA_FULL_ERROR=1
 export RAY_DEDUP_LOGS=0
 export TOKENIZERS_PARALLELISM=false
+if [[ -n "${CUDA_VISIBLE_DEVICES_OVERRIDE}" ]]; then
+  export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES_OVERRIDE}"
+fi
 
 echo "MP-OPD smoke configuration:"
 echo "  repository: ${REPO_ROOT}"
@@ -31,6 +35,7 @@ echo "  student:    ${MPOPD_SMOKE_MODEL}"
 echo "  reference:  ${MPOPD_SMOKE_REF_MODEL}"
 echo "  parquet:    ${MPOPD_SMOKE_TRAIN_PARQUET}"
 echo "  GPUs:       ${GPU_COUNT}"
+echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "  log:        ${LOG_FILE}"
 
 if [[ ! -f "${MPOPD_SMOKE_TRAIN_PARQUET}" ]]; then
@@ -59,6 +64,7 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.rollout.name=vllm \
+  actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.rollout.n=1 \
   actor_rollout_ref.rollout.response_length="${RESPONSE_LENGTH}" \
   trainer.total_epochs=1 \
