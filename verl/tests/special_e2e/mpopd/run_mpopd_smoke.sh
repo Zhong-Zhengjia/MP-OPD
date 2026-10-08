@@ -2,8 +2,7 @@
 set -Eeuo pipefail
 
 # One-update MP-OPD validation for a real server with GPUs and local checkpoints.
-# This script intentionally uses the synchronous Hugging Face rollout so that
-# vLLM/FlashAttention compatibility is not part of the first training check.
+# Use the project's supported vLLM rollout path.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
@@ -59,7 +58,7 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.use_dynamic_bsz=true \
   actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
-  actor_rollout_ref.rollout.name=hf \
+  actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.n=1 \
   actor_rollout_ref.rollout.response_length="${RESPONSE_LENGTH}" \
   trainer.total_epochs=1 \
