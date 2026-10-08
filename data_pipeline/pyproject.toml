@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mpopd-data-pipeline"
+version = "0.1.0"
+description = "Dataset adapters and converters for MP-OPD"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=14"]
+test = ["pytest>=8"]
+
+[project.scripts]
+mpopd-data = "mpopd_data.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
