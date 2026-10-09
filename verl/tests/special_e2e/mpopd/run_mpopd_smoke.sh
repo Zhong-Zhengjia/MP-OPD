@@ -75,7 +75,6 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.mpopd_lr_scale=1.0 \
   actor_rollout_ref.actor.use_dynamic_bsz=true \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_GPU}" \
-  actor_rollout_ref.actor.ppo_infer_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_GPU}" \
   actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.rollout.name=vllm \
