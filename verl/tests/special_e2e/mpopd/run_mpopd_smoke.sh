@@ -21,6 +21,7 @@ RESPONSE_LENGTH="${MPOPD_SMOKE_RESPONSE_LENGTH:-4096}"
 TOTAL_LENGTH="${MPOPD_SMOKE_TOTAL_LENGTH:-37000}"
 MAX_NUM_BATCHED_TOKENS="${MPOPD_SMOKE_MAX_NUM_BATCHED_TOKENS:-${TOTAL_LENGTH}}"
 EXPERT_PROMPT_LENGTH="${MPOPD_SMOKE_EXPERT_PROMPT_LENGTH:-32768}"
+MAX_TOKEN_LEN_PER_GPU="${MPOPD_SMOKE_MAX_TOKEN_LEN_PER_GPU:-${TOTAL_LENGTH}}"
 PPO_MINI_BATCH_SIZE="${MPOPD_SMOKE_PPO_MINI_BATCH_SIZE:-8}"
 LOG_FILE="${MPOPD_SMOKE_LOG:-/tmp/mpopd-gpu-smoke-real.log}"
 
@@ -44,6 +45,7 @@ echo "  response length: ${RESPONSE_LENGTH}"
 echo "  total length: ${TOTAL_LENGTH}"
 echo "  max batched tokens: ${MAX_NUM_BATCHED_TOKENS}"
 echo "  expert prompt length: ${EXPERT_PROMPT_LENGTH}"
+echo "  max actor tokens per GPU: ${MAX_TOKEN_LEN_PER_GPU}"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "  log:        ${LOG_FILE}"
 
@@ -72,6 +74,8 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.ref.model.path="${MPOPD_SMOKE_REF_MODEL}" \
   actor_rollout_ref.actor.mpopd_lr_scale=1.0 \
   actor_rollout_ref.actor.use_dynamic_bsz=true \
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_GPU}" \
+  actor_rollout_ref.actor.ppo_infer_max_token_len_per_gpu="${MAX_TOKEN_LEN_PER_GPU}" \
   actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.rollout.name=vllm \
