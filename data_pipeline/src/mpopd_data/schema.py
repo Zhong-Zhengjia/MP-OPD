@@ -16,8 +16,9 @@ class SchemaValidationError(ValueError):
 @dataclass(frozen=True)
 class ExpertContext:
     enabled: bool
-    instruction: str
     evidence_available: bool
+    instruction: str | None = None
+    instruction_override: str | None = None
     evidence: Any = None
 
 
@@ -31,15 +32,22 @@ class MpopdRow:
     extra_info: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
-        contexts = {
-            name: {
+        contexts: dict[str, dict[str, Any]] = {}
+        for name, context in self.expert_contexts.items():
+            # Per §11, direction instructions live in the config by default; a row only
+            # carries an instruction when it snapshots one, and ``instruction_override``
+            # only when a sample overrides the config default. Omit both when absent so
+            # the runtime falls back to the configured expert instructions.
+            entry: dict[str, Any] = {
                 "enabled": context.enabled,
-                "instruction": context.instruction,
                 "evidence_available": context.evidence_available,
                 "evidence": context.evidence,
             }
-            for name, context in self.expert_contexts.items()
-        }
+            if context.instruction is not None:
+                entry["instruction"] = context.instruction
+            if context.instruction_override is not None:
+                entry["instruction_override"] = context.instruction_override
+            contexts[name] = entry
         extra_info = dict(self.extra_info)
         extra_info["schema_version"] = SCHEMA_VERSION
         extra_info["expert_contexts"] = contexts
@@ -82,8 +90,22 @@ def validate_mpopd_row(row: dict[str, Any]) -> MpopdRow:
     for name in EXPERT_NAMES:
         raw = raw_contexts[name]
         _require(isinstance(raw, dict), f"expert_contexts.{name} must be an object")
+        # ``instruction`` is optional (defaults to the config-level direction instruction);
+        # ``instruction_override`` optionally replaces that default for one sample. When
+        # present, each must be a non-empty string so an empty instruction never silently
+        # reaches the runtime.
         instruction = raw.get("instruction")
-        _require(isinstance(instruction, str) and instruction.strip(), f"expert_contexts.{name}.instruction is required")
+        if instruction is not None:
+            _require(
+                isinstance(instruction, str) and instruction.strip(),
+                f"expert_contexts.{name}.instruction must be a non-empty string when provided",
+            )
+        instruction_override = raw.get("instruction_override")
+        if instruction_override is not None:
+            _require(
+                isinstance(instruction_override, str) and instruction_override.strip(),
+                f"expert_contexts.{name}.instruction_override must be a non-empty string when provided",
+            )
         enabled = raw.get("enabled")
         evidence_available = raw.get("evidence_available")
         _require(isinstance(enabled, bool), f"expert_contexts.{name}.enabled must be boolean")
@@ -97,8 +119,11 @@ def validate_mpopd_row(row: dict[str, Any]) -> MpopdRow:
         )
         contexts[name] = ExpertContext(
             enabled=enabled,
-            instruction=instruction.strip(),
             evidence_available=evidence_available,
+            instruction=instruction.strip() if isinstance(instruction, str) else None,
+            instruction_override=(
+                instruction_override.strip() if isinstance(instruction_override, str) else None
+            ),
             evidence=raw.get("evidence"),
         )
 

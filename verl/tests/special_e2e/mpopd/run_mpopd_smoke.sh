@@ -110,7 +110,9 @@ if ! grep -Eq 'actor/mpopd_kl_loss|mpopd_kl_loss' "${LOG_FILE}"; then
   exit 4
 fi
 
-if grep -Eiq 'Traceback|CUDA out of memory|ActorDiedError|Missing mandatory value|ImportError|nan|inf' "${LOG_FILE}"; then
+# Match standalone nan/inf tokens only (\b) so legitimate log content such as
+# "INFO", "inference", or "information" does not trigger a false failure.
+if grep -Eiq 'Traceback|CUDA out of memory|ActorDiedError|Missing mandatory value|ImportError|FloatingPointError|\bnan\b|\binf\b' "${LOG_FILE}"; then
   echo "FAIL: the log contains a fatal runtime marker." >&2
   exit 5
 fi

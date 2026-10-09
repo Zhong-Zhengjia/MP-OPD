@@ -74,17 +74,20 @@ def build_expert_messages(
     expert_name: str,
     context: ExpertContext,
 ) -> list[dict[str, str]]:
-    """Copy a clean chat and append the direction-specific expert context."""
+    """Copy a clean chat and append the direction-specific expert context.
+
+    ``context.instruction`` already carries the expert's viewpoint header, so we
+    append it directly rather than adding a second wrapper heading. The training
+    evidence section is added only when ``evidence_available`` is true; this avoids
+    leaving a dangling evidence heading for experts with no observed evidence.
+    """
     if not context.enabled:
         raise ValueError(f"cannot build a disabled expert prompt: {expert_name}")
     messages = copy.deepcopy(raw_prompt)
-    evidence = ""
+    addition = f"\n\n{context.instruction}"
     if context.evidence_available:
-        evidence = "\n训练期方向证据：\n" + json.dumps(context.evidence, ensure_ascii=False)
-    addition = (
-        f"\n\n【MP-OPD {expert_name} 专家视角】\n"
-        f"{context.instruction}{evidence}"
-    )
+        evidence_text = json.dumps(context.evidence, ensure_ascii=False)
+        addition += f"\n\n训练期方向证据（仅供本专家参考）：\n{evidence_text}"
     if not messages or messages[-1].get("role") != "user":
         messages.append({"role": "user", "content": addition.lstrip()})
     else:
@@ -130,14 +133,23 @@ def prepare_expert_prompt_inputs(
     batch: DataProto,
     tokenizer,
     config: MPOPDConfig,
+    *,
+    max_total_length: int | None = None,
 ) -> ExpertPromptInputs:
-    """Build flattened, left-padded expert prompt+response inputs."""
+    """Build flattened, left-padded expert prompt+response inputs.
+
+    ``max_total_length`` (optional, e.g. the rollout ``max_model_len``) bounds the
+    full expert sequence (prompt + response). An expert whose prompt+response would
+    exceed it is skipped so the frozen forward never has to truncate the response
+    prefix; pass ``None`` to enforce only the ``max_expert_prompt_length`` budget.
+    """
     responses = batch.batch["responses"]
     response_mask = batch.batch.get(
         "response_mask",
         torch.ones_like(responses, dtype=torch.long),
     )
     batch_size = responses.shape[0]
+    response_seq_len = responses.shape[1]
     expert_mask = torch.zeros((batch_size, len(config.expert_names)), dtype=torch.bool)
     prompt_rows: list[torch.Tensor] = []
     flat_batch: list[int] = []
@@ -157,6 +169,8 @@ def prepare_expert_prompt_inputs(
                 continue
             prompt_ids = _tokenize_prompt(tokenizer, build_expert_messages(raw_prompt, name, context))
             if prompt_ids.numel() > config.max_expert_prompt_length:
+                continue
+            if max_total_length is not None and prompt_ids.numel() + response_seq_len > max_total_length:
                 continue
             expert_mask[batch_index, expert_index] = True
             # The policy helpers append/score ``responses`` separately. Keep

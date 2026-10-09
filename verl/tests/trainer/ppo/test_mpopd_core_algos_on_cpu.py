@@ -76,3 +76,36 @@ def test_target_is_detached():
         torch.ones(1, 1, dtype=torch.bool),
     )
     assert not result.target_probs.requires_grad
+
+
+def test_strict_mode_raises_when_any_sample_lacks_active_experts():
+    # ``skip_samples_without_active_experts=False`` treats a sample with no active
+    # expert as a configuration error rather than silently producing a zero-gradient
+    # row, so a batch containing one should raise immediately.
+    student = torch.zeros(1, 1, 2, requires_grad=True)
+    target = torch.full((1, 1, 2), 0.5)
+    try:
+        compute_mpopd_kl_loss(
+            student,
+            target,
+            torch.ones(1, 1),
+            torch.tensor([False]),
+            skip_samples_without_active_experts=False,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("strict mode should raise when a sample has no active experts")
+
+
+def test_strict_mode_passes_when_all_samples_have_active_experts():
+    student = torch.tensor([[[0.0, 0.0]]], requires_grad=True)
+    target = torch.full((1, 1, 2), 0.5)
+    loss = compute_mpopd_kl_loss(
+        student,
+        target,
+        torch.ones(1, 1),
+        torch.tensor([True]),
+        skip_samples_without_active_experts=False,
+    )
+    assert torch.allclose(loss, torch.tensor(0.0))

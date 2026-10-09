@@ -150,8 +150,16 @@ def compute_mpopd_kl_loss(
     target_probs: torch.Tensor,
     response_mask: torch.Tensor,
     valid_samples: torch.Tensor,
+    *,
+    skip_samples_without_active_experts: bool = True,
 ) -> torch.Tensor:
-    """Compute masked ``KL(target || student)`` over selected top-k tokens."""
+    """Compute masked ``KL(target || student)`` over selected top-k tokens.
+
+    When ``skip_samples_without_active_experts`` is true (default), samples with no
+    active expert are masked out of the loss so MP-OPD never silently degrades to
+    anchor distillation on them. When false, encountering such a sample is treated
+    as a configuration error and raises instead of producing a zero-gradient loss.
+    """
     if student_topk_log_probs.shape != target_probs.shape:
         raise ValueError("student_topk_log_probs and target_probs must have the same shape")
     if student_topk_log_probs.ndim != 3:
@@ -160,6 +168,11 @@ def compute_mpopd_kl_loss(
         raise ValueError("response_mask must have shape [B,T]")
     if valid_samples.shape != (student_topk_log_probs.shape[0],):
         raise ValueError("valid_samples must have shape [B]")
+    if not skip_samples_without_active_experts and not bool(valid_samples.all()):
+        raise ValueError(
+            "MP-OPD encountered samples with no active experts; enable "
+            "skip_samples_without_active_experts to mask them or filter them upstream"
+        )
 
     student_log_probs = torch.log_softmax(student_topk_log_probs, dim=-1)
     target_log_probs = torch.log(target_probs.clamp_min(torch.finfo(target_probs.dtype).tiny))
