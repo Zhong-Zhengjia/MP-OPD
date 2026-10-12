@@ -1338,6 +1338,9 @@ class DataParallelPPOActor(BasePPOActor):
                         target.target_probs,
                         response_mask,
                         target.valid_samples,
+                        skip_samples_without_active_experts=bool(
+                            mp_cfg.get("skip_samples_without_active_experts", True)
+                        ),
                     )
                     if not torch.isfinite(loss):
                         raise FloatingPointError("MP-OPD loss is non-finite")
@@ -1353,21 +1356,62 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             weight_entropy = weights.sum() * 0
                             max_weight = weights.sum() * 0
-                        append_to_dict(
-                            metrics,
-                            {
-                                "actor/mpopd_kl_loss": loss.detach().item() * scale,
-                                "actor/mpopd_target_entropy": (-(target.target_probs * target.target_log_probs).sum(-1).mean()).item(),
-                                "actor/mpopd_student_topk_entropy": (-(student_log_probs.detach().softmax(-1) * student_log_probs.detach().log_softmax(-1)).sum(-1).mean()).item(),
-                                "actor/mpopd_expert_weight_entropy": weight_entropy.item(),
-                                "actor/mpopd_max_expert_weight": max_weight.item(),
-                                "actor/mpopd_fused_delta_mean": target.fused_delta.mean().item(),
-                                "actor/mpopd_fused_delta_abs_mean": target.fused_delta.abs().mean().item(),
-                                "actor/mpopd_conflict_rate": (target.expert_delta < 0).float().mean().item(),
-                                "actor/mpopd_all_experts_unavailable_count": (~target.valid_samples).sum().item(),
-                                "actor/mpopd_top_k": student_log_probs.shape[-1],
-                            },
-                        )
+
+                        # §17.1 distribution diagnostics.
+                        student_topk_probs = student_log_probs.detach().softmax(-1)
+                        topk_mass = student_log_probs.detach().exp().sum(-1).mean()
+                        target_max_prob = target.target_probs.max(-1).values.mean()
+
+                        # §17.2 expert-signal diagnostics. Restrict to valid experts and
+                        # response positions: a conflict is a candidate token where at
+                        # least one valid expert raises the log-prob and another lowers it.
+                        expert_mask_b = model_inputs["expert_mask"].to(torch.bool)
+                        expert_delta = target.expert_delta
+                        valid_e = expert_mask_b[:, None, None, :]
+                        rm_tk = response_mask[:, :, None].to(expert_delta.dtype)
+                        rm_tke = response_mask[:, :, None, None].to(expert_delta.dtype)
+                        active_b = active[:, None, None].to(expert_delta.dtype)
+                        pos = (expert_delta > 0) & valid_e
+                        neg = (expert_delta < 0) & valid_e
+                        conflict = pos.any(-1) & neg.any(-1)
+                        conflict_denom = (rm_tk * active_b).sum().clamp_min(1.0)
+                        conflict_rate = (conflict.to(rm_tk.dtype) * rm_tk * active_b).sum() / conflict_denom
+                        valid_count = (rm_tke * valid_e.to(expert_delta.dtype)).sum().clamp_min(1.0)
+                        pos_ratio = (pos.to(expert_delta.dtype) * rm_tke * valid_e.to(expert_delta.dtype)).sum() / valid_count
+                        neg_ratio = (neg.to(expert_delta.dtype) * rm_tke * valid_e.to(expert_delta.dtype)).sum() / valid_count
+                        active_expert_count = expert_mask_b.sum(-1).float().mean()
+
+                        metric_update = {
+                            "actor/mpopd_kl_loss": loss.detach().item() * scale,
+                            "actor/mpopd_target_entropy": (-(target.target_probs * target.target_log_probs).sum(-1).mean()).item(),
+                            "actor/mpopd_student_topk_entropy": (-(student_topk_probs * student_topk_probs.log()).sum(-1).mean()).item(),
+                            "actor/mpopd_topk_probability_mass": topk_mass.item(),
+                            "actor/mpopd_target_max_probability": target_max_prob.item(),
+                            "actor/mpopd_expert_weight_entropy": weight_entropy.item(),
+                            "actor/mpopd_max_expert_weight": max_weight.item(),
+                            "actor/mpopd_fused_delta_mean": target.fused_delta.mean().item(),
+                            "actor/mpopd_fused_delta_abs_mean": target.fused_delta.abs().mean().item(),
+                            "actor/mpopd_conflict_rate": conflict_rate.item(),
+                            "actor/mpopd_positive_delta_ratio": pos_ratio.item(),
+                            "actor/mpopd_negative_delta_ratio": neg_ratio.item(),
+                            "actor/mpopd_active_expert_count": active_expert_count.item(),
+                            "actor/mpopd_all_experts_unavailable_count": (~target.valid_samples).sum().item(),
+                            "actor/mpopd_top_k": student_log_probs.shape[-1],
+                        }
+                        # Per-expert delta / weight, averaged over response positions.
+                        expert_names = mp_cfg.get("expert_names", [])
+                        for e, name in enumerate(expert_names):
+                            if e >= expert_delta.shape[-1]:
+                                break
+                            e_active = expert_mask_b[:, e]
+                            e_denom = (response_mask * e_active[:, None].to(response_mask.dtype)).sum().clamp_min(1.0)
+                            e_rm = response_mask[:, :, None] * e_active[:, None, None].to(response_mask.dtype)
+                            e_delta = expert_delta[..., e]
+                            e_weight = weights[..., e]
+                            metric_update[f"actor/mpopd_{name}_delta_mean"] = ((e_delta * e_rm).sum() / e_denom).item()
+                            metric_update[f"actor/mpopd_{name}_delta_abs_mean"] = ((e_delta.abs() * e_rm).sum() / e_denom).item()
+                            metric_update[f"actor/mpopd_{name}_weight_mean"] = ((e_weight * e_rm).sum() / e_denom).item()
+                        append_to_dict(metrics, metric_update)
                 grad_norm = self._optimizer_step(lr_scale=float(self.config.get("mpopd_lr_scale", 1.0)))
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
         self.actor_optimizer.zero_grad()

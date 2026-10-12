@@ -2073,7 +2073,11 @@ class RayPPOTrainer:
     def _prepare_mpopd_update_batch(self, batch: DataProto) -> tuple[DataProto, dict]:
         """Pack expert prompts, score all clean/expert views, and return update tensors."""
         mp_cfg = omega_conf_to_dataclass(self.mp_opd_config, dataclass_type=type(AlgoConfig().mp_opd))
-        packed = prepare_expert_prompt_inputs(batch, self.ref_tokenizer or self.tokenizer, mp_cfg)
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        max_total_length = rollout_cfg.get("max_model_len", None)
+        packed = prepare_expert_prompt_inputs(
+            batch, self.ref_tokenizer or self.tokenizer, mp_cfg, max_total_length=max_total_length
+        )
         batch = attach_expert_prompt_tensors(batch, packed)
         batch.non_tensor_batch.pop("expert_contexts", None)
         batch.meta_info.update(

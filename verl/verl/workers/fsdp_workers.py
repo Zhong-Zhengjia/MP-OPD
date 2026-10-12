@@ -1611,16 +1611,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         self._set_mpopd_log_prob_meta_info(data)
         data.meta_info["top_k"] = top_k
+        mp_cfg = data.meta_info.get("mp_opd_config", {})
+        expert_micro_batch = int(mp_cfg.get("expert_forward_micro_batch_size", 0))
+        timing_metrics: dict[str, float] = {}
 
         with self.ulysses_sharding_manager:
             actor_data = data.to("cpu")
-            _, student_topk_ids, old_log_probs = self.actor.compute_topk_ids_and_log_probs(
+            t0 = time.perf_counter()
+            _, student_topk_ids, _ = self.actor.compute_topk_ids_and_log_probs(
                 data=actor_data, top_k=top_k
             )
+            timing_metrics["timing/mpopd_student_topk_forward_s"] = time.perf_counter() - t0
             clean_data = build_mpopd_clean_dataproto(data, student_topk_ids)
             clean_data = self._set_mpopd_log_prob_meta_info(clean_data)
+            t0 = time.perf_counter()
             student_base_log_probs = self.base_policy.compute_topk_log_probs_on_ids(data=clean_data)
             teacher_base_log_probs = self.ref_policy.compute_topk_log_probs_on_ids(data=clean_data)
+            timing_metrics["timing/mpopd_clean_base_forward_s"] = time.perf_counter() - t0
 
             expert_mask = data.batch["expert_mask"].to(dtype=torch.bool)
             flat_batch_indices, flat_expert_indices = torch.nonzero(expert_mask, as_tuple=True)
@@ -1636,10 +1643,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
             flat_data = build_flat_expert_dataproto(data, packed, student_topk_ids)
             flat_data = self._set_mpopd_log_prob_meta_info(flat_data)
+            t0 = time.perf_counter()
             if len(flat_data) == 0:
                 flat_expert_log_probs = student_topk_ids.new_empty((0, student_topk_ids.shape[1], top_k), dtype=torch.float32)
+            elif expert_micro_batch > 0:
+                # §13: chunk the flattened [B×E] expert batch to bound peak memory.
+                expert_chunks = []
+                for chunk in flat_data.split(expert_micro_batch):
+                    chunk = self._set_mpopd_log_prob_meta_info(chunk)
+                    expert_chunks.append(self.ref_policy.compute_topk_log_probs_on_ids(data=chunk))
+                flat_expert_log_probs = torch.concat(expert_chunks, dim=0)
             else:
                 flat_expert_log_probs = self.ref_policy.compute_topk_log_probs_on_ids(data=flat_data)
+            timing_metrics["timing/mpopd_expert_forward_s"] = time.perf_counter() - t0
             specialized = restore_specialized_expert_log_probs(
                 flat_expert_log_probs,
                 packed,
@@ -1655,13 +1671,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = DataProto.from_dict(
             tensors={
                 "student_topk_ids": student_topk_ids,
-                "old_log_probs": old_log_probs,
                 "student_base_topk_log_probs": student_base_log_probs,
                 "teacher_base_topk_log_probs": teacher_base_log_probs,
                 "specialized_expert_topk_log_probs": specialized,
                 "expert_mask": data.batch["expert_mask"],
             },
-            meta_info={"top_k": top_k, "num_experts": num_experts},
+            meta_info={"top_k": top_k, "num_experts": num_experts, "metrics": timing_metrics},
         )
         return output.to("cpu")
 
