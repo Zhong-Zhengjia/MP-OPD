@@ -48,6 +48,28 @@ export VERL_FILE_LOGGER_ROOT="${VERL_FILE_LOGGER_ROOT:-${REPO_ROOT}/logs}"
 LOGGERS="${LOGGERS:-console,file}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-mpopd_recommendation}"
 
+# Quiet the terminal during full training. Ray forwards each worker
+# process's stdout/stderr to the driver, so the INFO lines and
+# FutureWarnings each rank prints every step pile up and bury the
+# metrics we care about. Two env knobs, inherited by the worker procs:
+#   VERL_LOGGING_LEVEL  verl modules read this to set logging.getLogger
+#                       level (fsdp_workers, agent_loop, tools, ...).
+#                       ERROR keeps only genuine errors; the per-rank
+#                       "Saved model/optim" INFO lines (checkpoint time)
+#                       go quiet too -- that's fine, the trainer's own
+#                       "Saving checkpoint to ..." line still prints.
+#   PYTHONWARNINGS      filters Python warnings (FutureWarning from FSDP
+#                       state_dict_type, torch.cuda._set_allocator_settings,
+#                       etc.) at the interpreter level before any import.
+# Override or unset either to bring back the noise (e.g. debugging).
+export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-ERROR}"
+export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore::FutureWarning,ignore::DeprecationWarning}"
+# vLLM and transformers emit their own per-step INFO (causal_conv1d
+# fallback, TileLang JIT compile notice, internal warnings). They read
+# these knobs, not VERL_LOGGING_LEVEL. ERROR keeps only real failures.
+export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-ERROR}"
+export TRANSFORMERS_VERBOSITY="${TRANSFORMERS_VERBOSITY:-error}"
+
 # MPOPD_QUICK=1: cap to 8 samples for a fast end-to-end check. Lengths stay
 # at the full production budget (32768 prompt / 4096 response) — recommendation
 # prompts are 7k-10k tokens and must not be truncated. The slow reference
