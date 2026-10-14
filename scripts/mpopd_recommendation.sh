@@ -6,15 +6,14 @@
 # retention, console-only logging, and disables reward KL, actor KL loss, and
 # validation by default. It selects FSDP for the actor and vLLM for rollout.
 #
-# Required assets (paths default to the repo root; override via env vars):
+# Required assets (defaults point at the server checkpoint share; override via env):
 #   STUDENT_MODEL_PATH  Hugging Face student checkpoint (updated by training)
 #   EXPERT_MODEL_PATH   Frozen teacher/expert checkpoint (shared by all 4 experts)
 #   TRAIN_FILES / VAL_FILES  Parquet produced by scripts/prepare_train_parquet.sh
 #
-# Example:
+# Example (defaults already point at the configured server paths, so only the
+# GPU count needs to be supplied):
 #   bash scripts/prepare_train_parquet.sh
-#   STUDENT_MODEL_PATH=/models/Qwen3-8B \
-#   EXPERT_MODEL_PATH=/models/Qwen3-4B \
 #   bash scripts/mpopd_recommendation.sh trainer.n_gpus_per_node=8
 #
 # Extra arguments are forwarded unchanged as Hydra overrides; later overrides
@@ -25,8 +24,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERL_ROOT="${REPO_ROOT}/verl"
-STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH:-${REPO_ROOT}/models/Qwen3-8B}"
-EXPERT_MODEL_PATH="${EXPERT_MODEL_PATH:-${REPO_ROOT}/models/Qwen3-4B}"
+STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH:-/share/yangshiyu05/models/Qwen/Qwen3.5-0.8B}"
+EXPERT_MODEL_PATH="${EXPERT_MODEL_PATH:-/share/yangshiyu05/models/Qwen/Qwen3.5-4B}"
 TRAIN_FILES="${TRAIN_FILES:-${REPO_ROOT}/data/recommendation/train.parquet}"
 VAL_FILES="${VAL_FILES:-${REPO_ROOT}/data/recommendation/validation.parquet}"
 
