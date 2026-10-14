@@ -1398,42 +1398,58 @@ class RayPPOTrainer:
 
         print(f"Loading checkpoint from {checkpoint_path}")
 
-        actor_local_path = os.path.join(checkpoint_path, "actor")
-        actor_remote_path = None
-        self.actor_rollout_wg.load_checkpoint(
-            actor_local_path,
-            actor_remote_path,
-            del_local_after_load=self.config.trainer.get("del_local_ckpt_after_load", False),
-        )
+        try:
+            actor_local_path = os.path.join(checkpoint_path, "actor")
+            actor_remote_path = None
+            self.actor_rollout_wg.load_checkpoint(
+                actor_local_path,
+                actor_remote_path,
+                del_local_after_load=self.config.trainer.get("del_local_ckpt_after_load", False),
+            )
 
-        if self.use_critic:
-            critic_local_path = os.path.join(checkpoint_path, str(Role.Critic))
-            if os.path.isdir(critic_local_path):
-                self.critic_wg.load_checkpoint(
-                    critic_local_path,
-                    None,
-                    del_local_after_load=self.config.trainer.get("del_local_ckpt_after_load", False),
-                )
+            if self.use_critic:
+                critic_local_path = os.path.join(checkpoint_path, str(Role.Critic))
+                if os.path.isdir(critic_local_path):
+                    self.critic_wg.load_checkpoint(
+                        critic_local_path,
+                        None,
+                        del_local_after_load=self.config.trainer.get("del_local_ckpt_after_load", False),
+                    )
+                else:
+                    print(f"Warning: critic checkpoint not found at {critic_local_path}; critic will start from init state.")
+
+            dataloader_path = os.path.join(checkpoint_path, "data.pt")
+            if os.path.exists(dataloader_path):
+                dataloader_state_dict = torch.load(dataloader_path, map_location="cpu", weights_only=False)
+                self.train_dataloader.load_state_dict(dataloader_state_dict)
+                print(f"Loaded dataloader state from {dataloader_path}")
             else:
-                print(f"Warning: critic checkpoint not found at {critic_local_path}; critic will start from init state.")
+                print(f"Warning: dataloader state not found at {dataloader_path}; dataloader will start from scratch.")
 
-        dataloader_path = os.path.join(checkpoint_path, "data.pt")
-        if os.path.exists(dataloader_path):
-            dataloader_state_dict = torch.load(dataloader_path, map_location="cpu", weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
-            print(f"Loaded dataloader state from {dataloader_path}")
-        else:
-            print(f"Warning: dataloader state not found at {dataloader_path}; dataloader will start from scratch.")
-
-        meta_path = os.path.join(checkpoint_path, "meta.pt")
-        if os.path.exists(meta_path):
-            meta = torch.load(meta_path, map_location="cpu", weights_only=False)
-            self.global_steps = int(meta.get("global_steps", self.global_steps))
-            if hasattr(self, "pace_enabled"):
-                self._load_pace_state_dict(meta.get("pace_state", {}))
-            print(f"Loaded trainer state: global_steps={self.global_steps}")
-        else:
-            print(f"Warning: trainer meta not found at {meta_path}; global_steps remains {self.global_steps}.")
+            meta_path = os.path.join(checkpoint_path, "meta.pt")
+            if os.path.exists(meta_path):
+                meta = torch.load(meta_path, map_location="cpu", weights_only=False)
+                self.global_steps = int(meta.get("global_steps", self.global_steps))
+                if hasattr(self, "pace_enabled"):
+                    self._load_pace_state_dict(meta.get("pace_state", {}))
+                print(f"Loaded trainer state: global_steps={self.global_steps}")
+            else:
+                print(f"Warning: trainer meta not found at {meta_path}; global_steps remains {self.global_steps}.")
+        except Exception as e:
+            # A prior run can leave a half-written checkpoint if it crashed
+            # (OOM SIGKILL, NCCL abort, etc.) mid-save -- the FSDP optim shard
+            # is truncated, so torch.load raises "PytorchStreamReader failed
+            # locating file data/N ... checkpoint file is corrupted". With
+            # resume_mode=auto this fires on every new launch and blocks even
+            # a fresh-from-scratch run. Fail safe: warn, reset global_steps,
+            # and train from scratch. The next save overwrites the bad dir.
+            print(
+                f"[WARN] Failed to load checkpoint from {checkpoint_path}: {e}\n"
+                "[WARN] The checkpoint is likely corrupted (a prior run probably "
+                "crashed mid-save). Falling back to training from scratch; the "
+                "next save will overwrite this checkpoint."
+            )
+            self.global_steps = 0
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
