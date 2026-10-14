@@ -48,15 +48,16 @@ export VERL_FILE_LOGGER_ROOT="${VERL_FILE_LOGGER_ROOT:-${REPO_ROOT}/logs}"
 LOGGERS="${LOGGERS:-console,file}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-mpopd_recommendation}"
 
-# MPOPD_QUICK=1: cap to 8 samples and 2 steps for a fast end-to-end check.
-# Lengths stay at full 16384 — recommendation prompts are 7k-10k tokens and
-# must not be truncated. The slow reference attention kernels (causal_conv1d /
-# flash-linear-attention, used by Qwen3.5 linear-attention layers when the
-# optimized CUDA kernels are unavailable) make each step slow. The NCCL
-# timeout is 300s: when ranks are in sync every all-gather completes in
-# milliseconds, so a short timeout never trips on genuine (slow-but-in-sync)
-# compute — it only fails fast on a real desync (one rank never entering a
-# collective). Full-speed training still requires the optimized kernels.
+# MPOPD_QUICK=1: cap to 8 samples for a fast end-to-end check. Lengths stay
+# at the full production budget (32768 prompt / 4096 response) — recommendation
+# prompts are 7k-10k tokens and must not be truncated. The slow reference
+# attention kernels (causal_conv1d / flash-linear-attention, used by Qwen3.5
+# linear-attention layers when the optimized CUDA kernels are unavailable)
+# make each step slow. The NCCL timeout is 300s: when ranks are in sync every
+# all-gather completes in milliseconds, so a short timeout never trips on
+# genuine (slow-but-in-sync) compute — it only fails fast on a real desync
+# (one rank never entering a collective). Full-speed training still requires
+# the optimized kernels.
 if [[ "${MPOPD_QUICK:-0}" == "1" ]]; then
   QUICK_ARGS=(
     data.train_max_samples=8
@@ -68,7 +69,7 @@ if [[ "${MPOPD_QUICK:-0}" == "1" ]]; then
   # len(dataloader) * total_epochs (ray_trainer.py, when the yaml default
   # null stays). With 8 samples / batch 8 = 1 step per epoch, so
   # total_epochs=N -> N steps. Set total_epochs only.
-  echo "MPOPD_QUICK=1: 8 samples, auto steps (1 step/epoch x total_epochs), full 16384 length — verifying the data flow only."
+  echo "MPOPD_QUICK=1: 8 samples, auto steps (1 step/epoch x total_epochs), full 32768 prompt / 4096 response — verifying the data flow only."
 else
   QUICK_ARGS=()
 fi
@@ -102,13 +103,13 @@ exec python -m verl.trainer.main_ppo \
   algorithm.mp_opd.token_temperature=1.0 \
   algorithm.mp_opd.lambda_value=1.0 \
   algorithm.mp_opd.expert_forward_micro_batch_size=1 \
-  algorithm.mp_opd.max_expert_prompt_length=16384 \
+  algorithm.mp_opd.max_expert_prompt_length=32768 \
   critic.enable=false \
   +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
   +actor_rollout_ref.ref.model.override_config.attn_implementation=sdpa \
   data.return_raw_chat=true \
   data.truncation=left \
-  data.max_prompt_length=16384 \
+  data.max_prompt_length=32768 \
   data.max_response_length=4096 \
   data.dataloader_num_workers=0 \
   "data.train_files=${TRAIN_FILES}" \
@@ -124,8 +125,8 @@ exec python -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.actor.mpopd_lr_scale=1.0 \
   actor_rollout_ref.rollout.name=vllm \
-  actor_rollout_ref.rollout.max_model_len=20480 \
-  actor_rollout_ref.rollout.max_num_batched_tokens=20480 \
+  actor_rollout_ref.rollout.max_model_len=36864 \
+  actor_rollout_ref.rollout.max_num_batched_tokens=36864 \
   actor_rollout_ref.rollout.enforce_eager=true \
   actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
