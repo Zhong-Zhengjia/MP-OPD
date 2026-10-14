@@ -18,6 +18,11 @@
 # To override the GPU count, pass it (it takes precedence over the default 4):
 #   bash scripts/mpopd_recommendation.sh trainer.n_gpus_per_node=8
 #
+# Quick smoke run (small data, 2 steps, no checkpoint) to verify the full
+# MP-OPD data flow end-to-end before committing to a full run:
+#   MPOPD_QUICK=1 bash scripts/mpopd_recommendation.sh
+# Once it prints mpopd_kl_loss and global_step=2, drop MPOPD_QUICK for the full run.
+#
 # Extra arguments are forwarded unchanged as Hydra overrides; later overrides
 # take precedence. The student and expert tokenizers must share an identical
 # token-to-ID vocabulary (MP-OPD scores the student's exact top-k token IDs).
@@ -30,6 +35,19 @@ STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH:-/share/yangshiyu05/models/Qwen/Qwen3.5
 EXPERT_MODEL_PATH="${EXPERT_MODEL_PATH:-/share/yangshiyu05/models/Qwen/Qwen3.5-4B}"
 TRAIN_FILES="${TRAIN_FILES:-${REPO_ROOT}/data/recommendation/train.parquet}"
 VAL_FILES="${VAL_FILES:-${REPO_ROOT}/data/recommendation/validation.parquet}"
+
+# MPOPD_QUICK=1: cap to 8 samples and 2 steps for a fast end-to-end check.
+if [[ "${MPOPD_QUICK:-0}" == "1" ]]; then
+  QUICK_ARGS=(
+    data.train_max_samples=8
+    data.train_batch_size=8
+    trainer.total_training_steps=2
+    trainer.save_freq=-1
+  )
+  echo "MPOPD_QUICK=1: 8 samples, 2 steps, no checkpoint — verifying the data flow only."
+else
+  QUICK_ARGS=()
+fi
 
 cd "${VERL_ROOT}"
 
@@ -76,4 +94,5 @@ exec python -m verl.trainer.main_ppo \
   trainer.val_before_train=false \
   trainer.test_freq=-1 \
   trainer.n_gpus_per_node=4 \
+  "${QUICK_ARGS[@]}" \
   "$@"
