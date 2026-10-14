@@ -56,6 +56,7 @@ if [[ "${MPOPD_QUICK:-0}" == "1" ]]; then
     data.train_batch_size=8
     trainer.total_training_steps=2
     trainer.save_freq=-1
+    data.dataloader_prefetch_factor=1
   )
   echo "MPOPD_QUICK=1: 8 samples, 2 steps, no checkpoint, full 16384 length — verifying the data flow only."
 else
@@ -110,6 +111,7 @@ exec python -m verl.trainer.main_ppo \
   "trainer.logger=[${LOGGERS}]" \
   trainer.project_name=mpopd \
   "trainer.experiment_name=${EXPERIMENT_NAME}" \
+  +ray_kwargs.ray_init.object_store_memory=67108864 \
   trainer.val_before_train=false \
   trainer.test_freq=-1 \
   trainer.n_gpus_per_node=4 \

@@ -473,14 +473,25 @@ class RayPPOTrainer:
             collate_fn = default_collate_fn
 
         num_workers = self.config.data["dataloader_num_workers"]
-
-        self.train_dataloader = StatefulDataLoader(
-            dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+        # prefetch_factor controls how many batches each worker pre-produces
+        # and holds in shared memory. Lowering it reduces peak /dev/shm usage
+        # (critical when the container caps /dev/shm at 512M and Ray's object
+        # store already reserves a chunk). Default 2 (PyTorch default); set to
+        # 1 under tight memory.
+        prefetch_factor = self.config.data.get("dataloader_prefetch_factor", 2)
+        dl_kwargs = dict(
             num_workers=num_workers,
             drop_last=True,
             collate_fn=collate_fn,
             sampler=train_sampler,
+        )
+        if num_workers > 0:
+            dl_kwargs["prefetch_factor"] = prefetch_factor
+
+        self.train_dataloader = StatefulDataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            **dl_kwargs,
         )
 
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
