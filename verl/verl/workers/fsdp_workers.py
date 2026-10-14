@@ -2056,12 +2056,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 attn_implementation=attn_implementation,
             )
 
-            # Qwen3.5 multimodal: the vision config's rope_parameters can be
-            # lost when AutoConfig.from_pretrained deserializes the config,
-            # causing Qwen3_5VisionRotaryEmbedding.__init__ to crash on
-            # model_class.from_config below. The live actor module (loaded via
-            # from_pretrained during init) retains the correct vision_config, so
-            # copy rope_parameters from it when the export config is missing it.
+            # Qwen3.5 multimodal: a freshly deserialized AutoConfig.from_pretrained
+            # of the vision_config can be missing attributes the vision tower's
+            # __init__ reads at from_config time -- rope_parameters,
+            # num_attention_heads, ... -- in a transformers-version-dependent
+            # way, so model_class.from_config below crashes. The live actor
+            # module (loaded via from_pretrained during init) retains a
+            # vision_config that already built the model successfully, so it
+            # has every attribute needed. Replace the export vision_config
+            # with the live one wholesale instead of copying attributes one at
+            # a time (whack-a-mole: rope_parameters was the first, then
+            # num_attention_heads -- the next version will lose a third).
             try:
                 live_module = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
                 live_config = getattr(live_module, "config", None)
@@ -2069,14 +2074,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     hasattr(model_config, "vision_config")
                     and live_config is not None
                     and hasattr(live_config, "vision_config")
-                    and not getattr(model_config.vision_config, "rope_parameters", None)
-                    and getattr(live_config.vision_config, "rope_parameters", None)
                 ):
-                    model_config.vision_config.rope_parameters = dict(
-                        live_config.vision_config.rope_parameters
-                    )
+                    # deepcopy to isolate the export config from the live
+                    # module's config; fall back to direct assignment (share the
+                    # object) if deepcopy trips on some nested attribute, so the
+                    # swap still happens. The export path only reads/serializes
+                    # the config, never mutates it, so sharing is safe.
+                    try:
+                        import copy
+                        model_config.vision_config = copy.deepcopy(live_config.vision_config)
+                    except Exception:
+                        model_config.vision_config = live_config.vision_config
             except Exception as e:
-                print(f"[WARN] could not copy vision rope_parameters for export: {e}")
+                print(f"[WARN] could not copy vision_config for export: {e}")
 
             has_remote_code = hasattr(model_config, "auto_map") and any(
                 model_config.architectures[0] in val for val in model_config.auto_map.values()
