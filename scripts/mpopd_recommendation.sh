@@ -115,7 +115,7 @@ exec python -m verl.trainer.main_ppo \
   "trainer.logger=[${LOGGERS}]" \
   trainer.project_name=mpopd \
   "trainer.experiment_name=${EXPERIMENT_NAME}" \
-  +ray_kwargs.ray_init.object_store_memory=67108864 \
+  +ray_kwargs.ray_init.object_store_memory=83886080 \
   trainer.val_before_train=false \
   trainer.test_freq=-1 \
   trainer.n_gpus_per_node=4 \
