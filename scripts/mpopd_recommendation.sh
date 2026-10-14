@@ -61,11 +61,14 @@ if [[ "${MPOPD_QUICK:-0}" == "1" ]]; then
   QUICK_ARGS=(
     data.train_max_samples=8
     data.train_batch_size=8
-    trainer.total_training_steps=2
     trainer.save_freq=-1
     +data.dataloader_prefetch_factor=1
   )
-  echo "MPOPD_QUICK=1: 8 samples, 2 steps, no checkpoint, full 16384 length — verifying the data flow only."
+  # total_training_steps is intentionally NOT set here: it auto-derives as
+  # len(dataloader) * total_epochs (ray_trainer.py, when the yaml default
+  # null stays). With 8 samples / batch 8 = 1 step per epoch, so
+  # total_epochs=N -> N steps. Set total_epochs only.
+  echo "MPOPD_QUICK=1: 8 samples, auto steps (1 step/epoch x total_epochs), full 16384 length — verifying the data flow only."
 else
   QUICK_ARGS=()
 fi
