@@ -39,6 +39,7 @@ exec python -m verl.trainer.main_ppo \
   algorithm.mp_opd.token_temperature=1.0 \
   algorithm.mp_opd.lambda_value=1.0 \
   algorithm.mp_opd.expert_forward_micro_batch_size=1 \
+  critic.enable=false \
   data.return_raw_chat=true \
   "data.train_files=${TRAIN_FILES}" \
   "data.val_files=${VAL_FILES}" \
