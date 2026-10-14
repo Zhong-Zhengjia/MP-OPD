@@ -97,6 +97,8 @@ exec python -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.strategy=fsdp \
   actor_rollout_ref.nccl_timeout=3600 \
   teacher_rollout.nccl_timeout=3600 \
+  data.train_batch_size=128 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=128 \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.actor.mpopd_lr_scale=1.0 \
   actor_rollout_ref.rollout.name=vllm \
