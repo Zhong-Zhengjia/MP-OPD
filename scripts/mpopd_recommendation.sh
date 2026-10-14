@@ -82,18 +82,21 @@ cd "${VERL_ROOT}"
 # throwaway IPC files, recreated on demand by a fresh run.
 rm -f /dev/shm/psm_* /dev/shm/nccl-* /dev/shm/torch_* 2>/dev/null || true
 
-# dataloader_num_workers / prefetch_factor (set below in the python args):
-# num_workers=4 lets DataLoader prefetch in parallel subprocesses. The risk:
-# at checkpoint time the FSDP full-model gather + HF-export CPU copy spike
-# memory; if the kernel OOM killer SIGKILLs an idle DataLoader worker, torch
-# raises a fatal "DataLoader worker killed" crash (observed twice with
-# num_workers=2 at end-of-run teardown). prefetch_factor=1 is the minimum,
-# so each worker holds only one prefetched batch -- critical at batch_size=128
-# with 32768-token prompts, where prefetch_factor=2 would stack 8 huge
-# batches in RAM and guarantee an OOM at the first checkpoint. If a
-# checkpoint still triggers the "DataLoader worker killed" crash, fall back
-# to num_workers=0 (load in main process, no worker to kill); throughput is
-# barely affected because rollout (vLLM) + FSDP forward/backward dominate.
+# dataloader_num_workers=0 (set below in the python args): load batches in
+# the main process. This is REQUIRED, not optional, here. The container caps
+# /dev/shm at 512M, and any num_workers>0 has PyTorch pass batch tensors from
+# the worker subprocess to the main process through shared memory
+# (_share_fd_cpu_ -> multiprocessing.queues._feed). At batch_size=128 with
+# 32768-token prompts a single batch's tensors are ~100s of MB; with 4
+# workers x 4 DP ranks = 16 workers that immediately oversubscribes the
+# 512M cap -> "unable to allocate shared memory(shm): Resource temporarily
+# unavailable (11)" on the very first batch (progress stuck at 0/54).
+# num_workers=2 hit the same wall (just later, at checkpoint time, as an OOM
+# SIGKILL of an idle worker -> fatal "DataLoader worker killed"). 0 avoids
+# the shm path entirely. prefetch_factor is kept for config symmetry but is
+# a no-op at num_workers=0 (ray_trainer.py only passes it when >0).
+# Throughput is barely affected: rollout (vLLM) + FSDP forward/backward
+# dominate step time (gen ~43s of a ~56s step).
 # NOTE: keep this comment OUTSIDE the backslash-continued python command --
 # a '#' inside a continued line comments out every arg after it.
 
@@ -113,7 +116,7 @@ exec python -m verl.trainer.main_ppo \
   data.truncation=left \
   data.max_prompt_length=32768 \
   data.max_response_length=4096 \
-  data.dataloader_num_workers=4 \
+  data.dataloader_num_workers=0 \
   +data.dataloader_prefetch_factor=1 \
   "data.train_files=${TRAIN_FILES}" \
   "data.val_files=${VAL_FILES}" \
