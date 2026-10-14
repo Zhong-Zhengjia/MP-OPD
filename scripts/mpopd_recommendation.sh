@@ -56,7 +56,7 @@ exec python -m verl.trainer.main_ppo \
   data.truncation=left \
   data.max_prompt_length=8192 \
   data.max_response_length=2048 \
-  data.dataloader_num_workers=8 \
+  data.dataloader_num_workers=4 \
   "data.train_files=${TRAIN_FILES}" \
   "data.val_files=${VAL_FILES}" \
   "actor_rollout_ref.model.path=${STUDENT_MODEL_PATH}" \
