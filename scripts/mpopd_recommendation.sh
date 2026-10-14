@@ -36,6 +36,13 @@ EXPERT_MODEL_PATH="${EXPERT_MODEL_PATH:-/share/yangshiyu05/models/Qwen/Qwen3.5-4
 TRAIN_FILES="${TRAIN_FILES:-${REPO_ROOT}/data/recommendation/train.parquet}"
 VAL_FILES="${VAL_FILES:-${REPO_ROOT}/data/recommendation/validation.parquet}"
 
+# Log every step's metrics to a JSONL file so results survive after the
+# terminal scrolls. verl's "file" backend writes {step, data} per line.
+# To also log to wandb, set LOGGERS="console,wandb" and export WANDB_API_KEY.
+export VERL_FILE_LOGGER_ROOT="${VERL_FILE_LOGGER_ROOT:-${REPO_ROOT}/logs}"
+LOGGERS="${LOGGERS:-console,file}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-mpopd_recommendation}"
+
 # MPOPD_QUICK=1: cap to 8 samples and 2 steps for a fast end-to-end check.
 # Lengths stay at full 16384 — recommendation prompts are 7k-10k tokens and
 # must not be truncated. The slow reference attention kernels (causal_conv1d /
@@ -100,7 +107,9 @@ exec python -m verl.trainer.main_ppo \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
   algorithm.use_kl_in_reward=false \
   actor_rollout_ref.actor.use_kl_loss=false \
-  trainer.logger=console \
+  "trainer.logger=[${LOGGERS}]" \
+  trainer.project_name=mpopd \
+  "trainer.experiment_name=${EXPERIMENT_NAME}" \
   trainer.val_before_train=false \
   trainer.test_freq=-1 \
   trainer.n_gpus_per_node=4 \
