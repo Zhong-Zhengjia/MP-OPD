@@ -1374,13 +1374,16 @@ class DataParallelPPOActor(BasePPOActor):
                         pos = (expert_delta > 0) & valid_e
                         neg = (expert_delta < 0) & valid_e
                         conflict = pos.any(-1) & neg.any(-1)
-                        conflict_denom = (rm_tk * active_b).sum().clamp_min(1.0)
+                        # Denominators include the K dimension so ratios are in [0, 1].
+                        # Without the K factor the numerators sum over [B,T,K(,E)] but
+                        # the denominators only over [B,T(,E)], inflating ratios by top_k.
+                        topk_dim = student_log_probs.shape[-1]
+                        conflict_denom = (rm_tk * active_b).sum().clamp_min(1.0) * topk_dim
                         conflict_rate = (conflict.to(rm_tk.dtype) * rm_tk * active_b).sum() / conflict_denom
-                        valid_count = (rm_tke * valid_e.to(expert_delta.dtype)).sum().clamp_min(1.0)
+                        valid_count = (rm_tke * valid_e.to(expert_delta.dtype)).sum().clamp_min(1.0) * topk_dim
                         pos_ratio = (pos.to(expert_delta.dtype) * rm_tke * valid_e.to(expert_delta.dtype)).sum() / valid_count
                         neg_ratio = (neg.to(expert_delta.dtype) * rm_tke * valid_e.to(expert_delta.dtype)).sum() / valid_count
                         active_expert_count = expert_mask_b.sum(-1).float().mean()
-
                         metric_update = {
                             "actor/mpopd_kl_loss": loss.detach().item() * scale,
                             "actor/mpopd_target_entropy": (-(target.target_probs * target.target_log_probs).sum(-1).mean()).item(),
