@@ -47,6 +47,21 @@ try:
 except ImportError:
     from torch.distributed._tensor import DTensor
 
+# Pre-import flash-linear-attention (fla) submodules before any transformers
+# modeling code is loaded. Qwen3.5's linear-attention layers use
+# @use_kernel_func_from_hub_with_fallback("chunk_gated_delta_rule", "fla"),
+# which resolves the optimized kernel at *decoration time* (module import)
+# via getattr(fla, "ops"). If "fla.ops" hasn't been imported yet, the getattr
+# raises AttributeError, the decorator's `except Exception` swallows it, and
+# transformers silently falls back to the O(n^2) reference implementation —
+# 10x+ slower, causing NCCL timeouts. Pre-importing the submodule ensures it
+# is registered in sys.modules so the decorator's getattr succeeds.
+try:
+    import fla.ops.gated_delta_rule  # noqa: F401
+    import fla.ops.triton  # noqa: F401
+except ImportError:
+    pass
+
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.models.transformers.monkey_patch import apply_monkey_patch
