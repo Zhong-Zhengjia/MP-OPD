@@ -81,6 +81,8 @@ exec python -m verl.trainer.main_ppo \
   "+actor_rollout_ref.model.base_model_path=${STUDENT_MODEL_PATH}" \
   "+actor_rollout_ref.ref.model.path=${EXPERT_MODEL_PATH}" \
   actor_rollout_ref.actor.strategy=fsdp \
+  actor_rollout_ref.nccl_timeout=1800 \
+  teacher_rollout.nccl_timeout=1800 \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.actor.mpopd_lr_scale=1.0 \
   actor_rollout_ref.rollout.name=vllm \
