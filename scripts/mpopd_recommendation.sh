@@ -82,6 +82,18 @@ cd "${VERL_ROOT}"
 # throwaway IPC files, recreated on demand by a fresh run.
 rm -f /dev/shm/psm_* /dev/shm/nccl-* /dev/shm/torch_* 2>/dev/null || true
 
+# dataloader_num_workers=0 (set below in the python args): load batches in the
+# main process. With num_workers>0 each DP rank spawns DataLoader worker
+# subprocesses that hold prefetched batches in /dev/shm (capped at 512M here).
+# At checkpoint time the FSDP full-model gather + HF-export CPU copy spike
+# memory; the kernel OOM killer then SIGKILLs an idle DataLoader worker, and
+# torch turns that into a fatal "DataLoader worker killed" crash -- observed
+# twice at end-of-run teardown, after the shards were already saved.
+# num_workers=0 removes those worker subprocesses entirely; throughput is
+# unaffected because rollout (vLLM) and FSDP forward/backward dominate.
+# NOTE: keep this comment OUTSIDE the backslash-continued python command --
+# a '#' inside a continued line comments out every arg after it.
+
 exec python -m verl.trainer.main_ppo \
   algorithm.train_mode=multi_prompt_distill \
   'algorithm.mp_opd.expert_names=[chasing,long_term,repurchase,generalized]' \
@@ -98,15 +110,6 @@ exec python -m verl.trainer.main_ppo \
   data.truncation=left \
   data.max_prompt_length=16384 \
   data.max_response_length=4096 \
-  # num_workers=0: load batches in the main process. With num_workers>0 each
-  # rank spawns worker subprocesses that hold prefetched batches in /dev/shm
-  # (capped at 512M in this container). At checkpoint time the FSDP
-  # full-model gather + HF-export CPU copy spike memory; the kernel OOM
-  # killer then SIGKILLs an idle DataLoader worker, and torch's signal
-  # handler turns that into a fatal "DataLoader worker killed" crash --
-  # observed twice at end-of-run teardown. num_workers=0 removes those
-  # worker subprocesses entirely. Throughput is unaffected here because
-  # rollout (vLLM) and FSDP forward/backward dominate, not data loading.
   data.dataloader_num_workers=0 \
   "data.train_files=${TRAIN_FILES}" \
   "data.val_files=${VAL_FILES}" \
