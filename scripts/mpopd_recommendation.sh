@@ -37,25 +37,20 @@ TRAIN_FILES="${TRAIN_FILES:-${REPO_ROOT}/data/recommendation/train.parquet}"
 VAL_FILES="${VAL_FILES:-${REPO_ROOT}/data/recommendation/validation.parquet}"
 
 # MPOPD_QUICK=1: cap to 8 samples and 2 steps for a fast end-to-end check.
-# Also shortens prompt length to 4096 so the slow reference attention kernels
-# (causal_conv1d / flash-linear-attention, used by Qwen3.5 linear-attention
-# layers when the optimized CUDA kernels are unavailable) finish well within
-# the NCCL timeout. truncation=left truncates uniformly (no expert skipping)
-# so there is no FSDP desync. Full-length training (16384) requires the fast
-# kernels — see the comment block at the top of this file.
+# Lengths stay at full 16384 — recommendation prompts are 7k-10k tokens and
+# must not be truncated. The slow reference attention kernels (causal_conv1d /
+# flash-linear-attention, used by Qwen3.5 linear-attention layers when the
+# optimized CUDA kernels are unavailable) make each step slow, so the NCCL
+# timeout is raised to 3600s to avoid a false desync kill during genuine
+# slow compute. Full-speed training still requires the optimized kernels.
 if [[ "${MPOPD_QUICK:-0}" == "1" ]]; then
   QUICK_ARGS=(
     data.train_max_samples=8
     data.train_batch_size=8
     trainer.total_training_steps=2
     trainer.save_freq=-1
-    data.max_prompt_length=4096
-    data.max_response_length=2048
-    algorithm.mp_opd.max_expert_prompt_length=5120
-    actor_rollout_ref.rollout.max_model_len=7168
-    actor_rollout_ref.rollout.max_num_batched_tokens=8192
   )
-  echo "MPOPD_QUICK=1: 8 samples, 2 steps, no checkpoint, prompt 4096 — verifying the data flow only."
+  echo "MPOPD_QUICK=1: 8 samples, 2 steps, no checkpoint, full 16384 length — verifying the data flow only."
 else
   QUICK_ARGS=()
 fi
@@ -92,8 +87,8 @@ exec python -m verl.trainer.main_ppo \
   "+actor_rollout_ref.model.base_model_path=${STUDENT_MODEL_PATH}" \
   "+actor_rollout_ref.ref.model.path=${EXPERT_MODEL_PATH}" \
   actor_rollout_ref.actor.strategy=fsdp \
-  actor_rollout_ref.nccl_timeout=1800 \
-  teacher_rollout.nccl_timeout=1800 \
+  actor_rollout_ref.nccl_timeout=3600 \
+  teacher_rollout.nccl_timeout=3600 \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.actor.mpopd_lr_scale=1.0 \
   actor_rollout_ref.rollout.name=vllm \
