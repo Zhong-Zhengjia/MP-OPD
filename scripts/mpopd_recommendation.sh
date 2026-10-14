@@ -63,7 +63,6 @@ if [[ "${MPOPD_QUICK:-0}" == "1" ]]; then
     data.train_max_samples=8
     data.train_batch_size=8
     trainer.save_freq=-1
-    +data.dataloader_prefetch_factor=1
   )
   # total_training_steps is intentionally NOT set here: it auto-derives as
   # len(dataloader) * total_epochs (ray_trainer.py, when the yaml default
@@ -83,15 +82,18 @@ cd "${VERL_ROOT}"
 # throwaway IPC files, recreated on demand by a fresh run.
 rm -f /dev/shm/psm_* /dev/shm/nccl-* /dev/shm/torch_* 2>/dev/null || true
 
-# dataloader_num_workers=0 (set below in the python args): load batches in the
-# main process. With num_workers>0 each DP rank spawns DataLoader worker
-# subprocesses that hold prefetched batches in /dev/shm (capped at 512M here).
-# At checkpoint time the FSDP full-model gather + HF-export CPU copy spike
-# memory; the kernel OOM killer then SIGKILLs an idle DataLoader worker, and
-# torch turns that into a fatal "DataLoader worker killed" crash -- observed
-# twice at end-of-run teardown, after the shards were already saved.
-# num_workers=0 removes those worker subprocesses entirely; throughput is
-# unaffected because rollout (vLLM) and FSDP forward/backward dominate.
+# dataloader_num_workers / prefetch_factor (set below in the python args):
+# num_workers=4 lets DataLoader prefetch in parallel subprocesses. The risk:
+# at checkpoint time the FSDP full-model gather + HF-export CPU copy spike
+# memory; if the kernel OOM killer SIGKILLs an idle DataLoader worker, torch
+# raises a fatal "DataLoader worker killed" crash (observed twice with
+# num_workers=2 at end-of-run teardown). prefetch_factor=1 is the minimum,
+# so each worker holds only one prefetched batch -- critical at batch_size=128
+# with 32768-token prompts, where prefetch_factor=2 would stack 8 huge
+# batches in RAM and guarantee an OOM at the first checkpoint. If a
+# checkpoint still triggers the "DataLoader worker killed" crash, fall back
+# to num_workers=0 (load in main process, no worker to kill); throughput is
+# barely affected because rollout (vLLM) + FSDP forward/backward dominate.
 # NOTE: keep this comment OUTSIDE the backslash-continued python command --
 # a '#' inside a continued line comments out every arg after it.
 
@@ -111,7 +113,8 @@ exec python -m verl.trainer.main_ppo \
   data.truncation=left \
   data.max_prompt_length=32768 \
   data.max_response_length=4096 \
-  data.dataloader_num_workers=0 \
+  data.dataloader_num_workers=4 \
+  +data.dataloader_prefetch_factor=1 \
   "data.train_files=${TRAIN_FILES}" \
   "data.val_files=${VAL_FILES}" \
   "actor_rollout_ref.model.path=${STUDENT_MODEL_PATH}" \
