@@ -36,6 +36,11 @@ EXPERT_MODEL_PATH="${EXPERT_MODEL_PATH:-/home/hechongchong/.jupyter/zhongzhengji
 TRAIN_FILES="${TRAIN_FILES:-${REPO_ROOT}/data/recommendation/train.parquet}"
 VAL_FILES="${VAL_FILES:-${REPO_ROOT}/data/recommendation/validation.parquet}"
 
+# Where checkpoints land. Default is MP-OPD/models/mpopd_recommendation so
+# saved models live inside the repo (not under verl/checkpoints/), each run
+# writing last/ plus global_step_{N}/ subdirs there. Override via MODEL_DIR.
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models/mpopd_recommendation}"
+
 # Log every step's metrics to a JSONL file so results survive after the
 # terminal scrolls. verl's "file" backend writes {step, data} per line.
 # To also log to wandb, set LOGGERS="console,wandb" and export WANDB_API_KEY.
@@ -124,6 +129,7 @@ exec python -m verl.trainer.main_ppo \
   "trainer.logger=[${LOGGERS}]" \
   trainer.project_name=mpopd \
   "trainer.experiment_name=${EXPERIMENT_NAME}" \
+  "trainer.default_local_dir=${MODEL_DIR}" \
   +ray_kwargs.ray_init.object_store_memory=83886080 \
   trainer.val_before_train=false \
   trainer.test_freq=-1 \
