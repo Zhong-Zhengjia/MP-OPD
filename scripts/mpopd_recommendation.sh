@@ -11,9 +11,11 @@
 #   EXPERT_MODEL_PATH   Frozen teacher/expert checkpoint (shared by all 4 experts)
 #   TRAIN_FILES / VAL_FILES  Parquet produced by scripts/prepare_train_parquet.sh
 #
-# Example (defaults already point at the configured server paths, so only the
-# GPU count needs to be supplied):
+# Example (defaults already point at the configured server paths and 4 GPUs):
 #   bash scripts/prepare_train_parquet.sh
+#   bash scripts/mpopd_recommendation.sh
+#
+# To override the GPU count, pass it (it takes precedence over the default 4):
 #   bash scripts/mpopd_recommendation.sh trainer.n_gpus_per_node=8
 #
 # Extra arguments are forwarded unchanged as Hydra overrides; later overrides
@@ -40,6 +42,8 @@ exec python -m verl.trainer.main_ppo \
   algorithm.mp_opd.lambda_value=1.0 \
   algorithm.mp_opd.expert_forward_micro_batch_size=1 \
   critic.enable=false \
+  +actor_rollout_ref.model.override_config.attn_implementation=eager \
+  +actor_rollout_ref.ref.model.override_config.attn_implementation=eager \
   data.return_raw_chat=true \
   "data.train_files=${TRAIN_FILES}" \
   "data.val_files=${VAL_FILES}" \
@@ -57,4 +61,5 @@ exec python -m verl.trainer.main_ppo \
   trainer.logger=console \
   trainer.val_before_train=false \
   trainer.test_freq=-1 \
+  trainer.n_gpus_per_node=4 \
   "$@"
