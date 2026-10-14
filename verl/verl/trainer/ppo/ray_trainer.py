@@ -2091,8 +2091,14 @@ class RayPPOTrainer:
         batch = batch.union(output)
         return batch, reduce_metrics(output.meta_info.get("metrics", {}))
 
-    def _run_mpopd_step(self, batch: DataProto, metrics: dict, timing_raw: dict) -> dict:
-        """Run one clean rollout -> expert preparation -> student update step."""
+    def _run_mpopd_step(self, batch: DataProto, metrics: dict, timing_raw: dict) -> tuple[dict, DataProto]:
+        """Run one clean rollout -> expert preparation -> student update step.
+
+        Returns (metrics, rollout_batch). rollout_batch is the post-generation
+        DataProto carrying ``responses`` / ``attention_mask`` so that downstream
+        timing-metric computation (which calls _compute_response_info) has the
+        response tensors it expects; the original input ``batch`` does not.
+        """
         batch.meta_info.update(
             {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -2115,7 +2121,7 @@ class RayPPOTrainer:
         metrics["training/global_step"] = self.global_steps
         metrics["training/actor_update_steps"] = getattr(self, "actor_update_steps", 0) + 1
         self.actor_update_steps = metrics["training/actor_update_steps"]
-        return metrics
+        return metrics, rollout_batch
 
     def _fit_mpopd(self):
         from omegaconf import OmegaConf
@@ -2139,8 +2145,8 @@ class RayPPOTrainer:
                     continue
                 metrics, timing_raw = {}, {}
                 with marked_timer("step", timing_raw):
-                    metrics = self._run_mpopd_step(batch, metrics, timing_raw)
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                    metrics, rollout_batch = self._run_mpopd_step(batch, metrics, timing_raw)
+                metrics.update(compute_timing_metrics(batch=rollout_batch, timing_raw=timing_raw))
                 logger.log(data=metrics, step=self.global_steps)
                 progress_bar.update(1)
                 self.global_steps += 1
