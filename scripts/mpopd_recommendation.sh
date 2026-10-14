@@ -68,8 +68,8 @@ exec python -m verl.trainer.main_ppo \
   algorithm.mp_opd.expert_forward_micro_batch_size=1 \
   algorithm.mp_opd.max_expert_prompt_length=16384 \
   critic.enable=false \
-  +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2 \
-  +actor_rollout_ref.ref.model.override_config.attn_implementation=flash_attention_2 \
+  +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
+  +actor_rollout_ref.ref.model.override_config.attn_implementation=sdpa \
   data.return_raw_chat=true \
   data.truncation=left \
   data.max_prompt_length=16384 \
