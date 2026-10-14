@@ -31,8 +31,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERL_ROOT="${REPO_ROOT}/verl"
-STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH:-/share/yangshiyu05/models/Qwen/Qwen3.5-0.8B}"
-EXPERT_MODEL_PATH="${EXPERT_MODEL_PATH:-/share/yangshiyu05/models/Qwen/Qwen3.5-4B}"
+STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH:-/home/hechongchong/.jupyter/zhongzhengjia/www/basemodel/student}"
+EXPERT_MODEL_PATH="${EXPERT_MODEL_PATH:-/home/hechongchong/.jupyter/zhongzhengjia/www/basemodel/teacher}"
 TRAIN_FILES="${TRAIN_FILES:-${REPO_ROOT}/data/recommendation/train.parquet}"
 VAL_FILES="${VAL_FILES:-${REPO_ROOT}/data/recommendation/validation.parquet}"
 
