@@ -33,6 +33,13 @@ VAL_FILES="${VAL_FILES:-${REPO_ROOT}/data/recommendation/validation.parquet}"
 
 cd "${VERL_ROOT}"
 
+# Free shared memory before launching. The container caps /dev/shm at 512M and
+# stale Ray/NCCL/PSM shared-memory files from prior crashed runs otherwise leave
+# too little for the DataLoader workers and Ray object store, causing
+# "unable to allocate shared memory" failures. Safe to remove: these are
+# throwaway IPC files, recreated on demand by a fresh run.
+rm -f /dev/shm/psm_* /dev/shm/nccl-* /dev/shm/torch_* 2>/dev/null || true
+
 exec python -m verl.trainer.main_ppo \
   algorithm.train_mode=multi_prompt_distill \
   'algorithm.mp_opd.expert_names=[chasing,long_term,repurchase,generalized]' \
@@ -49,7 +56,7 @@ exec python -m verl.trainer.main_ppo \
   data.truncation=left \
   data.max_prompt_length=8192 \
   data.max_response_length=2048 \
-  data.dataloader_num_workers=0 \
+  data.dataloader_num_workers=8 \
   "data.train_files=${TRAIN_FILES}" \
   "data.val_files=${VAL_FILES}" \
   "actor_rollout_ref.model.path=${STUDENT_MODEL_PATH}" \
