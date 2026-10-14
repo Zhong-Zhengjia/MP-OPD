@@ -58,7 +58,7 @@ if [[ "${MPOPD_QUICK:-0}" == "1" ]]; then
     data.train_batch_size=8
     trainer.total_training_steps=2
     trainer.save_freq=-1
-    data.dataloader_prefetch_factor=1
+    +data.dataloader_prefetch_factor=1
   )
   echo "MPOPD_QUICK=1: 8 samples, 2 steps, no checkpoint, full 16384 length — verifying the data flow only."
 else
