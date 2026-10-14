@@ -66,7 +66,7 @@ exec python -m verl.trainer.main_ppo \
   algorithm.mp_opd.token_temperature=1.0 \
   algorithm.mp_opd.lambda_value=1.0 \
   algorithm.mp_opd.expert_forward_micro_batch_size=1 \
-  algorithm.mp_opd.max_expert_prompt_length=8192 \
+  algorithm.mp_opd.max_expert_prompt_length=8704 \
   critic.enable=false \
   +actor_rollout_ref.model.override_config.attn_implementation=eager \
   +actor_rollout_ref.ref.model.override_config.attn_implementation=eager \
@@ -84,8 +84,8 @@ exec python -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.actor.mpopd_lr_scale=1.0 \
   actor_rollout_ref.rollout.name=vllm \
-  actor_rollout_ref.rollout.max_model_len=10240 \
-  actor_rollout_ref.rollout.max_num_batched_tokens=10240 \
+  actor_rollout_ref.rollout.max_model_len=12288 \
+  actor_rollout_ref.rollout.max_num_batched_tokens=12288 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
   algorithm.use_kl_in_reward=false \
