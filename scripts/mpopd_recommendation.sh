@@ -86,6 +86,8 @@ exec python -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.max_model_len=20480 \
   actor_rollout_ref.rollout.max_num_batched_tokens=20480 \
+  actor_rollout_ref.rollout.enforce_eager=true \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
   algorithm.use_kl_in_reward=false \

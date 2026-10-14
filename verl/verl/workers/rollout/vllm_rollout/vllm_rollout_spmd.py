@@ -246,6 +246,13 @@ class vLLMRollout(BaseRollout):
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
+        # Release cached allocator blocks left over from FSDP actor model
+        # construction before vLLM takes its memory snapshot. Otherwise the
+        # caching allocator lazily frees those blocks during vLLM's profiling
+        # window, making free memory rise and tripping vLLM's
+        # "init_snapshot.free_memory >= free_gpu_memory" assertion in
+        # colocated (actor+vLLM same process) setups.
+        torch.cuda.empty_cache()
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=config.free_cache_engine,
