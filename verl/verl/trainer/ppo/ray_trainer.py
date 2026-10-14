@@ -1167,10 +1167,6 @@ class RayPPOTrainer:
 
     def _get_best_metric_name(self):
         metric_name = self.config.trainer.get("best_metric_name", None)
-        assert metric_name is not None, (
-            "trainer.best_metric_name must be set, "
-            "e.g. val-core/gsm8k/acc/mean@1"
-        )
         return metric_name
 
 
@@ -1209,7 +1205,11 @@ class RayPPOTrainer:
         current_metric = None
         is_best = False
 
-        if metrics is not None and best_metric_name in metrics:
+        if best_metric_name is None:
+            # No validation metric configured (e.g. MP-OPD without eval) —
+            # always save as "last" and skip best-tracking.
+            pass
+        elif metrics is not None and best_metric_name in metrics:
             current_metric = float(metrics[best_metric_name])
             is_best = self._is_better_metric(current_metric, self._best_valid_metric)
         else:
@@ -1221,11 +1221,17 @@ class RayPPOTrainer:
         ckpt_name = "best_valid" if is_best else "last"
         local_ckpt_folder = os.path.join(base_dir, ckpt_name)
 
-        print(
-            f"Saving checkpoint to {local_ckpt_folder}, "
-            f"global_step={self.global_steps}, is_best={is_best}, "
-            f"{best_metric_name}={current_metric}"
-        )
+        if best_metric_name is not None:
+            print(
+                f"Saving checkpoint to {local_ckpt_folder}, "
+                f"global_step={self.global_steps}, is_best={is_best}, "
+                f"{best_metric_name}={current_metric}"
+            )
+        else:
+            print(
+                f"Saving checkpoint to {local_ckpt_folder}, "
+                f"global_step={self.global_steps} (no best metric; last only)"
+            )
 
         # 清掉旧目录，只保留一个 best_valid 和一个 last
         if os.path.exists(local_ckpt_folder):
