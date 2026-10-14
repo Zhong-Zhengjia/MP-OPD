@@ -139,9 +139,12 @@ def prepare_expert_prompt_inputs(
     """Build flattened, left-padded expert prompt+response inputs.
 
     ``max_total_length`` (optional, e.g. the rollout ``max_model_len``) bounds the
-    full expert sequence (prompt + response). An expert whose prompt+response would
-    exceed it is skipped so the frozen forward never has to truncate the response
-    prefix; pass ``None`` to enforce only the ``max_expert_prompt_length`` budget.
+    full expert sequence (prompt + response). An expert whose prompt+response
+    would exceed it has its prompt left-truncated to fit (the response prefix is
+    never truncated, so the scored tokens stay intact); pass ``None`` to enforce
+    only the ``max_expert_prompt_length`` budget. Experts are never dropped on
+    length — dropping would make the per-rank expert-forward count data-dependent
+    and desync FSDP all-gather collectives.
     """
     responses = batch.batch["responses"]
     response_mask = batch.batch.get(
@@ -168,10 +171,20 @@ def prepare_expert_prompt_inputs(
             if not configured_mask[expert_index]:
                 continue
             prompt_ids = _tokenize_prompt(tokenizer, build_expert_messages(raw_prompt, name, context))
-            if prompt_ids.numel() > config.max_expert_prompt_length:
-                continue
-            if max_total_length is not None and prompt_ids.numel() + response_seq_len > max_total_length:
-                continue
+            # Left-truncate the expert prompt to the length budget instead of
+            # dropping the (sample, expert) pair. Skipping makes the per-rank
+            # expert-forward count data-dependent: a long prompt landing on only
+            # some ranks makes those ranks run fewer FSDP forward passes, so the
+            # all-gather collectives desync (NCCL timeout). Left truncation keeps
+            # every configured expert on every rank (uniform counts) and preserves
+            # the trailing question/instruction, matching the clean prompt's left
+            # truncation. The response prefix is never truncated, so the scored
+            # tokens stay intact.
+            budget = config.max_expert_prompt_length
+            if max_total_length is not None:
+                budget = min(budget, max(1, max_total_length - response_seq_len))
+            if prompt_ids.numel() > budget:
+                prompt_ids = prompt_ids[-budget:]
             expert_mask[batch_index, expert_index] = True
             # The policy helpers append/score ``responses`` separately. Keep
             # expert_input_ids as prompt-only tensors, just like the clean

@@ -47,9 +47,11 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-mpopd_recommendation}"
 # Lengths stay at full 16384 — recommendation prompts are 7k-10k tokens and
 # must not be truncated. The slow reference attention kernels (causal_conv1d /
 # flash-linear-attention, used by Qwen3.5 linear-attention layers when the
-# optimized CUDA kernels are unavailable) make each step slow, so the NCCL
-# timeout is raised to 3600s to avoid a false desync kill during genuine
-# slow compute. Full-speed training still requires the optimized kernels.
+# optimized CUDA kernels are unavailable) make each step slow. The NCCL
+# timeout is 300s: when ranks are in sync every all-gather completes in
+# milliseconds, so a short timeout never trips on genuine (slow-but-in-sync)
+# compute — it only fails fast on a real desync (one rank never entering a
+# collective). Full-speed training still requires the optimized kernels.
 if [[ "${MPOPD_QUICK:-0}" == "1" ]]; then
   QUICK_ARGS=(
     data.train_max_samples=8
@@ -95,8 +97,8 @@ exec python -m verl.trainer.main_ppo \
   "+actor_rollout_ref.model.base_model_path=${STUDENT_MODEL_PATH}" \
   "+actor_rollout_ref.ref.model.path=${EXPERT_MODEL_PATH}" \
   actor_rollout_ref.actor.strategy=fsdp \
-  actor_rollout_ref.nccl_timeout=3600 \
-  teacher_rollout.nccl_timeout=3600 \
+  actor_rollout_ref.nccl_timeout=300 \
+  teacher_rollout.nccl_timeout=300 \
   data.train_batch_size=128 \
   actor_rollout_ref.actor.ppo_mini_batch_size=128 \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \

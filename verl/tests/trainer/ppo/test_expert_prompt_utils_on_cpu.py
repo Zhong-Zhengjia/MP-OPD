@@ -96,10 +96,12 @@ def test_expert_messages_include_evidence_only_when_available():
     assert '"k": "v"' in content
 
 
-def test_prepare_skips_experts_exceeding_max_total_length():
-    # An expert whose prompt+response would exceed ``max_total_length`` (e.g. the
-    # rollout ``max_model_len``) is dropped so the frozen forward never truncates the
-    # response prefix. The same expert is kept when the bound is removed.
+def test_prepare_truncates_experts_exceeding_max_total_length():
+    # An expert whose prompt+response exceeds ``max_total_length`` (e.g. the
+    # rollout ``max_model_len``) is kept but its prompt is left-truncated to fit
+    # (prompt + response <= max_total_length). The response prefix is never
+    # truncated, so the scored tokens stay intact, and the expert is never
+    # dropped — dropping would desync per-rank FSDP forward counts.
     class Batch:
         pass
 
@@ -115,10 +117,14 @@ def test_prepare_skips_experts_exceeding_max_total_length():
     batch.non_tensor_batch = {"raw_prompt": raw_prompts, "expert_contexts": expert_contexts}
     config = MPOPDConfig(expert_names=["chasing"], expert_instructions={"chasing": "recent"})
 
-    bounded = prepare_expert_prompt_inputs(batch, FakeTokenizer(), config, max_total_length=4)
-    assert bounded.expert_mask.tolist() == [[False]]
-    assert bounded.flat_batch_indices.tolist() == []
+    # response_seq_len=5, max_total_length=7 -> prompt budget = 2; the prompt
+    # (len 3) is left-truncated to its last 2 tokens; the expert is KEPT.
+    bounded = prepare_expert_prompt_inputs(batch, FakeTokenizer(), config, max_total_length=7)
+    assert bounded.expert_mask.tolist() == [[True]]
+    assert bounded.flat_batch_indices.tolist() == [0]
+    assert bounded.input_ids.shape[1] == 2  # truncated prompt
 
     unbounded = prepare_expert_prompt_inputs(batch, FakeTokenizer(), config, max_total_length=None)
     assert unbounded.expert_mask.tolist() == [[True]]
     assert unbounded.flat_batch_indices.tolist() == [0]
+    assert unbounded.input_ids.shape[1] == 3  # full prompt

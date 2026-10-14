@@ -241,6 +241,10 @@ class FileLogger:
     def log(self, data, step):
         data = {"step": step, "data": data}
         self.fp.write(json.dumps(data) + "\n")
+        # Flush after every step so metrics survive a hard crash (SIGABRT/OOM).
+        # Each step's JSON is a few hundred bytes; without flushing it sits in
+        # the ~8KB stdio buffer and is lost if the worker dies mid-run.
+        self.fp.flush()
 
     def finish(self):
         self.fp.close()
