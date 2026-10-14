@@ -90,7 +90,16 @@ exec python -m verl.trainer.main_ppo \
   data.truncation=left \
   data.max_prompt_length=16384 \
   data.max_response_length=4096 \
-  data.dataloader_num_workers=2 \
+  # num_workers=0: load batches in the main process. With num_workers>0 each
+  # rank spawns worker subprocesses that hold prefetched batches in /dev/shm
+  # (capped at 512M in this container). At checkpoint time the FSDP
+  # full-model gather + HF-export CPU copy spike memory; the kernel OOM
+  # killer then SIGKILLs an idle DataLoader worker, and torch's signal
+  # handler turns that into a fatal "DataLoader worker killed" crash --
+  # observed twice at end-of-run teardown. num_workers=0 removes those
+  # worker subprocesses entirely. Throughput is unaffected here because
+  # rollout (vLLM) and FSDP forward/backward dominate, not data loading.
+  data.dataloader_num_workers=0 \
   "data.train_files=${TRAIN_FILES}" \
   "data.val_files=${VAL_FILES}" \
   "actor_rollout_ref.model.path=${STUDENT_MODEL_PATH}" \
