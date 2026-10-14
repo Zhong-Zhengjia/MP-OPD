@@ -2158,10 +2158,18 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     metrics, rollout_batch = self._run_mpopd_step(batch, metrics, timing_raw)
                 metrics.update(compute_timing_metrics(batch=rollout_batch, timing_raw=timing_raw))
+                metrics["training/global_step"] = self.global_steps
+                metrics["training/epoch"] = epoch
                 logger.log(data=metrics, step=self.global_steps)
                 progress_bar.update(1)
+                is_last_step = self.global_steps + 1 >= self.total_training_steps
+                if self.config.trainer.save_freq > 0 and (
+                    is_last_step or (self.global_steps + 1) % self.config.trainer.save_freq == 0
+                ):
+                    with marked_timer("save_checkpoint", timing_raw, color="green"):
+                        self._save_checkpoint(metrics=metrics)
                 self.global_steps += 1
-                if self.global_steps >= self.total_training_steps:
+                if is_last_step:
                     progress_bar.close()
                     return
         progress_bar.close()
