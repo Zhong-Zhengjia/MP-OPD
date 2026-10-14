@@ -2081,33 +2081,41 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 else:
                     model_class = AutoModel
 
-            save_model = model_class.from_config(
-                model_config,
-                torch_dtype=export_dtype,
-                trust_remote_code=trust_remote_code,
-            ).cpu()
+            # HF safetensors export is a convenience for inference, not needed to
+            # resume training (the FSDP shards saved above are sufficient). A
+            # multimodal model's vision config can be incompatible with
+            # model_class.from_config (e.g. Qwen3.5 vision rope_parameters),
+            # so wrap the whole export in try/except and let training continue.
+            try:
+                save_model = model_class.from_config(
+                    model_config,
+                    torch_dtype=export_dtype,
+                    trust_remote_code=trust_remote_code,
+                ).cpu()
 
-            missing, unexpected = save_model.load_state_dict(state_dict, strict=False)
-            print(f"[INFO] missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
+                missing, unexpected = save_model.load_state_dict(state_dict, strict=False)
+                print(f"[INFO] missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
 
-            if hasattr(save_model, "peft_config"):
-                try:
-                    save_model = save_model.merge_and_unload()
-                    print("[INFO] LoRA merged before saving.")
-                except Exception as e:
-                    print(f"[WARN] merge_and_unload failed: {e}")
+                if hasattr(save_model, "peft_config"):
+                    try:
+                        save_model = save_model.merge_and_unload()
+                        print("[INFO] LoRA merged before saving.")
+                    except Exception as e:
+                        print(f"[WARN] merge_and_unload failed: {e}")
 
-            save_model.save_pretrained(hf_local_path, safe_serialization=True)
+                save_model.save_pretrained(hf_local_path, safe_serialization=True)
 
-            if self.processor is not None:
-                self.processor.save_pretrained(hf_local_path)
-            if self.tokenizer is not None:
-                self.tokenizer.save_pretrained(hf_local_path)
-            if getattr(self, "generation_config", None) is not None:
-                try:
-                    self.generation_config.save_pretrained(hf_local_path)
-                except Exception as e:
-                    print(f"[WARN] save generation config failed: {e}")
+                if self.processor is not None:
+                    self.processor.save_pretrained(hf_local_path)
+                if self.tokenizer is not None:
+                    self.tokenizer.save_pretrained(hf_local_path)
+                if getattr(self, "generation_config", None) is not None:
+                    try:
+                        self.generation_config.save_pretrained(hf_local_path)
+                    except Exception as e:
+                        print(f"[WARN] save generation config failed: {e}")
+            except Exception as e:
+                print(f"[WARN] HF safetensors export failed (training shards are intact): {e}")
 
             if hdfs_path is not None:
                 hf_hdfs_path = os.path.join(hdfs_path, "hf_model")
