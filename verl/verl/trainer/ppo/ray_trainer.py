@@ -1220,6 +1220,11 @@ class RayPPOTrainer:
 
         ckpt_name = "best_valid" if is_best else "last"
         local_ckpt_folder = os.path.join(base_dir, ckpt_name)
+        # Also save a step-named copy so multiple checkpoints survive across
+        # training instead of being overwritten by the rmtree below. The
+        # "last"/"best_valid" dirs are kept for backward-compatible resume;
+        # find_latest_ckpt_path reads the tracker file to locate global_step_{N}.
+        step_ckpt_folder = os.path.join(base_dir, f"global_step_{self.global_steps}")
 
         if best_metric_name is not None:
             print(
@@ -1237,9 +1242,14 @@ class RayPPOTrainer:
         if os.path.exists(local_ckpt_folder):
             shutil.rmtree(local_ckpt_folder)
         local_mkdir_safe(local_ckpt_folder)
+        # If the step-named dir already exists (re-save at same step), clear it.
+        if os.path.exists(step_ckpt_folder):
+            shutil.rmtree(step_ckpt_folder)
+        local_mkdir_safe(step_ckpt_folder)
 
         # actor
         actor_local_path = os.path.join(local_ckpt_folder, "actor")
+        step_actor_path = os.path.join(step_ckpt_folder, "actor")
         actor_remote_path = (
             None
             if self.config.trainer.default_hdfs_dir is None
@@ -1267,10 +1277,23 @@ class RayPPOTrainer:
                 max_ckpt_to_keep=None,
             )
 
+        # Copy the actor (and critic) checkpoint to the step-named dir so
+        # multiple checkpoints survive. The worker's save_checkpoint writes
+        # FSDP shards + HF export; a plain filesystem copy preserves all of it.
+        shutil.copytree(actor_local_path, step_actor_path, dirs_exist_ok=True)
+        if self.use_critic:
+            shutil.copytree(
+                critic_local_path,
+                os.path.join(step_ckpt_folder, str(Role.Critic)),
+                dirs_exist_ok=True,
+            )
+
         # dataloader state
         dataloader_local_path = os.path.join(local_ckpt_folder, "data.pt")
+        step_dataloader_path = os.path.join(step_ckpt_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+        torch.save(dataloader_state_dict, step_dataloader_path)
 
         meta = {
             "global_steps": int(self.global_steps),
@@ -1281,6 +1304,7 @@ class RayPPOTrainer:
         if hasattr(self, "pace_enabled"):
             meta["pace_state"] = self._pace_state_dict()
         torch.save(meta, os.path.join(local_ckpt_folder, "meta.pt"))
+        torch.save(meta, os.path.join(step_ckpt_folder, "meta.pt"))
 
         local_latest_checkpointed_iteration = os.path.join(base_dir, "latest_checkpointed_iteration.txt")
         with open(local_latest_checkpointed_iteration, "w") as f:

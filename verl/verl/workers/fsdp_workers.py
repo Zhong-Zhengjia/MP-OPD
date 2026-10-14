@@ -2056,6 +2056,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 attn_implementation=attn_implementation,
             )
 
+            # Qwen3.5 multimodal: the vision config's rope_parameters can be
+            # lost when AutoConfig.from_pretrained deserializes the config,
+            # causing Qwen3_5VisionRotaryEmbedding.__init__ to crash on
+            # model_class.from_config below. The live actor module (loaded via
+            # from_pretrained during init) retains the correct vision_config, so
+            # copy rope_parameters from it when the export config is missing it.
+            try:
+                live_module = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+                live_config = getattr(live_module, "config", None)
+                if (
+                    hasattr(model_config, "vision_config")
+                    and live_config is not None
+                    and hasattr(live_config, "vision_config")
+                    and not getattr(model_config.vision_config, "rope_parameters", None)
+                    and getattr(live_config.vision_config, "rope_parameters", None)
+                ):
+                    model_config.vision_config.rope_parameters = dict(
+                        live_config.vision_config.rope_parameters
+                    )
+            except Exception as e:
+                print(f"[WARN] could not copy vision rope_parameters for export: {e}")
+
             has_remote_code = hasattr(model_config, "auto_map") and any(
                 model_config.architectures[0] in val for val in model_config.auto_map.values()
             )
