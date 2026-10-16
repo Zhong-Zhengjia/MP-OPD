@@ -76,10 +76,13 @@ def build_expert_messages(
 ) -> list[dict[str, str]]:
     """Copy a clean chat and append the direction-specific expert context.
 
-    ``context.instruction`` already carries the expert's viewpoint header, so we
-    append it directly rather than adding a second wrapper heading. The training
-    evidence section is added only when ``evidence_available`` is true; this avoids
-    leaving a dangling evidence heading for experts with no observed evidence.
+    ``context.instruction`` already carries the expert's viewpoint header and a
+    hard output-range restriction (the expert must only predict categories in its
+    own domain), so we append it directly rather than adding a second wrapper
+    heading. When ``evidence_available`` is true, the per-expert candidate list
+    is appended as a hard domain boundary (the expert must choose only from those
+    candidates) rather than as soft "for-reference" guidance; this avoids leaving
+    a dangling evidence heading for experts with no observed evidence.
     """
     if not context.enabled:
         raise ValueError(f"cannot build a disabled expert prompt: {expert_name}")
@@ -87,7 +90,7 @@ def build_expert_messages(
     addition = f"\n\n{context.instruction}"
     if context.evidence_available:
         evidence_text = json.dumps(context.evidence, ensure_ascii=False)
-        addition += f"\n\n训练期方向证据（仅供本专家参考）：\n{evidence_text}"
+        addition += f"\n\n你的领域证据（候选类目）如下，预测只能从这些类目中选择：\n{evidence_text}"
     if not messages or messages[-1].get("role") != "user":
         messages.append({"role": "user", "content": addition.lstrip()})
     else:

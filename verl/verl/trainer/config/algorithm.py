@@ -339,10 +339,10 @@ class MPOPDConfig(BaseConfig):
     )
     expert_instructions: dict[str, str] = field(
         default_factory=lambda: {
-            "chasing": "加强关注近期高强度兴趣及其延续性",
-            "long_term": "加强关注跨时间窗口稳定出现的长期偏好",
-            "repurchase": "加强关注重复购买、消耗周期和历史复购间隔",
-            "generalized": "加强关注相邻品类和可迁移的泛化兴趣",
+            "chasing": "只预测用户最近14天内点击过的类目，对领域外类目赋予极低概率",
+            "long_term": "只预测用户14天外点击过的类目，对领域外类目赋予极低概率",
+            "repurchase": "只预测用户历史购买过的类目，对领域外类目赋予极低概率",
+            "generalized": "只预测用户未点击且未购买的新类目，对领域外类目赋予极低概率",
         }
     )
     top_k: int = 10

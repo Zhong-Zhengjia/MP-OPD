@@ -111,20 +111,22 @@ algorithm:
     # Ordered expert axis used by prompt packing and tensor fusion
     expert_names: [chasing, long_term, repurchase, generalized]
 
-    # Default focus instruction for each configured expert
+    # Default focus instruction for each configured expert. These are fallbacks
+    # used only when a sample carries no per-sample instruction; the data pipeline
+    # normally embeds the full domain-restricted instruction from prompts/*.txt.
     expert_instructions:
 
-      # Focus instruction for recent high-intensity interests
-      chasing: "加强关注近期高强度兴趣及其延续性"
+      # Restrict predictions to categories clicked within the last 14 days
+      chasing: "只预测用户最近14天内点击过的类目，对领域外类目赋予极低概率"
 
-      # Focus instruction for stable long-term interests
-      long_term: "加强关注跨时间窗口稳定出现的长期偏好"
+      # Restrict predictions to categories clicked more than 14 days ago
+      long_term: "只预测用户14天外点击过的类目，对领域外类目赋予极低概率"
 
-      # Focus instruction for repeat-purchase behavior
-      repurchase: "加强关注重复购买、消耗周期和历史复购间隔"
+      # Restrict predictions to categories the user has purchased before
+      repurchase: "只预测用户历史购买过的类目，对领域外类目赋予极低概率"
 
-      # Focus instruction for generalized adjacent interests
-      generalized: "加强关注相邻品类和可迁移的泛化兴趣"
+      # Restrict predictions to categories with no click or purchase history
+      generalized: "只预测用户未点击且未购买的新类目，对领域外类目赋予极低概率"
 
     # Number of current-student token candidates scored by every expert
     top_k: 10
