@@ -36,15 +36,20 @@ EXPERT_MODEL_PATH="${EXPERT_MODEL_PATH:-/home/hechongchong/.jupyter/zhongzhengji
 TRAIN_FILES="${TRAIN_FILES:-${REPO_ROOT}/data/recommendation/train.parquet}"
 VAL_FILES="${VAL_FILES:-${REPO_ROOT}/data/recommendation/validation.parquet}"
 
-# Where checkpoints land. Default is MP-OPD/models/mpopd_recommendation so
-# saved models live inside the repo (not under verl/checkpoints/), each run
-# writing last/ plus global_step_{N}/ subdirs there. Override via MODEL_DIR.
-MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models/mpopd_recommendation}"
+# Every run gets its own timestamped output directory under models/, holding
+# both checkpoints (last/, global_step_N/) and the metrics JSONL log. This
+# avoids overwriting a prior run's outputs and makes it easy to compare runs.
+# Format: models/mpopd_YYYYmmdd_HHMMSS. Override the whole dir via MODEL_DIR
+# (in which case it is used as-is and the timestamp suffix is not appended).
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models/mpopd_$(date +%Y%m%d_%H%M%S)}"
+mkdir -p "${MODEL_DIR}"
 
 # Log every step's metrics to a JSONL file so results survive after the
 # terminal scrolls. verl's "file" backend writes {step, data} per line.
-# To also log to wandb, set LOGGERS="console,wandb" and export WANDB_API_KEY.
-export VERL_FILE_LOGGER_ROOT="${VERL_FILE_LOGGER_ROOT:-${REPO_ROOT}/logs}"
+# Point the file logger straight at the run dir so the log lives next to the
+# checkpoints. To also log to wandb, set LOGGERS="console,wandb" and export
+# WANDB_API_KEY.
+export VERL_FILE_LOGGER_PATH="${MODEL_DIR}/training_log.jsonl"
 LOGGERS="${LOGGERS:-console,file}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-mpopd_recommendation}"
 
