@@ -168,6 +168,7 @@ exec python -m verl.trainer.main_ppo \
   +ray_kwargs.ray_init.object_store_memory=83886080 \
   trainer.val_before_train=false \
   trainer.test_freq=-1 \
+  trainer.total_epochs=2 \
   trainer.n_gpus_per_node=4 \
   "${QUICK_ARGS[@]}" \
   "$@"
