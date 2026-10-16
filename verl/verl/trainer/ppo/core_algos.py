@@ -102,7 +102,17 @@ def build_mpopd_target(
 
     with torch.no_grad():
         expert_mask = expert_mask.to(device=specialized_expert_log_probs.device, dtype=torch.bool)
-        delta = specialized_expert_log_probs - teacher_base_log_probs.unsqueeze(-1)
+        # K-normalize both teacher distributions within the top-k set before
+        # differencing. specialized_expert_log_probs and teacher_base_log_probs
+        # are full-vocab log-softmax values gathered at the top-k ids, so their
+        # raw difference lives in a full-vocab scale (±100) that mismatches the
+        # anchor log_softmax(student_base, dim=-1) which is K-normalized (±log
+        # K). Renormalizing both within K puts delta in the same space as the
+        # anchor, making their sum in the target construction scale-consistent
+        # and removing the need to tune token_temperature as a scale bridge.
+        expert_knorm = torch.log_softmax(specialized_expert_log_probs, dim=2)
+        teacher_knorm = torch.log_softmax(teacher_base_log_probs, dim=-1)
+        delta = expert_knorm - teacher_knorm.unsqueeze(-1)
         safe_delta = torch.where(expert_mask[:, None, None, :], delta, torch.zeros_like(delta))
         expert_logits = delta.abs() / expert_temperature
         if expert_priors is not None:
@@ -153,7 +163,12 @@ def compute_mpopd_kl_loss(
     *,
     skip_samples_without_active_experts: bool = True,
 ) -> torch.Tensor:
-    """Compute masked ``KL(target || student)`` over selected top-k tokens.
+    """Compute masked ``KL(student || target)`` (reverse KL) over selected top-k tokens.
+
+    Reverse KL is mode-seeking: the student concentrates on the high-probability
+    tokens of the target rather than covering every mode. This prevents the
+    entropy growth observed with forward KL (``KL(target || student)``), where the
+    student flattens onto low-probability target tokens to cover the full support.
 
     When ``skip_samples_without_active_experts`` is true (default), samples with no
     active expert are masked out of the loss so MP-OPD never silently degrades to
@@ -175,8 +190,9 @@ def compute_mpopd_kl_loss(
         )
 
     student_log_probs = torch.log_softmax(student_topk_log_probs, dim=-1)
+    student_probs = student_log_probs.exp()
     target_log_probs = torch.log(target_probs.clamp_min(torch.finfo(target_probs.dtype).tiny))
-    token_kl = (target_probs * (target_log_probs - student_log_probs)).sum(dim=-1)
+    token_kl = (student_probs * (student_log_probs - target_log_probs)).sum(dim=-1)
     sample_mask = response_mask.to(dtype=token_kl.dtype) * valid_samples[:, None].to(dtype=token_kl.dtype)
     denominator = sample_mask.sum()
     if denominator.item() == 0:

@@ -125,7 +125,7 @@ rm -f /dev/shm/psm_* /dev/shm/nccl-* /dev/shm/torch_* 2>/dev/null || true
 exec python -m verl.trainer.main_ppo \
   algorithm.train_mode=multi_prompt_distill \
   'algorithm.mp_opd.expert_names=[chasing,long_term,repurchase,generalized]' \
-  algorithm.mp_opd.top_k=10 \
+  algorithm.mp_opd.top_k=20 \
   algorithm.mp_opd.expert_temperature=1.0 \
   algorithm.mp_opd.token_temperature=1.0 \
   algorithm.mp_opd.lambda_value=1.0 \

@@ -4,6 +4,10 @@ from verl.trainer.ppo.core_algos import build_mpopd_target, compute_mpopd_kl_los
 
 
 def test_only_student_log_probs_receive_gradient():
+    # Reverse KL(student || target): gradient flows only through the student
+    # (target is detached). When the target concentrates on token 0 (0.9 vs
+    # 0.1) and the student is uniform, the gradient on token 0 is negative
+    # (gradient descent raises its logit toward the target mode).
     student_log_probs = torch.tensor([[[0.0, 0.0]]], requires_grad=True)
     target = torch.tensor([[[0.9, 0.1]]])
     loss = compute_mpopd_kl_loss(
