@@ -2088,25 +2088,41 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             except Exception as e:
                 print(f"[WARN] could not copy vision_config for export: {e}")
 
-            # MP-OPD trains the backbone as a generator (rollout produces text),
-            # but the base student may be registered as a *ForEmbedding model
-            # (e.g. Qwen3.5-Embedding). The actor state_dict is the causal-LM
-            # backbone (top-level ``model.*``, no ``language_model.`` prefix, no
-            # separate ``lm_head``). If the config's architectures still say
-            # ``*ForEmbedding``, vLLM loads it via the pooling runner and looks
-            # for ``language_model.*`` weights -- which don't exist -- and
-            # fails. Normalize the export architecture to the causal-LM sibling
-            # (same backbone, tied lm_head) so the saved checkpoint is directly
-            # loadable by vLLM/HF for generation. tie_word_embeddings is forced
-            # true when unset because the backbone has no separate lm_head to
-            # load (Qwen3 ties lm_head to embed_tokens by default).
+            # MP-OPD trains the backbone as a generator, but the base student
+            # may be a Qwen3.5-Embedding model: its actor state_dict has keys
+            # prefixed ``language_model.`` (the embedding wrapper holds the
+            # causal-LM backbone under a ``language_model`` submodule), and
+            # its config.architectures is ``Qwen3_5ForEmbedding``. vLLM's
+            # ``Qwen3_5ForCausalLM`` (and ``ForEmbedding``) expect bare
+            # ``model.*`` + ``lm_head.*`` keys, so a checkpoint exported
+            # as-is fails to load in vLLM with
+            # "no module or parameter named 'language_model'". Normalize both
+            # the architecture and the state_dict keys so the saved hf_model
+            # is directly loadable for generation:
+            #   1. Strip the ``language_model.`` prefix from every key so the
+            #      backbone weights land at ``model.*`` and the head at
+            #      ``lm_head.*`` (matching ForCausalLM).
+            #   2. If the head is missing (a pure backbone / tied checkpoint),
+            #      tie lm_head to embed_tokens by forcing tie_word_embeddings
+            #      and letting from_config build the tied head.
+            #   3. Rewrite architectures to the ``*ForCausalLM`` sibling.
+            state_dict = {
+                (k[len("language_model."):] if k.startswith("language_model.") else k): v
+                for k, v in state_dict.items()
+            }
+            has_lm_head = any(k.startswith("lm_head.") or k == "lm_head.weight" for k in state_dict)
             arch = model_config.architectures[0] if model_config.architectures else ""
-            if arch.endswith("ForEmbedding"):
-                ca_lm_arch = arch[: -len("ForEmbedding")] + "ForCausalLM"
-                model_config.architectures = [ca_lm_arch]
+            needs_arch_fix = arch.endswith("ForEmbedding")
+            if needs_arch_fix:
+                model_config.architectures = [arch[: -len("ForEmbedding")] + "ForCausalLM"]
+                print(f"[INFO] export: normalized architecture {arch} -> {model_config.architectures[0]}")
+            if not has_lm_head:
+                # Backbone has no separate lm_head to load; tie it to
+                # embed_tokens (Qwen3 ties by default) so ForCausalLM can
+                # build the head from config.
                 if getattr(model_config, "tie_word_embeddings", None) is None:
                     model_config.tie_word_embeddings = True
-                print(f"[INFO] export: normalized architecture {arch} -> {ca_lm_arch} (tied lm_head) for generation inference")
+                print("[INFO] export: no lm_head in state_dict, tying to embed_tokens")
 
             has_remote_code = hasattr(model_config, "auto_map") and any(
                 model_config.architectures[0] in val for val in model_config.auto_map.values()
