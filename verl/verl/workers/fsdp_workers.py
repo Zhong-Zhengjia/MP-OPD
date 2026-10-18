@@ -2088,6 +2088,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             except Exception as e:
                 print(f"[WARN] could not copy vision_config for export: {e}")
 
+            # MP-OPD trains the backbone as a generator (rollout produces text),
+            # but the base student may be registered as a *ForEmbedding model
+            # (e.g. Qwen3.5-Embedding). The actor state_dict is the causal-LM
+            # backbone (top-level ``model.*``, no ``language_model.`` prefix, no
+            # separate ``lm_head``). If the config's architectures still say
+            # ``*ForEmbedding``, vLLM loads it via the pooling runner and looks
+            # for ``language_model.*`` weights -- which don't exist -- and
+            # fails. Normalize the export architecture to the causal-LM sibling
+            # (same backbone, tied lm_head) so the saved checkpoint is directly
+            # loadable by vLLM/HF for generation. tie_word_embeddings is forced
+            # true when unset because the backbone has no separate lm_head to
+            # load (Qwen3 ties lm_head to embed_tokens by default).
+            arch = model_config.architectures[0] if model_config.architectures else ""
+            if arch.endswith("ForEmbedding"):
+                ca_lm_arch = arch[: -len("ForEmbedding")] + "ForCausalLM"
+                model_config.architectures = [ca_lm_arch]
+                if getattr(model_config, "tie_word_embeddings", None) is None:
+                    model_config.tie_word_embeddings = True
+                print(f"[INFO] export: normalized architecture {arch} -> {ca_lm_arch} (tied lm_head) for generation inference")
+
             has_remote_code = hasattr(model_config, "auto_map") and any(
                 model_config.architectures[0] in val for val in model_config.auto_map.values()
             )
