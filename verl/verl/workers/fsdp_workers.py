@@ -2089,27 +2089,40 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 print(f"[WARN] could not copy vision_config for export: {e}")
 
             # MP-OPD trains the backbone as a generator, but the base student
-            # may be a Qwen3.5-Embedding model: its actor state_dict has keys
+            # may be a Qwen3.5-Embedding model: its actor state_dict keys are
             # prefixed ``language_model.`` (the embedding wrapper holds the
             # causal-LM backbone under a ``language_model`` submodule), and
             # its config.architectures is ``Qwen3_5ForEmbedding``. vLLM's
-            # ``Qwen3_5ForCausalLM`` (and ``ForEmbedding``) expect bare
-            # ``model.*`` + ``lm_head.*`` keys, so a checkpoint exported
-            # as-is fails to load in vLLM with
-            # "no module or parameter named 'language_model'". Normalize both
-            # the architecture and the state_dict keys so the saved hf_model
-            # is directly loadable for generation:
-            #   1. Strip the ``language_model.`` prefix from every key so the
-            #      backbone weights land at ``model.*`` and the head at
-            #      ``lm_head.*`` (matching ForCausalLM).
+            # ``Qwen3_5ForCausalLM`` expects the backbone under ``model.*`` plus
+            # a top-level ``lm_head.*``, so a checkpoint exported as-is fails to
+            # load in vLLM with "no module or parameter named 'language_model'"
+            # (keys still wrapped) or "...named 'embed_tokens'" (prefix
+            # stripped but missing the ``model.`` submodule name). Normalize
+            # both the architecture and the state_dict keys so the saved
+            # hf_model is directly loadable for generation:
+            #   1. Remap ``language_model.<backbone>.*`` -> ``model.<backbone>.*``
+            #      (the wrapper's ``language_model`` IS the ForCausalLM ``model``
+            #      submodule, so the prefix is *replaced*, not stripped), while
+            #      a real ``lm_head.*`` stays at the top level.
             #   2. If the head is missing (a pure backbone / tied checkpoint),
             #      tie lm_head to embed_tokens by forcing tie_word_embeddings
             #      and letting from_config build the tied head.
             #   3. Rewrite architectures to the ``*ForCausalLM`` sibling.
-            state_dict = {
-                (k[len("language_model."):] if k.startswith("language_model.") else k): v
-                for k, v in state_dict.items()
-            }
+
+            def _to_vllm_key(k: str) -> str:
+                # ``language_model`` is the ForCausalLM ``model`` submodule: the
+                # backbone (embed_tokens/layers/norm) sits directly under it, so
+                # the prefix must become ``model.``. Tolerate a wrapper that
+                # already nests ``model.`` or carries ``lm_head`` by peeling
+                # only the wrapper prefix in those cases.
+                if k.startswith("language_model."):
+                    inner = k[len("language_model."):]
+                    if inner.startswith("model.") or inner.startswith("lm_head"):
+                        return inner
+                    return "model." + inner
+                return k
+
+            state_dict = {_to_vllm_key(k): v for k, v in state_dict.items()}
             has_lm_head = any(k.startswith("lm_head.") or k == "lm_head.weight" for k in state_dict)
             arch = model_config.architectures[0] if model_config.architectures else ""
             needs_arch_fix = arch.endswith("ForEmbedding")
