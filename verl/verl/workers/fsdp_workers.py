@@ -237,6 +237,91 @@ def reduce_metrics(metrics_dict):
     return metrics
 
 
+def _remap_vllm_key(k: str) -> str:
+    """Map a checkpoint weight key to the form vLLM's Qwen3_5ForCausalLM expects.
+
+    The Qwen3.5-Embedding wrapper holds the causal-LM backbone under a
+    ``language_model`` submodule, which IS the ForCausalLM ``model`` submodule,
+    so ``language_model.`` becomes ``model.`` (replaced, not stripped —
+    stripping leaves bare keys and vLLM then errors "no module named
+    'embed_tokens'"). A wrapper that already nests ``model.`` or carries a
+    real ``lm_head`` is handled by peeling only the wrapper prefix; a bare
+    backbone key from a prior bad strip is re-prefixed with ``model.``.
+    Mirrors scripts/fix_hf_model_for_vllm.py.
+    """
+    if k.startswith("language_model."):
+        inner = k[len("language_model."):]
+        if inner.startswith("model.") or inner.startswith("lm_head"):
+            return inner
+        return "model." + inner
+    if k.startswith(("embed_tokens.", "layers.", "norm.")) or k in ("embed_tokens.weight", "norm.weight"):
+        return "model." + k
+    return k
+
+
+def _normalize_exported_hf_model_for_vllm(hf_dir: str) -> None:
+    """Post-process a just-saved hf_model so vLLM loads it as a causal-LM.
+
+    save_pretrained serializes the freshly-built model's OWN parameter names,
+    which for a Qwen3.5-Embedding student are ``language_model.*`` under a
+    ``Qwen3_5Model``/``Qwen3_5ForEmbedding`` arch — not what vLLM's
+    ``Qwen3_5ForCausalLM`` expects. Remap the saved safetensors keys to
+    ``model.*`` (+ top-level ``lm_head.*``) and rewrite config.json
+    architectures to the ``*ForCausalLM`` sibling, in place. Idempotent.
+    Mirrors scripts/fix_hf_model_for_vllm.py so retraining produces
+    directly-loadable checkpoints without a manual repair step.
+    """
+    import glob as _glob
+    import os as _os
+
+    from safetensors import safe_open as _safe_open
+
+    st_files = sorted(_glob.glob(_os.path.join(hf_dir, "model*.safetensors")))
+    if not st_files:
+        return
+
+    # Remap safetensors keys where needed.
+    for st in st_files:
+        with _safe_open(st, framework="pt") as f:
+            keys = list(f.keys())
+        if not any(_remap_vllm_key(k) != k for k in keys):
+            continue
+        new_tensors = {}
+        with _safe_open(st, framework="pt") as f:
+            for k in keys:
+                new_tensors[_remap_vllm_key(k)] = f.get_tensor(k)
+        tmp = st + ".tmp"
+        save_file(new_tensors, tmp, metadata={"format": "pt"})
+        _os.replace(tmp, st)
+
+    # Rewrite config.json: architectures -> *ForCausalLM, tie if no lm_head.
+    cfg_path = _os.path.join(hf_dir, "config.json")
+    if not _os.path.exists(cfg_path):
+        return
+    with open(cfg_path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    archs = cfg.get("architectures") or []
+    arch = archs[0] if archs else ""
+    if arch and not arch.endswith("ForCausalLM"):
+        base = arch
+        for suffix in ("ForEmbedding", "Model"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        cfg["architectures"] = [base + "ForCausalLM"]
+    # If the checkpoint has no separate lm_head, tie it to embed_tokens so
+    # ForCausalLM builds the head from config at load time.
+    has_lm_head = any(
+        _remap_vllm_key(k) == "lm_head.weight" or _remap_vllm_key(k).startswith("lm_head.")
+        for st in st_files
+        for k in _safe_open(st, framework="pt").keys()
+    )
+    if not has_lm_head and cfg.get("tie_word_embeddings") is None:
+        cfg["tie_word_embeddings"] = True
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
 class ActorRolloutRefWorker(Worker, DistProfilerExtension): 
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -2091,51 +2176,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # MP-OPD trains the backbone as a generator, but the base student
             # may be a Qwen3.5-Embedding model: its actor state_dict keys are
             # prefixed ``language_model.`` (the embedding wrapper holds the
-            # causal-LM backbone under a ``language_model`` submodule), and
-            # its config.architectures is ``Qwen3_5ForEmbedding``. vLLM's
-            # ``Qwen3_5ForCausalLM`` expects the backbone under ``model.*`` plus
-            # a top-level ``lm_head.*``, so a checkpoint exported as-is fails to
-            # load in vLLM with "no module or parameter named 'language_model'"
-            # (keys still wrapped) or "...named 'embed_tokens'" (prefix
-            # stripped but missing the ``model.`` submodule name). Normalize
-            # both the architecture and the state_dict keys so the saved
-            # hf_model is directly loadable for generation:
-            #   1. Remap ``language_model.<backbone>.*`` -> ``model.<backbone>.*``
-            #      (the wrapper's ``language_model`` IS the ForCausalLM ``model``
-            #      submodule, so the prefix is *replaced*, not stripped), while
-            #      a real ``lm_head.*`` stays at the top level.
-            #   2. If the head is missing (a pure backbone / tied checkpoint),
-            #      tie lm_head to embed_tokens by forcing tie_word_embeddings
-            #      and letting from_config build the tied head.
-            #   3. Rewrite architectures to the ``*ForCausalLM`` sibling.
-
-            def _to_vllm_key(k: str) -> str:
-                # ``language_model`` is the ForCausalLM ``model`` submodule: the
-                # backbone (embed_tokens/layers/norm) sits directly under it, so
-                # the prefix must become ``model.``. Tolerate a wrapper that
-                # already nests ``model.`` or carries ``lm_head`` by peeling
-                # only the wrapper prefix in those cases.
-                if k.startswith("language_model."):
-                    inner = k[len("language_model."):]
-                    if inner.startswith("model.") or inner.startswith("lm_head"):
-                        return inner
-                    return "model." + inner
-                return k
-
-            state_dict = {_to_vllm_key(k): v for k, v in state_dict.items()}
-            has_lm_head = any(k.startswith("lm_head.") or k == "lm_head.weight" for k in state_dict)
-            arch = model_config.architectures[0] if model_config.architectures else ""
-            needs_arch_fix = arch.endswith("ForEmbedding")
-            if needs_arch_fix:
-                model_config.architectures = [arch[: -len("ForEmbedding")] + "ForCausalLM"]
-                print(f"[INFO] export: normalized architecture {arch} -> {model_config.architectures[0]}")
-            if not has_lm_head:
-                # Backbone has no separate lm_head to load; tie it to
-                # embed_tokens (Qwen3 ties by default) so ForCausalLM can
-                # build the head from config.
-                if getattr(model_config, "tie_word_embeddings", None) is None:
-                    model_config.tie_word_embeddings = True
-                print("[INFO] export: no lm_head in state_dict, tying to embed_tokens")
+            # causal-LM backbone under a ``language_model`` submodule), and its
+            # config.architectures is ``Qwen3_5Model`` / ``Qwen3_5ForEmbedding``.
+            # vLLM's ``Qwen3_5ForCausalLM`` expects the backbone under ``model.*``
+            # plus a top-level ``lm_head.*``.
+            #
+            # The fix is applied to the SAVED FILES after save_pretrained, not to
+            # the state_dict/model_config beforehand. Reason: save_pretrained
+            # serializes the freshly-built model's OWN parameter names, so the
+            # only way the trained weights actually land on disk is to let
+            # from_config build the wrapper model (``language_model.*`` structure)
+            # and load_state_dict with the matching ``language_model.*`` keys.
+            # Remapping the state_dict BEFORE load_state_dict (or rewriting
+            # architectures before from_config) would build/feed a ``model.*``
+            # structure that the ``language_model.*`` weights cannot match under
+            # strict=False — every key would be missing/unexpected and
+            # save_pretrained would write a RANDOMLY-INITIALIZED model. So we
+            # load the trained weights under the wrapper's native keys, save
+            # them, then _normalize_exported_hf_model_for_vllm renames the keys
+            # on disk (language_model.* -> model.*) and rewrites config.json
+            # architectures to ``*ForCausalLM``. Idempotent; mirrors
+            # scripts/fix_hf_model_for_vllm.py.
 
             has_remote_code = hasattr(model_config, "auto_map") and any(
                 model_config.architectures[0] in val for val in model_config.auto_map.values()
@@ -2185,6 +2246,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         print(f"[WARN] merge_and_unload failed: {e}")
 
                 save_model.save_pretrained(hf_local_path, safe_serialization=True)
+
+                # save_pretrained writes the freshly-built model's OWN parameter
+                # names (language_model.* + Qwen3_5Model arch for an embedding
+                # student), which vLLM rejects. Normalize the saved files in
+                # place to model.* + ForCausalLM so the checkpoint is directly
+                # loadable for generation without a manual repair step.
+                try:
+                    _normalize_exported_hf_model_for_vllm(hf_local_path)
+                    print(f"[INFO] export: normalized hf_model at {hf_local_path} for vLLM")
+                except Exception as e:
+                    print(f"[WARN] export: vLLM normalization failed (run scripts/fix_hf_model_for_vllm.py manually): {e}")
 
                 if self.processor is not None:
                     self.processor.save_pretrained(hf_local_path)

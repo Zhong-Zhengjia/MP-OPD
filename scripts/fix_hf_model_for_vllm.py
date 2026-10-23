@@ -102,8 +102,17 @@ def main(argv: list[str]) -> int:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         archs = cfg.get("architectures") or []
         arch = archs[0] if archs else ""
-        if arch.endswith("ForEmbedding"):
-            new_arch = arch[: -len("ForEmbedding")] + "ForCausalLM"
+        # Any non-CausalLM arch (ForEmbedding wrapper, bare *Model backbone)
+        # must become its *ForCausalLM sibling so vLLM loads it as a generator.
+        #   Qwen3_5ForEmbedding -> Qwen3_5ForCausalLM
+        #   Qwen3_5Model        -> Qwen3_5ForCausalLM
+        if arch and not arch.endswith("ForCausalLM"):
+            base = arch
+            for suffix in ("ForEmbedding", "Model"):
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+            new_arch = base + "ForCausalLM"
             backup = cfg_path.with_suffix(".json.bak")
             if not backup.exists():
                 shutil.copy2(cfg_path, backup)
