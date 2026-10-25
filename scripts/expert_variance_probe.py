@@ -469,17 +469,36 @@ def main(argv: list[str]) -> int:
     teacher_tok = AutoTokenizer.from_pretrained(args.teacher_path)
 
     if args.backend == "hf":
-        from transformers import AutoModel
+        from transformers import AutoConfig, AutoModel
         device = f"cuda:{args.teacher_gpu}"
-        # The teacher may be a Qwen3.5-Embedding wrapper (Qwen3_5ForEmbedding)
-        # whose causal-LM backbone lives under .language_model -- building
-        # ForCausalLM directly from the wrapper config fails because vocab_size
-        # is on the inner text config, not the wrapper. Load the wrapper via
-        # AutoModel (respects architectures) and unwrap to the causal-LM,
-        # which forward() returns full-vocab logits from. Falls back to the
-        # model itself if it already exposes lm_head (bare ForCausalLM).
+        # The teacher is a Qwen3.5-Embedding wrapper (Qwen3_5ForEmbedding) whose
+        # causal-LM backbone lives under .language_model. Building ForCausalLM
+        # directly from the wrapper config fails because vocab_size is on the
+        # inner text config, not the wrapper; AutoModel (respecting
+        # architectures) builds the wrapper and we unwrap to .language_model,
+        # whose forward() returns full-vocab logits. Falls back to the model
+        # itself if it already exposes lm_head (bare ForCausalLM).
+        #
+        # The original teacher (basemodel/teacher) ships a vision_config whose
+        # `rope_parameters` field is missing on this transformers version --
+        # the wrapper's __init__ builds the vision tower unconditionally and
+        # crashes on `vision_config.rope_parameters`. The probe only uses the
+        # causal-LM backbone; the vision tower is built but never called, so
+        # patch a default rope onto the config before load. (The student
+        # checkpoint re-saved after training already has this field; the
+        # un-rebased teacher does not.) Mirrors the vision_config workaround
+        # in verl/workers/fsdp_workers.py, adapted for cold-load.
+        teacher_cfg = AutoConfig.from_pretrained(
+            args.teacher_path, trust_remote_code=True, attn_implementation="sdpa",
+        )
+        if getattr(teacher_cfg, "vision_config", None) is not None:
+            vc = teacher_cfg.vision_config
+            if not hasattr(vc, "rope_parameters") or vc.rope_parameters is None:
+                vc.rope_parameters = {"rope_type": "default", "factor": 1.0}
+                print("[probe] teacher(hf): patched vision_config.rope_parameters (missing on base teacher config)")
         full = AutoModel.from_pretrained(
             args.teacher_path,
+            config=teacher_cfg,
             dtype=torch.bfloat16,
             trust_remote_code=True,
             attn_implementation="sdpa",
