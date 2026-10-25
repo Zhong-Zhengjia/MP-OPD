@@ -71,19 +71,33 @@ EXPERT_NAMES = ["chasing", "long_term", "repurchase", "generalized"]
 def _remap_vllm_key(k: str) -> str:
     """Map a wrapper weight key to the form Qwen3_5ForCausalLM expects.
 
-    The embedding wrapper's ``language_model`` is the ForCausalLM ``model``
-    submodule: the backbone (embed_tokens/layers/norm) sits directly under
-    it, so ``language_model.`` becomes ``model.``. A wrapper that already
-    nests ``model.`` or carries a real ``lm_head`` is handled by peeling only
-    the wrapper prefix. Bare backbone keys (from a prior bad strip) are also
-    re-prefixed. Mirrors scripts/fix_hf_model_for_vllm.py:remap_vllm_key so
-    the probe is standalone.
+    Two save formats reach this function:
+      - base teacher (basemodel/teacher): ``model.language_model.<bb>.*`` --
+        the ForEmbedding wrapper holds a container under ``.model`` whose
+        ``.language_model`` IS the bare causal-LM backbone (Qwen3_5Model).
+      - exported student: ``language_model.<bb>.*`` -- the wrapper saves its
+        own parameter names flat, so ``language_model.`` sits at the top.
+    Both become the ForCausalLM form: ``model.<bb>.*`` (backbone) or
+    ``lm_head.*`` (head). A wrapper that already nests ``model.`` under the
+    prefix (``language_model.model.<bb>.*``) or carries a real ``lm_head``
+    is handled by peeling only the wrapper prefix. Bare backbone keys (from
+    a prior bad strip) are also re-prefixed. Mirrors
+    scripts/fix_hf_model_for_vllm.py:remap_vllm_key, extended for the base
+    teacher's nested ``model.language_model.*`` format.
     """
+    # Base teacher nested form: model.language_model.<bb>.* -> model.<bb>.*
+    if k.startswith("model.language_model."):
+        inner = k[len("model.language_model."):]
+        if inner.startswith("model.") or inner.startswith("lm_head"):
+            return inner
+        return "model." + inner
+    # Exported student flat form: language_model.<bb>.* -> model.<bb>.*
     if k.startswith("language_model."):
         inner = k[len("language_model."):]
         if inner.startswith("model.") or inner.startswith("lm_head"):
             return inner
         return "model." + inner
+    # Bare backbone key from a prior strip: model.<key>
     if k.startswith(("embed_tokens.", "layers.", "norm.")) or k in ("embed_tokens.weight", "norm.weight"):
         return "model." + k
     return k
@@ -578,6 +592,25 @@ def main(argv: list[str]) -> int:
             f"[probe] teacher(hf): loaded {len(remapped)} tensors | "
             f"missing(top5)={missing[:5]} | unexpected(top5)={unexpected_real[:5]}"
         )
+        # Guard against silent random-teacher output: the backbone embedding
+        # and at least the first layer's params MUST load, or every recorded
+        # probability is from random weights. Fail loudly instead of writing
+        # a meaningless JSONL (this caught the model.language_model.* remap
+        # gap on the first run).
+        critical_missing = [
+            k for k in missing
+            if k == "model.embed_tokens.weight"
+            or k.startswith("model.layers.0.")
+        ]
+        if critical_missing:
+            raise RuntimeError(
+                "teacher backbone weights did not load (remap mismatch). "
+                f"critical missing: {critical_missing[:5]}. "
+                f"sample unexpected (raw keys): {unexpected_real[:5]}. "
+                "The saved key prefix is not what _remap_vllm_key handles -- "
+                "dump a few raw keys from the teacher safetensors and extend "
+                "_remap_vllm_key."
+            )
         teacher = teacher.to(device).eval()
         print(f"[probe] teacher(hf): ready, {type(teacher).__name__} on {device}")
         def _teacher_score(cond_text, r_ids_local, top20_local):
