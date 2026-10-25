@@ -374,17 +374,35 @@ def main(argv: list[str]) -> int:
     gc.collect()
 
     import torch
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModel
 
     torch.cuda.empty_cache()
     device = f"cuda:{args.teacher_gpu}"
     teacher_tok = AutoTokenizer.from_pretrained(args.teacher_path)
-    teacher = AutoModelForCausalLM.from_pretrained(
+    # The teacher may be a Qwen3.5-Embedding wrapper (Qwen3_5ForEmbedding)
+    # whose causal-LM backbone lives under .language_model -- building
+    # ForCausalLM directly from the wrapper config fails because vocab_size
+    # is on the inner text config, not the wrapper. Load the wrapper via
+    # AutoModel (respects architectures) and unwrap to the causal-LM, which
+    # forward() returns full-vocab logits from. Falls back to the model
+    # itself if it already exposes lm_head (bare ForCausalLM).
+    full = AutoModel.from_pretrained(
         args.teacher_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         trust_remote_code=True,
         attn_implementation="sdpa",
     ).to(device).eval()
+    if hasattr(full, "language_model"):
+        teacher = full.language_model
+        print(f"[probe] teacher: unwrapped {type(full).__name__}.language_model -> {type(teacher).__name__}")
+    elif hasattr(full, "lm_head"):
+        teacher = full
+        print(f"[probe] teacher: using {type(full).__name__} directly")
+    else:
+        raise RuntimeError(
+            f"loaded teacher has neither .language_model nor .lm_head; "
+            f"cannot get causal-LM logits. model type: {type(full).__name__}"
+        )
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
