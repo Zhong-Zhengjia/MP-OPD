@@ -135,15 +135,36 @@ def load_probe_prompts(
                 "expert_contexts": ec,
             })
     selected: list[dict[str, Any]] = []
+    short: list[str] = []
     for s in strata:
         if len(by_stratum[s]) < n_per_stratum:
-            raise ValueError(
-                f"stratum {s!r}: only {len(by_stratum[s])} prompts with full "
-                f"evidence, need {n_per_stratum}"
-            )
+            short.append(f"{s}={len(by_stratum[s])}/{n_per_stratum}")
+            continue
         for i, p in enumerate(by_stratum[s][:n_per_stratum]):
             p["sample_idx"] = i
             selected.append(p)
+    if short:
+        # Build a "what's available" hint so the user can pick strata that
+        # actually have enough full-evidence samples without re-running a
+        # separate diagnostic. Single full pass; cheap.
+        avail: dict[str, int] = {}
+        with open(train_jsonl, encoding="utf-8") as f:
+            for line in f:
+                obj = json.loads(line)
+                bt = obj.get("extra_info", {}).get("buyer_type_cn")
+                if bt is None:
+                    continue
+                ec = obj.get("extra_info", {}).get("expert_contexts", {})
+                if all(
+                    ec.get(k, {}).get("evidence_available", False)
+                    for k in EXPERT_NAMES
+                ):
+                    avail[bt] = avail.get(bt, 0) + 1
+        hint = ", ".join(f"{k}={v}" for k, v in sorted(avail.items(), key=lambda kv: -kv[1]))
+        raise ValueError(
+            f"insufficient full-evidence samples for: {', '.join(short)}. "
+            f"Available full-evidence counts per stratum: {hint}"
+        )
     return selected
 
 
@@ -310,7 +331,7 @@ def main(argv: list[str]) -> int:
     p.add_argument("--train-jsonl", default="data/train_1000.jsonl")
     p.add_argument("--output", default="scripts/expert_variance_probe.jsonl")
     p.add_argument(
-        "--strata", default="高价值消费者,潜在用户",
+        "--strata", default="核心高价值消费者,活跃消费者",
         help="comma-separated buyer_type_cn strata to sample from",
     )
     p.add_argument("--n-per-stratum", type=int, default=3)

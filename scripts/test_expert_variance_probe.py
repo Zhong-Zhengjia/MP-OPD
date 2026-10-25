@@ -112,8 +112,9 @@ def test_load_probe_prompts_filters_full_evidence():
     raised = False
     try:
         load_probe_prompts(Path(path), ["高价值消费者"], 2)
-    except ValueError:
+    except ValueError as e:
         raised = True
+        assert "insufficient full-evidence" in str(e)
     assert raised, "expected ValueError for insufficient samples"
     # Evidence filtering is correct: selected prompts have all 4 evidence.
     for p in prompts:
