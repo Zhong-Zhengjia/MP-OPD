@@ -20,12 +20,21 @@ from expert_variance_probe import (  # noqa: E402
 
 
 class _FakeTok:
-    """Char-level tokenizer stub for label_response testing."""
+    """Char-level tokenizer stub for label_response testing.
+
+    Each char -> its ord; decode inverts that so _token_char_spans (which
+    decodes each id individually and accumulates lengths) recovers the exact
+    per-char spans, matching the real byte-level-BPE property the probe
+    relies on.
+    """
 
     def __call__(self, text, return_offsets_mapping=False, add_special_tokens=False):
         ids = [ord(c) for c in text]
         offsets = [(i, i + 1) for i in range(len(text))]
         return {"input_ids": ids, "offset_mapping": offsets}
+
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(chr(int(i)) for i in ids)
 
 
 def test_build_expert_messages_appends_instruction():

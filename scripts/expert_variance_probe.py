@@ -227,22 +227,57 @@ def _span_within(token_span: tuple[int, int], spans: list[tuple[int, int]]) -> b
     return False
 
 
+def _token_char_spans(tokenizer, r_ids: list[int], r_text: str) -> list[tuple[int, int]]:
+    """Map each response token id to its character span [start, end) in r_text.
+
+    r_text is vLLM's decode(r_ids); the robust way to recover per-token spans
+    is to decode each id individually and accumulate lengths, which aligns
+    spans to the ACTUAL r_ids rather than a re-tokenization of r_text (those
+    can differ by a BOS/merge token, ~1/1186, and silently shift labels). For
+    byte-level BPE (Qwen) the individual decodes concatenate to r_text; we
+    verify and fall back to the re-tokenization path if they diverge.
+    """
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    ok = True
+    for tid in r_ids:
+        piece = tokenizer.decode([tid], skip_special_tokens=False)
+        spans.append((pos, pos + len(piece)))
+        pos += len(piece)
+    if pos == len(r_text):
+        return spans
+    # Individual-decode concatenation diverged from r_text (rare: a merge
+    # boundary the tokenizer handles only in batch). Fall back to re-tokenizing
+    # r_text and warn -- labels are best-effort in this case.
+    enc = tokenizer(r_text, return_offsets_mapping=True, add_special_tokens=False)
+    retok_offsets = enc["offset_mapping"]
+    if len(retok_offsets) == len(r_ids):
+        return list(retok_offsets)
+    print(
+        f"[WARN] token-span recovery diverged (individual decode len {pos} "
+        f"vs r_text {len(r_text)}, retok {len(retok_offsets)} vs r_ids "
+        f"{len(r_ids)}); labels are best-effort",
+        file=sys.stderr,
+    )
+    # Truncate/pad to r_ids length so downstream indexing is safe.
+    out = list(retok_offsets[:len(r_ids)])
+    while len(out) < len(r_ids):
+        out.append((-1, -1))
+    return out
+
+
 def label_response(tokenizer, r_text: str, r_ids: list[int]) -> list[tuple[int, str]]:
     """Return per-token (label, field) aligned to r_ids.
 
     label=1 for tokens whose span falls inside a 兴趣 value; 0 otherwise.
     field ∈ {兴趣, 理由, structure, parse_fail}. If the response is not valid
     JSON (no 兴趣/理由 values found), every token is tagged parse_fail.
+
+    Spans are derived from the actual r_ids (decode-each-id), not a
+    re-tokenization of r_text, so labels stay aligned to vLLM's token
+    positions even when re-tokenization would differ by a boundary token.
     """
-    enc = tokenizer(r_text, return_offsets_mapping=True, add_special_tokens=False)
-    ids = enc["input_ids"]
-    offsets = enc["offset_mapping"]
-    if ids != r_ids:
-        print(
-            f"[WARN] tokenizer re-tokenization differs from vLLM r_ids "
-            f"(len {len(ids)} vs {len(r_ids)}); labels are best-effort",
-            file=sys.stderr,
-        )
+    offsets = _token_char_spans(tokenizer, r_ids, r_text)
     interest_spans = [m.span(1) for m in _INTEREST_RE.finditer(r_text)]
     reason_spans = [m.span(1) for m in _REASON_RE.finditer(r_text)]
     if not interest_spans and not reason_spans:
