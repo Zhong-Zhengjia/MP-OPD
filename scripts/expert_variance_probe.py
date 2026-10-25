@@ -416,9 +416,11 @@ def main(argv: list[str]) -> int:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--student-gpu-memory-utilization", type=float, default=0.4)
     p.add_argument(
-        "--backend", choices=["vllm", "hf"], default="vllm",
-        help="teacher scoring backend: vllm (matches baseline, misses capped "
-        "at teacher top-20) or hf (exact full-vocab, needs ~11GB transient)",
+        "--backend", choices=["vllm", "hf"], default="hf",
+        help="teacher scoring backend: hf (exact full-vocab logits -- the only "
+        "path that records the student's top-20 without an 89% miss rate) or "
+        "vllm (matches baseline teacher_infer, but prompt_logprobs only exposes "
+        "the teacher's own top-20, so student top-20 IDs outside it become -1.0)",
     )
     p.add_argument(
         "--teacher-gpu", type=int, default=1,
