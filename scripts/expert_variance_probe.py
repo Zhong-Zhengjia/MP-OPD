@@ -8,13 +8,19 @@ For each selected prompt:
      student's top-20 IDs per position and their full-vocab softmax probs are
      the ``student_base`` distribution (free, from the sampling logprobs), and
      the 20 IDs are the shared candidate set for all 6 conditions.
-  2. Re-score those same 20 IDs under 5 teacher conditions (HF forward, exact
-     full-vocab softmax at those IDs, one sequence at a time for stability):
+  2. Re-score those same 20 IDs under 5 teacher conditions:
        expert_base       teacher + base prompt
        expert_chasing    teacher + chasing expert prompt
        expert_long_term  teacher + long_term expert prompt
        expert_repurchase teacher + repurchase expert prompt
        expert_generalized teacher + generalized expert prompt
+     Teacher backend (--backend):
+       vllm (default): teacher vLLM scores prompt+R with prompt_logprobs=20.
+         IDs in the student top-20 that fall in the teacher top-20 get exact
+         probs; the rest are recorded as MISSING (-1.0). Per-prompt miss rate
+         is printed; if >10% a hint suggests switching to --backend hf.
+       hf: teacher HF forward, exact full-vocab softmax at the 20 IDs (one
+         sequence at a time for stability). ~11GB transient logits buffer.
   3. Label each response token: 1 = category-name token (inside a 兴趣 value),
      0 = reason/structure token.
   4. Emit one JSONL line per (prompt, response token position).
@@ -22,7 +28,7 @@ For each selected prompt:
 Selection: from data/train_1000.jsonl, pick N prompts per stratum
 (buyer_type_cn), keeping only samples where ALL 4 experts have
 evidence_available=true (so expert domain differences are visible). Defaults:
-高价值消费者 x3 + 潜在用户 x3 = 6 prompts.
+核心高价值消费者 x3 + 活跃消费者 x3 = 6 prompts.
 
 Usage (server, conda env verl):
   python scripts/expert_variance_probe.py \\
@@ -30,10 +36,13 @@ Usage (server, conda env verl):
     --teacher-path /home/hechongchong/.jupyter/zhongzhengjia/www/basemodel/teacher \\
     --train-jsonl data/train_1000.jsonl \\
     --output scripts/expert_variance_probe.jsonl
+  # exact full-vocab (no misses):
+  ... --backend hf
 
-GPU layout: student vLLM runs on GPU 0 (tensor_parallel_size=1); teacher HF
-runs on GPU 1 (--teacher-gpu). Ensure both are free. Lower
---student-gpu-memory-utilization if GPU 0 is partially occupied.
+GPU layout: student vLLM runs on GPU 0 (tensor_parallel_size=1). Teacher:
+  - vllm backend: second vLLM on --teacher-gpu (default 1)
+  - hf backend: HF on --teacher-gpu (default 1)
+Ensure both GPUs are free.
 
 Output JSONL schema (one line per token position):
   user_id, stratum, sample_idx, token_pos, token_id, token_text,
@@ -270,29 +279,94 @@ def sample_student(llm, tokenizer, prompts_text: list[str], max_tokens: int, see
 
 
 # ---------------------------------------------------------------------------
-# Teacher scoring (HF forward, exact full-vocab softmax at the 20 IDs)
+# Teacher scoring
 # ---------------------------------------------------------------------------
-def teacher_forward_probs(
+# vLLM (default): teacher scores prompt+R with prompt_logprobs=20, max_tokens=1
+# (generates nothing; only scores the prompt). vLLM returns the teacher's OWN
+# top-20 + the actual-token logprob at every prompt position. We look up the
+# student's 20 IDs there: hits are exact, misses (student top-20 IDs outside
+# teacher top-20) are recorded as a sentinel (MISSING = -1.0) since their
+# true prob is below teacher's 20th-ranked. The per-row miss count is also
+# reported so the user can switch to --backend hf if misses are too frequent.
+MISSING = -1.0
+
+
+def teacher_vllm_probs(
+    llm, tokenizer, prompt_text: str, r_ids: list[int],
+    top20_ids_list: list[list[int]], max_model_len: int,
+) -> list[list[float]]:
+    """vLLM teacher path. Returns per-position top-20 probs (aligned to the
+    student's top20_ids_list); MISSING sentinel for IDs not in teacher top-20."""
+    from vllm import SamplingParams
+
+    prompt_ids = tokenizer(
+        prompt_text, add_special_tokens=False
+    ).input_ids
+    if isinstance(prompt_ids, list) and prompt_ids and isinstance(prompt_ids[0], list):
+        prompt_ids = prompt_ids[0]
+    prompt_ids = list(prompt_ids)
+    full_ids = prompt_ids + r_ids
+    if len(full_ids) > max_model_len:
+        overflow = len(full_ids) - max_model_len
+        if overflow >= len(prompt_ids):
+            raise ValueError(
+                f"response alone ({len(r_ids)}) exceeds max_model_len ({max_model_len})"
+            )
+        prompt_ids = prompt_ids[overflow:]
+        full_ids = prompt_ids + r_ids
+    prompt_len = len(prompt_ids)
+
+    # prompt_logprobs=20 scores every prompt position (incl. R tokens);
+    # max_tokens=1 means vLLM generates at least one token after scoring.
+    # We pass the FULL sequence as prompt_token_ids (vLLM does NOT re-tokenize
+    # when prompt_token_ids is provided) and read prompt_logprobs at the R
+    # positions (prompt_len + t - 1 predicts r_ids[t]).
+    sp = SamplingParams(prompt_logprobs=20, max_tokens=1, temperature=0)
+    outputs = llm.generate(
+        prompts=None,
+        sampling_params=sp,
+        prompt_token_ids=[full_ids],
+    )
+    out = outputs[0]
+    # out.prompt_logprobs[i] = logprobs for position i (predicts token i+1).
+    # It has len(full_ids) entries (None at position 0). R token t is predicted
+    # at position prompt_len + t - 1.
+    plp = out.prompt_logprobs
+    out_probs: list[list[float]] = []
+    for t in range(len(r_ids)):
+        pos = prompt_len + t - 1
+        if pos < 0 or pos >= len(plp) or plp[pos] is None:
+            out_probs.append([MISSING] * len(top20_ids_list[t]))
+            continue
+        # Map teacher's top-20 (token_id -> logprob) for quick lookup.
+        lp_map: dict[int, float] = {}
+        for tid, lp in plp[pos].items():
+            lp_map[int(tid)] = _logprob_value(lp)
+        row: list[float] = []
+        for sid in top20_ids_list[t]:
+            if sid in lp_map:
+                row.append(math.exp(lp_map[sid]))
+            else:
+                row.append(MISSING)
+        out_probs.append(row)
+    return out_probs
+
+
+def teacher_hf_probs(
     model, tokenizer, prompt_text: str, r_ids: list[int],
     top20_ids_list: list[list[int]], device: str, max_model_len: int,
 ) -> list[list[float]]:
-    """Forward prompt+R through the teacher; return per-position top-20
-    full-vocab softmax probs (aligned to r_ids).
-
-    logits[i] predicts token i+1, so r_ids[t] is predicted at position
-    prompt_len + t - 1. We slice logits to those positions, run log_softmax
-    over the full vocab (numerically stable), and index the 20 IDs. The full
-    logits tensor is freed right after the slice; with sdpa attention +
-    use_cache=False the transient memory is the model weights + a ~11GB
-    logits buffer (bf16, 36k x 152k) which fits a 140GB GPU.
-    """
+    """HF teacher path (exact). Forward prompt+R; take full-vocab log_softmax
+    at the student's 20 IDs. logits[i] predicts token i+1, so r_ids[t] is
+    predicted at position prompt_len + t - 1. With sdpa + use_cache=False the
+    transient memory is model weights + a ~11GB logits buffer (bf16, 36k x
+    152k) which fits a 140GB GPU."""
     import torch
 
     prompt_ids = tokenizer(
         prompt_text, add_special_tokens=False, return_tensors="pt"
     ).input_ids[0].tolist()
     full_ids_list = prompt_ids + r_ids
-    # Left-truncate the prompt if over budget; never drop response tokens.
     if len(full_ids_list) > max_model_len:
         overflow = len(full_ids_list) - max_model_len
         if overflow >= len(prompt_ids):
@@ -327,7 +401,7 @@ def main(argv: list[str]) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--student-path", required=True, help="vLLM student model dir")
-    p.add_argument("--teacher-path", required=True, help="HF teacher model dir")
+    p.add_argument("--teacher-path", required=True, help="teacher model dir (vLLM or HF)")
     p.add_argument("--train-jsonl", default="data/train_1000.jsonl")
     p.add_argument("--output", default="scripts/expert_variance_probe.jsonl")
     p.add_argument(
@@ -339,7 +413,20 @@ def main(argv: list[str]) -> int:
     p.add_argument("--max-tokens", type=int, default=4096)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--student-gpu-memory-utilization", type=float, default=0.4)
-    p.add_argument("--teacher-gpu", type=int, default=1)
+    p.add_argument(
+        "--backend", choices=["vllm", "hf"], default="vllm",
+        help="teacher scoring backend: vllm (matches baseline, misses capped "
+        "at teacher top-20) or hf (exact full-vocab, needs ~11GB transient)",
+    )
+    p.add_argument(
+        "--teacher-gpu", type=int, default=1,
+        help="GPU for the teacher (hf backend). Ignored for vllm backend, "
+        "which shares the student vLLM's GPU pool unless --teacher-gpu-memory-utilization is set.",
+    )
+    p.add_argument(
+        "--teacher-gpu-memory-utilization", type=float, default=0.5,
+        help="vLLM teacher gpu_memory_utilization (vllm backend only)",
+    )
     args = p.parse_args(argv)
 
     strata = [s.strip() for s in args.strata.split(",") if s.strip()]
@@ -368,41 +455,70 @@ def main(argv: list[str]) -> int:
     sampled = sample_student(
         llm, tokenizer, base_prompt_texts, args.max_tokens, args.seed
     )
-    # Release vLLM; GPU 0 may stay occupied by worker procs until exit, so the
-    # teacher goes on a different GPU (--teacher-gpu).
+    # Release student vLLM; for vllm backend we then load a second vLLM for
+    # the teacher, for hf backend we load HF on --teacher-gpu.
     del llm
     gc.collect()
 
     import torch
-    from transformers import AutoModel
+    from transformers import AutoTokenizer
 
     torch.cuda.empty_cache()
-    device = f"cuda:{args.teacher_gpu}"
     teacher_tok = AutoTokenizer.from_pretrained(args.teacher_path)
-    # The teacher may be a Qwen3.5-Embedding wrapper (Qwen3_5ForEmbedding)
-    # whose causal-LM backbone lives under .language_model -- building
-    # ForCausalLM directly from the wrapper config fails because vocab_size
-    # is on the inner text config, not the wrapper. Load the wrapper via
-    # AutoModel (respects architectures) and unwrap to the causal-LM, which
-    # forward() returns full-vocab logits from. Falls back to the model
-    # itself if it already exposes lm_head (bare ForCausalLM).
-    full = AutoModel.from_pretrained(
-        args.teacher_path,
-        dtype=torch.bfloat16,
-        trust_remote_code=True,
-        attn_implementation="sdpa",
-    ).to(device).eval()
-    if hasattr(full, "language_model"):
-        teacher = full.language_model
-        print(f"[probe] teacher: unwrapped {type(full).__name__}.language_model -> {type(teacher).__name__}")
-    elif hasattr(full, "lm_head"):
-        teacher = full
-        print(f"[probe] teacher: using {type(full).__name__} directly")
-    else:
-        raise RuntimeError(
-            f"loaded teacher has neither .language_model nor .lm_head; "
-            f"cannot get causal-LM logits. model type: {type(full).__name__}"
+
+    if args.backend == "hf":
+        from transformers import AutoModel
+        device = f"cuda:{args.teacher_gpu}"
+        # The teacher may be a Qwen3.5-Embedding wrapper (Qwen3_5ForEmbedding)
+        # whose causal-LM backbone lives under .language_model -- building
+        # ForCausalLM directly from the wrapper config fails because vocab_size
+        # is on the inner text config, not the wrapper. Load the wrapper via
+        # AutoModel (respects architectures) and unwrap to the causal-LM,
+        # which forward() returns full-vocab logits from. Falls back to the
+        # model itself if it already exposes lm_head (bare ForCausalLM).
+        full = AutoModel.from_pretrained(
+            args.teacher_path,
+            dtype=torch.bfloat16,
+            trust_remote_code=True,
+            attn_implementation="sdpa",
+        ).to(device).eval()
+        if hasattr(full, "language_model"):
+            teacher = full.language_model
+            print(f"[probe] teacher(hf): unwrapped {type(full).__name__}.language_model -> {type(teacher).__name__}")
+        elif hasattr(full, "lm_head"):
+            teacher = full
+            print(f"[probe] teacher(hf): using {type(full).__name__} directly")
+        else:
+            raise RuntimeError(
+                f"loaded teacher has neither .language_model nor .lm_head; "
+                f"cannot get causal-LM logits. model type: {type(full).__name__}"
+            )
+        def _teacher_score(cond_text, r_ids_local, top20_local):
+            return teacher_hf_probs(
+                teacher, teacher_tok, cond_text, r_ids_local, top20_local,
+                device, args.max_model_len,
+            )
+    else:  # vllm backend
+        from vllm import LLM
+        # Second vLLM engine for the teacher; reuse the GPU just freed by the
+        # student. vLLM occupies one GPU per TP shard; TP=1 puts it on GPU 0
+        # unless CUDA_VISIBLE_DEVICES narrows it. To avoid clobbering, set
+        # teacher to a different visible-GPU index by default.
+        # Simplest robust layout: pin teacher to --teacher-gpu via env.
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.teacher_gpu)
+        teacher_llm = LLM(
+            model=args.teacher_path,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=args.teacher_gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+            dtype="bfloat16",
         )
+        print(f"[probe] teacher(vllm): loaded on cuda:{args.teacher_gpu}")
+        def _teacher_score(cond_text, r_ids_local, top20_local):
+            return teacher_vllm_probs(
+                teacher_llm, teacher_tok, cond_text, r_ids_local, top20_local,
+                args.max_model_len,
+            )
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -439,13 +555,22 @@ def main(argv: list[str]) -> int:
 
             # Forward each condition one at a time (stability over speed).
             cond_probs: dict[str, list[list[float]]] = {"student_base": student_base}
+            cond_miss: dict[str, int] = {}
             for cond_name, cond_text in conditions:
-                probs = teacher_forward_probs(
-                    teacher, teacher_tok, cond_text, r_ids, top20_ids,
-                    device, args.max_model_len,
-                )
+                probs = _teacher_score(cond_text, r_ids, top20_ids)
                 cond_probs[cond_name] = probs
-                print(f"[probe]   {cond_name}: scored {len(probs)} positions")
+                if args.backend == "vllm":
+                    miss = sum(
+                        1 for row in probs for v in row if v == MISSING
+                    )
+                    cond_miss[cond_name] = miss
+                    total = sum(len(row) for row in probs)
+                    print(
+                        f"[probe]   {cond_name}: scored {len(probs)} positions"
+                        f" | misses {miss}/{total} ({miss / max(total, 1) * 100:.1f}%)"
+                    )
+                else:
+                    print(f"[probe]   {cond_name}: scored {len(probs)} positions (hf exact)")
 
             for t in range(len(r_ids)):
                 label, field = labels[t]
@@ -469,6 +594,17 @@ def main(argv: list[str]) -> int:
                 fout.write(json.dumps(row, ensure_ascii=False) + "\n")
                 n_lines += 1
             fout.flush()
+
+            if args.backend == "vllm":
+                total_miss = sum(cond_miss.values())
+                total_cells = sum(len(r_ids) * 20 for _ in conditions)
+                pct = total_miss / max(total_cells, 1) * 100
+                if pct > 10:
+                    print(
+                        f"[probe]   ⚠ high miss rate {pct:.1f}% — student top-20 "
+                        f"often falls outside teacher top-20. Re-run with "
+                        f"--backend hf for exact full-vocab probabilities."
+                    )
     print(f"[probe] wrote {n_lines} rows to {out_path}")
     return 0
 
