@@ -68,6 +68,27 @@ from typing import Any
 EXPERT_NAMES = ["chasing", "long_term", "repurchase", "generalized"]
 
 
+def _remap_vllm_key(k: str) -> str:
+    """Map a wrapper weight key to the form Qwen3_5ForCausalLM expects.
+
+    The embedding wrapper's ``language_model`` is the ForCausalLM ``model``
+    submodule: the backbone (embed_tokens/layers/norm) sits directly under
+    it, so ``language_model.`` becomes ``model.``. A wrapper that already
+    nests ``model.`` or carries a real ``lm_head`` is handled by peeling only
+    the wrapper prefix. Bare backbone keys (from a prior bad strip) are also
+    re-prefixed. Mirrors scripts/fix_hf_model_for_vllm.py:remap_vllm_key so
+    the probe is standalone.
+    """
+    if k.startswith("language_model."):
+        inner = k[len("language_model."):]
+        if inner.startswith("model.") or inner.startswith("lm_head"):
+            return inner
+        return "model." + inner
+    if k.startswith(("embed_tokens.", "layers.", "norm.")) or k in ("embed_tokens.weight", "norm.weight"):
+        return "model." + k
+    return k
+
+
 # ---------------------------------------------------------------------------
 # Prompt construction (mirrors verl/verl/trainer/ppo/expert_prompt_utils.py
 # :build_expert_messages, inlined here so the probe is standalone and does
@@ -471,51 +492,94 @@ def main(argv: list[str]) -> int:
     teacher_tok = AutoTokenizer.from_pretrained(args.teacher_path)
 
     if args.backend == "hf":
-        from transformers import AutoConfig, AutoModel
+        import safetensors.torch
+        from transformers import AutoConfig, AutoModelForCausalLM
+        from safetensors import safe_open
         device = f"cuda:{args.teacher_gpu}"
         # The teacher is a Qwen3.5-Embedding wrapper (Qwen3_5ForEmbedding) whose
-        # causal-LM backbone lives under .language_model. Building ForCausalLM
-        # directly from the wrapper config fails because vocab_size is on the
-        # inner text config, not the wrapper; AutoModel (respecting
-        # architectures) builds the wrapper and we unwrap to .language_model,
-        # whose forward() returns full-vocab logits. Falls back to the model
-        # itself if it already exposes lm_head (bare ForCausalLM).
+        # causal-LM backbone + lm_head live under .language_model. The wrapper
+        # __init__ also builds a vision tower, and the base teacher's
+        # vision_config is missing rope_parameters / uses an unsupported rope
+        # type on this transformers version -- the probe never touches vision,
+        # so building the whole wrapper just to throw it away is fragile.
         #
-        # The original teacher (basemodel/teacher) ships a vision_config whose
-        # `rope_parameters` field is missing on this transformers version --
-        # the wrapper's __init__ builds the vision tower unconditionally and
-        # crashes on `vision_config.rope_parameters`. The probe only uses the
-        # causal-LM backbone; the vision tower is built but never called, so
-        # patch a default rope onto the config before load. (The student
-        # checkpoint re-saved after training already has this field; the
-        # un-rebased teacher does not.) Mirrors the vision_config workaround
-        # in verl/workers/fsdp_workers.py, adapted for cold-load.
+        # Instead: build a bare Qwen3_5ForCausalLM directly from the wrapper's
+        # text_config (no vision tower at all), then load the wrapper's
+        # safetensors weights into it with the language_model.* -> model.* /
+        # lm_head.* remap the export pipeline uses. This guarantees a real
+        # ForCausalLM (.lm_head present, forward returns full-vocab logits).
         teacher_cfg = AutoConfig.from_pretrained(
             args.teacher_path, trust_remote_code=True, attn_implementation="sdpa",
         )
-        if getattr(teacher_cfg, "vision_config", None) is not None:
-            vc = teacher_cfg.vision_config
-            if not hasattr(vc, "rope_parameters") or vc.rope_parameters is None:
-                vc.rope_parameters = {"rope_type": "default", "factor": 1.0}
-                print("[probe] teacher(hf): patched vision_config.rope_parameters (missing on base teacher config)")
-        full = AutoModel.from_pretrained(
-            args.teacher_path,
-            config=teacher_cfg,
-            dtype=torch.bfloat16,
-            trust_remote_code=True,
-            attn_implementation="sdpa",
-        ).to(device).eval()
-        if hasattr(full, "language_model"):
-            teacher = full.language_model
-            print(f"[probe] teacher(hf): unwrapped {type(full).__name__}.language_model -> {type(teacher).__name__}")
-        elif hasattr(full, "lm_head"):
-            teacher = full
-            print(f"[probe] teacher(hf): using {type(full).__name__} directly")
-        else:
+        text_cfg = getattr(teacher_cfg, "text_config", None)
+        if text_cfg is None:
+            # No separate text_config: the wrapper config IS the causal-LM
+            # config (already ForCausalLM). Use it directly.
+            text_cfg = teacher_cfg
+        # Ensure AutoModelForCausalLM picks the ForCausalLM class, not the bare
+        # backbone model. Some text_configs carry no architectures field.
+        if not getattr(text_cfg, "architectures", None):
+            mt = getattr(text_cfg, "model_type", "")
+            if mt and not mt.endswith("_for_causal_lm"):
+                text_cfg.architectures = [mt.replace("_text", "") + "_for_causal_lm"]
+        # Probe the saved weights for an lm_head; if absent, the head is tied to
+        # embed_tokens, so force tie_word_embeddings on the config.
+        weight_files = sorted(Path(args.teacher_path).glob("*.safetensors"))
+        if not weight_files:
+            raise RuntimeError(f"no *.safetensors found in teacher_path {args.teacher_path}")
+        has_lm_head = False
+        for wf in weight_files:
+            with safe_open(str(wf), framework="pt") as f:
+                for k in f.keys():
+                    if _remap_vllm_key(k) == "lm_head.weight" or _remap_vllm_key(k).startswith("lm_head."):
+                        has_lm_head = True
+                        break
+            if has_lm_head:
+                break
+        if not has_lm_head:
+            text_cfg.tie_word_embeddings = True
+            teacher_cfg.tie_word_embeddings = True
+            print("[probe] teacher(hf): no lm_head in weights -> tie_word_embeddings=true")
+        # AutoModelForCausalLM.from_config dispatches on model_type via its
+        # _model_mapping, not on architectures. Try the text_config first (the
+        # causal-LM config), then the wrapper config; both are candidates.
+        # Verify the built model actually exposes lm_head (full-vocab logits).
+        teacher = None
+        for cfg_try, label in ((text_cfg, "text_config"), (teacher_cfg, "wrapper_config")):
+            try:
+                cand = AutoModelForCausalLM.from_config(
+                    cfg_try, dtype=torch.bfloat16, attn_implementation="sdpa",
+                )
+            except Exception as e:
+                print(f"[probe] teacher(hf): from_config({label}) failed: {type(e).__name__}: {e}")
+                continue
+            if hasattr(cand, "lm_head"):
+                teacher = cand
+                print(f"[probe] teacher(hf): built {type(cand).__name__} from {label} (lm_head present, no vision tower)")
+                break
+            print(f"[probe] teacher(hf): from_config({label}) -> {type(cand).__name__} has no lm_head, skipping")
+            del cand
+        if teacher is None:
             raise RuntimeError(
-                f"loaded teacher has neither .language_model nor .lm_head; "
-                f"cannot get causal-LM logits. model type: {type(full).__name__}"
+                "could not build a ForCausalLM (lm_head present) from teacher_path; "
+                "neither text_config nor wrapper_config yielded one"
             )
+        # Load + remap weights into the ForCausalLM (random init before this).
+        remapped: dict[str, object] = {}
+        for wf in weight_files:
+            with safe_open(str(wf), framework="pt") as f:
+                for k in f.keys():
+                    remapped[_remap_vllm_key(k)] = f.get_tensor(k)
+        missing, unexpected = teacher.load_state_dict(remapped, strict=False)
+        # Filter out the vision keys we expect to be "unexpected" (we built no
+        # vision tower) so the report is meaningful.
+        unexpected_real = [k for k in unexpected if not k.startswith("visual.")]
+        print(
+            f"[probe] teacher(hf): loaded {len(remapped)} tensors | "
+            f"missing(top5)={missing[:5]} | unexpected(top5)={unexpected_real[:5]}"
+        )
+        teacher = teacher.to(device).eval()
+        print(f"[probe] teacher(hf): ready, {type(teacher).__name__} on {device}")
         def _teacher_score(cond_text, r_ids_local, top20_local):
             return teacher_hf_probs(
                 teacher, teacher_tok, cond_text, r_ids_local, top20_local,
