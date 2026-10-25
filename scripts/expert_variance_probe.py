@@ -322,11 +322,13 @@ def teacher_vllm_probs(
     # when prompt_token_ids is provided) and read prompt_logprobs at the R
     # positions (prompt_len + t - 1 predicts r_ids[t]).
     sp = SamplingParams(prompt_logprobs=20, max_tokens=1, temperature=0)
-    outputs = llm.generate(
-        prompts=None,
-        sampling_params=sp,
-        prompt_token_ids=[full_ids],
-    )
+    try:
+        from vllm import TokensPrompt
+        prompt_arg = TokensPrompt(prompt_token_ids=full_ids)
+        outputs = llm.generate(prompt_arg, sp)
+    except (ImportError, TypeError):
+        # Older vLLM: accept a dict or positional token-ids prompt.
+        outputs = llm.generate([{"prompt_token_ids": full_ids}], sp)
     out = outputs[0]
     # out.prompt_logprobs[i] = logprobs for position i (predicts token i+1).
     # It has len(full_ids) entries (None at position 0). R token t is predicted
