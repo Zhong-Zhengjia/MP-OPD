@@ -59,7 +59,8 @@ def test_mpopd_step_calls_rollout_prepare_and_update_in_order():
             "position_ids": torch.arange(2).repeat(1, 1),
         }
     )
-    metrics = trainer._run_mpopd_step(batch, {}, {})
+    # _run_mpopd_step returns (metrics, rollout_batch); unpack the tuple.
+    metrics, _rollout_batch = trainer._run_mpopd_step(batch, {}, {})
 
     assert trainer.actor_rollout_wg.calls == [
         "generate_sequences",
@@ -124,14 +125,16 @@ def test_fit_mpopd_saves_checkpoint_on_save_freq(monkeypatch):
         {"trainer": {"total_epochs": 5, "save_freq": 2, "project_name": "t", "experiment_name": "t", "logger": ["console"]}}
     )
 
+    # _fit_mpopd calls DataProto.from_single_dict(batch_dict), which expects a
+    # plain dict of tensors (the real StatefulDataLoader yields dicts via
+    # collate_fn -> {**tensors, **non_tensors}). Feeding DataProto here would
+    # hit "'DataProto' object has no attribute 'items'", so yield a plain dict.
     trainer.train_dataloader = [
-        DataProto.from_dict(
-            tensors={
-                "input_ids": torch.tensor([[1, 2]]),
-                "attention_mask": torch.ones(1, 2, dtype=torch.long),
-                "position_ids": torch.arange(2).repeat(1, 1),
-            }
-        )
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "attention_mask": torch.ones(1, 2, dtype=torch.long),
+            "position_ids": torch.arange(2).repeat(1, 1),
+        }
     ]
     trainer._is_empty_dataproto = lambda batch: False
 

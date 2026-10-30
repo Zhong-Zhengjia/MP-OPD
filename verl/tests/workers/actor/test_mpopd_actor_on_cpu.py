@@ -25,8 +25,11 @@ def test_only_student_log_probs_receive_gradient():
     log_p_k, log_p_out = _uniform_student(K=2)
     log_p_k.requires_grad_(True)
     log_p_out.requires_grad_(True)
-    # target concentrated on token 0 (over K+1)
-    target = torch.tensor([[[0.9, 0.05, 0.05]]])
+    # Reverse KL is mode-seeking: at a uniform student the unconstrained
+    # gradient is p_0*(1 + log(p_0/q_0)), negative iff p_0/q_0 < 1/e. The target
+    # must be concentrated enough to clear that threshold (q_0=0.9 with p_0=1/3
+    # sits just above 1/e and gives a near-zero positive gradient -- use 0.99).
+    target = torch.tensor([[[0.99, 0.005, 0.005]]])
     loss = compute_mpopd_kl_loss(log_p_k, log_p_out, target, torch.ones(1, 1), torch.tensor([True]))
     loss.backward()
 
