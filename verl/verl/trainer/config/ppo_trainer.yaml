@@ -134,11 +134,16 @@ algorithm:
     # Temperature for the expert-axis softmax over absolute deltas
     expert_temperature: 1.0
 
-    # Temperature for the token-axis target softmax
-    token_temperature: 1.0
-
-    # Scale applied to the signed fused expert delta
+    # Scale applied to the signed fused expert delta. method_new drops the
+    # token-axis temperature, so lambda_value alone scales g against log_a.
+    # In delta_normalize=full mode it must be tuned small (~0.01) for g/lambda
+    # to dominate the anchor; in delta_normalize=k mode it stays ~1.0.
     lambda_value: 1.0
+
+    # How the expert delta is scaled: "full" = raw full-vocab log-prob difference
+    # (method_new §4 literal); "k" = renormalize within top-k first (±log K),
+    # which amplifies a weak expert signal.
+    delta_normalize: full
 
     # Optional positive prior per expert; null means uniform priors
     expert_priors: null
@@ -151,6 +156,14 @@ algorithm:
 
     # Maximum token length allowed for a specialized expert prompt
     max_expert_prompt_length: 4096
+
+    # method_new §6 field loss: aggregate per-position KL over category/rationale/
+    # structure spans instead of a plain token mean.
+    enable_field_loss: true
+    # Weight of category vs rationale within an entry (method_new §6, 0 < eta < 1)
+    eta: 0.5
+    # Weight of the structural (JSON) span loss; 0.0 omits it (Lcontent only)
+    gamma: 0.0
 
   # Discount factor for future rewards
   gamma: 1.0

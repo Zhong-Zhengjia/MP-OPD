@@ -177,6 +177,30 @@ def topk_logprobs_from_logits(
     return topk_logits - logsumexp.unsqueeze(-1)
 
 
+def log1mexp(x: torch.Tensor) -> torch.Tensor:
+    """Numerically stable ``log(1 - exp(x))`` for ``x <= 0``.
+
+    Used to recover the log-probability mass outside a top-k set from the
+    top-k log-probs alone: since ``topk_logprobs_from_logits`` returns
+    full-vocab ``log_softmax`` values gathered at the top-k ids,
+    ``exp(topk_log_probs).sum(-1)`` is the total probability captured by the
+    top-k, and ``log(1 - that sum) = log1mexp(logsumexp(topk_log_probs, -1))``
+    gives the complement without materialising a full-vocab tensor. The
+    branch split at ``-ln 2`` follows the standard stable formula.
+    """
+    if torch.any(x > 0):
+        raise ValueError("log1mexp requires x <= 0")
+    ln2 = math.log(2.0)
+    # Promote to fp32 for the transcendentals, then cast back.
+    x_fp32 = x.float()
+    out = torch.where(
+        x_fp32 > -ln2,
+        torch.log(-torch.expm1(x_fp32)),
+        torch.log1p(-torch.exp(x_fp32)),
+    )
+    return out.to(x.dtype)
+
+
 def logprobs_from_logits_v2(logits: torch.FloatTensor, labels):
     """
     A memory efficient implementation of logprobs_from_logits

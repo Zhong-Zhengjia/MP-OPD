@@ -1,72 +1,162 @@
+"""Unit tests for the method_new MP-OPD target/loss (K+1 out bucket, full-vocab delta).
+
+These tests run on CPU without torch distributed. Inputs are constructed as
+valid full-vocab ``log_softmax`` values: each "vocab" is the K candidates plus a
+synthetic out token, so the anchor distribution ``a`` genuinely sums to 1 over
+the K+1 set and ``log1mexp`` recovers a real complement mass.
+"""
+
+import math
+
 import torch
 
-from verl.trainer.ppo.core_algos import build_mpopd_target, compute_mpopd_kl_loss
+from verl.trainer.ppo.core_algos import (
+    build_mpopd_target,
+    compute_mpopd_kl_loss,
+    compute_mpopd_token_kl,
+)
+from verl.utils.torch_functional import log1mexp
 
 
-def test_zero_delta_reduces_to_anchor_distribution():
-    # When specialized == teacher, K-normalization makes delta exactly zero
-    # (log_softmax(x) - log_softmax(x) = 0), so the target collapses to the
-    # anchor distribution regardless of the normalization choice.
-    anchor = torch.tensor([[[0.0, -1.0, -2.0]]])
+def _anchor_from_logits(logits: torch.Tensor):
+    """Build a valid K+1 anchor from K logits.
+
+    Treats the K logits as the top-k slice of a (K+1)-word vocab whose out logit
+    is 0, so ``log_softmax`` over K+1 yields a proper distribution. Returns
+    ``(log_a_k, log_a_out)`` where ``exp(log_a_k).sum + exp(log_a_out) == 1``.
+    """
+    out_logit = torch.zeros(*logits.shape[:2], 1)
+    full = torch.cat([logits, out_logit], dim=-1)
+    log_probs = torch.log_softmax(full, dim=-1)
+    k = logits.shape[-1]
+    return log_probs[..., :k], log_probs[..., k]
+
+
+def _log_softmax_kplus1(logits: torch.Tensor):
+    """Full-vocab log_softmax over a (K+1) vocab, returning only the K top-k slices.
+
+    ``logits`` is [B,T,K]; the out logit is fixed at 0 so the returned K values
+    are a valid full-vocab ``log_softmax`` (their exp sums to <= 1).
+    """
+    out_logit = torch.zeros(*logits.shape[:2], 1)
+    full = torch.cat([logits, out_logit], dim=-1)
+    return torch.log_softmax(full, dim=-1)[..., : logits.shape[-1]]
+
+
+def _expert_log_softmax(specialized_logits: torch.Tensor):
+    """Per-expert full-vocab log_softmax over a (K+1) vocab, K slices only.
+
+    ``specialized_logits`` is [B,T,K,E]; the out logit is 0 per expert, so each
+    expert's K values are a valid full-vocab ``log_softmax``.
+    """
+    out = torch.zeros(*specialized_logits.shape[:3], 1, specialized_logits.shape[3])
+    full = torch.cat([specialized_logits, out], dim=2)
+    return torch.log_softmax(full, dim=2)[..., : specialized_logits.shape[2], :]
+
+
+# --------------------------------------------------------------------------
+# build_mpopd_target
+# --------------------------------------------------------------------------
+
+
+def test_g_zero_target_equals_anchor_over_kplus1():
+    # method_new §8: when the fused expert delta is zero (specialized == teacher),
+    # the target collapses to the anchor distribution a on the K+1 set.
+    anchor_logits = torch.tensor([[[1.0, -1.0, 0.5]]])
+    log_a_k, log_a_out = _anchor_from_logits(anchor_logits)
+    teacher = _log_softmax_kplus1(anchor_logits)  # [B,T,K]
+    specialized = teacher.unsqueeze(-1).expand(-1, -1, -1, 2)  # == teacher → delta 0
     result = build_mpopd_target(
-        specialized_expert_log_probs=anchor[..., None].expand(-1, -1, -1, 2),
-        teacher_base_log_probs=anchor,
-        student_base_log_probs=anchor,
+        specialized_expert_log_probs=specialized,
+        teacher_base_log_probs=teacher,
+        student_base_log_probs=log_a_k,
+        student_base_out_log_probs=log_a_out,
         expert_mask=torch.ones(1, 2, dtype=torch.bool),
     )
-    expected = torch.softmax(anchor, dim=-1)
-    assert torch.allclose(result.target_probs, expected)
-    assert torch.allclose(result.fused_delta, torch.zeros_like(result.fused_delta))
+    expected = torch.exp(torch.cat([log_a_k, log_a_out.unsqueeze(-1)], dim=-1))
+    assert torch.allclose(result.target_probs, expected, atol=1e-6)
+    assert torch.allclose(result.fused_delta, torch.zeros_like(result.fused_delta), atol=1e-6)
 
 
-def test_k_normalized_delta_is_shift_invariant():
-    # K-normalization renormalizes each expert's log-probs within the top-k
-    # set via log_softmax. Two experts whose raw log-probs differ by a
-    # constant across all K tokens produce identical delta, because
-    # log_softmax cancels any additive constant. This is the property that
-    # puts delta in the same ±log(K) scale as the anchor.
-    base = torch.zeros(1, 1, 2)
-    specialized = torch.zeros(1, 1, 2, 2)
-    specialized[..., 0, 0] = 3.0  # expert 0: [3, 0]
-    specialized[..., 0, 1] = 0.0
-    specialized[..., 1, 0] = 5.0  # expert 1: [5, 2] — same shape, shifted +2
-    specialized[..., 1, 1] = 2.0
+def test_target_and_anchor_sum_to_one_over_kplus1():
+    anchor_logits = torch.randn(2, 3, 4)
+    log_a_k, log_a_out = _anchor_from_logits(anchor_logits)
+    teacher = _log_softmax_kplus1(anchor_logits)
+    specialized = _expert_log_softmax(teacher.unsqueeze(-1).expand(-1, -1, -1, 2) + 0.3)
     result = build_mpopd_target(
-        specialized,
-        torch.zeros_like(base),
-        base,
-        torch.ones(1, 2, dtype=torch.bool),
+        specialized_expert_log_probs=specialized,
+        teacher_base_log_probs=teacher,
+        student_base_log_probs=log_a_k,
+        student_base_out_log_probs=log_a_out,
+        expert_mask=torch.ones(2, 2, dtype=torch.bool),
     )
-    assert torch.allclose(result.expert_delta[..., 0], result.expert_delta[..., 1])
+    assert torch.allclose(result.target_probs.sum(-1), torch.ones(2, 3), atol=1e-5)
+    assert torch.allclose(result.anchor_probs.sum(-1), torch.ones(2, 3), atol=1e-5)
 
 
-def test_positive_and_negative_delta_change_target_with_signed_fusion():
-    # Experts with different K-spreads (3 vs 1) produce genuinely different
-    # K-normalized deltas, so the signed fusion weights them differently.
-    # Both still push token 0 up and token 1 down — the direction is preserved
-    # by K-normalization, but the magnitude reflects the within-K spread.
-    base = torch.zeros(1, 1, 2)
-    specialized = torch.zeros(1, 1, 2, 2)
-    specialized[..., 0, 0] = 3.0  # expert 0: spread 3 → strong delta
-    specialized[..., 1, 1] = -1.0  # expert 1: spread 1 → weaker delta
-    result = build_mpopd_target(
-        specialized,
-        torch.zeros_like(base),
-        base,
-        torch.ones(1, 2, dtype=torch.bool),
-    )
-    assert result.target_probs[0, 0, 0] > result.anchor_probs[0, 0, 0]
-    assert result.target_probs[0, 0, 1] < result.anchor_probs[0, 0, 1]
-
-
-def test_unavailable_experts_are_masked_and_all_unavailable_is_finite():
-    specialized = torch.tensor([[[[2.0, 100.0]]], [[[float("nan"), 0.0]]]])
-    teacher = torch.zeros(2, 1, 1)
-    student = torch.zeros(2, 1, 1)
+def test_opposite_deltas_cancel_to_anchor():
+    # +delta and -delta with equal |delta| get equal weights, so the signed
+    # fusion cancels and the target returns to the anchor (method_new §8).
+    anchor_logits = torch.tensor([[[1.0, -1.0, 0.5, 0.2]]])
+    log_a_k, log_a_out = _anchor_from_logits(anchor_logits)
+    teacher = _log_softmax_kplus1(anchor_logits)
+    base = teacher.unsqueeze(-1).expand(-1, -1, -1, 2).clone()
+    specialized = base.clone()
+    # expert 0: +shift, expert 1: -shift (same shape, opposite sign)
+    specialized[..., 0] = _log_softmax_kplus1(anchor_logits + 2.0)
+    specialized[..., 1] = _log_softmax_kplus1(anchor_logits - 2.0)
     result = build_mpopd_target(
         specialized,
         teacher,
-        student,
+        log_a_k,
+        log_a_out,
+        torch.ones(1, 2, dtype=torch.bool),
+    )
+    expected = torch.exp(torch.cat([log_a_k, log_a_out.unsqueeze(-1)], dim=-1))
+    assert torch.allclose(result.target_probs, expected, atol=1e-6)
+
+
+def test_positive_delta_raises_target_token():
+    # A positive fused delta on token 0 should raise its target probability
+    # above its anchor probability (method_new §8).
+    anchor_logits = torch.tensor([[[0.0, 0.0, 0.0, 0.0]]])
+    log_a_k, log_a_out = _anchor_from_logits(anchor_logits)
+    teacher = _log_softmax_kplus1(anchor_logits)
+    specialized = teacher.unsqueeze(-1).expand(-1, -1, -1, 2).clone()
+    # both experts shift mass onto token 0
+    lift = torch.tensor([3.0, 0.0, 0.0, 0.0])
+    specialized[..., 0] = _log_softmax_kplus1(anchor_logits + lift)
+    specialized[..., 1] = _log_softmax_kplus1(anchor_logits + lift)
+    result = build_mpopd_target(
+        specialized,
+        teacher,
+        log_a_k,
+        log_a_out,
+        torch.ones(1, 2, dtype=torch.bool),
+        lambda_value=0.05,  # amplify the full-vocab-scale delta
+    )
+    assert result.target_probs[0, 0, 0] > result.anchor_probs[0, 0, 0]
+
+
+def test_expert_weights_sum_to_one_per_candidate():
+    anchor_logits = torch.randn(1, 2, 3)
+    log_a_k, log_a_out = _anchor_from_logits(anchor_logits)
+    teacher = _log_softmax_kplus1(anchor_logits)
+    specialized = torch.stack(
+        [_log_softmax_kplus1(anchor_logits + 1.0), _log_softmax_kplus1(anchor_logits - 1.0)], dim=-1
+    )
+    result = build_mpopd_target(
+        specialized, teacher, log_a_k, log_a_out, torch.ones(1, 2, dtype=torch.bool)
+    )
+    assert torch.allclose(result.expert_weights.sum(-1), torch.ones(1, 2, 3), atol=1e-6)
+
+
+def test_unavailable_experts_masked_and_all_unavailable_is_finite():
+    specialized = torch.tensor([[[[2.0, 100.0]]], [[[float("nan"), 0.0]]]])
+    teacher = _log_softmax_kplus1(torch.zeros(2, 1, 1))
+    log_a_k, log_a_out = _anchor_from_logits(torch.zeros(2, 1, 1))
+    result = build_mpopd_target(
+        specialized, teacher, log_a_k, log_a_out,
         torch.tensor([[True, False], [False, False]]),
     )
     assert torch.allclose(result.expert_weights[0, 0, 0], torch.tensor([1.0, 0.0]))
@@ -74,70 +164,115 @@ def test_unavailable_experts_are_masked_and_all_unavailable_is_finite():
     assert torch.isfinite(result.target_probs).all()
 
 
-def test_reverse_kl_is_zero_when_student_matches_target():
-    # Reverse KL(student || target): when student and target are identical
-    # (both uniform [0.5, 0.5]), KL = Σ s_k * (log s_k - log t_k) = 0.
-    student = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], requires_grad=True)
-    target = torch.full((1, 2, 2), 0.5)
-    loss = compute_mpopd_kl_loss(
-        student,
-        target,
-        torch.ones(1, 2),
-        torch.tensor([True]),
-    )
-    assert torch.allclose(loss, torch.tensor(0.0))
-
-    invalid_student = torch.zeros(1, 1, 2, requires_grad=True)
-    invalid_loss = compute_mpopd_kl_loss(
-        invalid_student,
-        torch.full((1, 1, 2), 0.5),
-        torch.ones(1, 1),
-        torch.tensor([False]),
-    )
-    invalid_loss.backward()
-    assert torch.equal(invalid_student.grad, torch.zeros_like(invalid_student))
-
-
-def test_reverse_kl_pushes_student_toward_target_mode():
-    # Reverse KL is mode-seeking: when the target concentrates on token 0
-    # (0.9 vs 0.1) and the student is uniform, the gradient on the
-    # high-probability token should be negative (gradient descent increases
-    # its logit, raising its probability toward the target).
-    student = torch.tensor([[[0.0, 0.0]]], requires_grad=True)
-    target = torch.tensor([[[0.9, 0.1]]])
-    loss = compute_mpopd_kl_loss(
-        student,
-        target,
-        torch.ones(1, 1),
-        torch.tensor([True]),
-    )
-    loss.backward()
-    assert student.grad is not None
-    assert student.grad[0, 0, 0] < 0
-
-
 def test_target_is_detached():
+    anchor_logits = torch.tensor([[[1.0, -1.0]]])
+    log_a_k, log_a_out = _anchor_from_logits(anchor_logits)
+    teacher = _log_softmax_kplus1(anchor_logits)
     result = build_mpopd_target(
         torch.zeros(1, 1, 2, 1, requires_grad=True),
-        torch.zeros(1, 1, 2),
-        torch.zeros(1, 1, 2),
+        teacher,
+        log_a_k,
+        log_a_out,
         torch.ones(1, 1, dtype=torch.bool),
     )
     assert not result.target_probs.requires_grad
+    assert not result.target_log_probs.requires_grad
+    assert not result.expert_weights.requires_grad
+
+
+def test_delta_normalize_full_vs_k():
+    # Both modes satisfy g=0 → q=a and produce a valid K+1 target. The function
+    # does the K-renormalization internally for mode='k', so both modes receive
+    # the same raw full-vocab inputs.
+    anchor_logits = torch.tensor([[[1.0, -1.0, 0.5]]])
+    log_a_k, log_a_out = _anchor_from_logits(anchor_logits)
+    teacher = _log_softmax_kplus1(anchor_logits)
+    specialized = _expert_log_softmax(teacher.unsqueeze(-1).expand(-1, -1, -1, 2) + 1.0)
+    for mode in ("full", "k"):
+        result = build_mpopd_target(
+            specialized_expert_log_probs=specialized,
+            teacher_base_log_probs=teacher,
+            student_base_log_probs=log_a_k,
+            student_base_out_log_probs=log_a_out,
+            expert_mask=torch.ones(1, 2, dtype=torch.bool),
+            delta_normalize=mode,
+        )
+        assert torch.isfinite(result.target_probs).all()
+        assert torch.allclose(result.target_probs.sum(-1), torch.ones(1, 1), atol=1e-5)
+        # expert != teacher → fused delta is nonzero
+        assert result.fused_delta.abs().sum() > 0
+    # In 'k' mode the delta lives in ±log(K); in 'full' mode it is the raw
+    # full-vocab difference (typically smaller in absolute terms here).
+    full_res = build_mpopd_target(
+        specialized, teacher, log_a_k, log_a_out, torch.ones(1, 2, dtype=torch.bool), delta_normalize="full"
+    )
+    k_res = build_mpopd_target(
+        specialized, teacher, log_a_k, log_a_out, torch.ones(1, 2, dtype=torch.bool), delta_normalize="k"
+    )
+    assert k_res.expert_delta.abs().mean() != full_res.expert_delta.abs().mean()
+
+
+# --------------------------------------------------------------------------
+# compute_mpopd_kl_loss / compute_mpopd_token_kl
+# --------------------------------------------------------------------------
+
+
+def _uniform_student(B=1, T=1, K=2):
+    # A uniform full-vocab log_softmax over a (K+1) vocab: top-k log probs are
+    # log(1/(K+1)) and the out mass is the same, so p is uniform over K+1.
+    log_p = torch.full((B, T, K), -math.log(K + 1))
+    log_p_out = torch.full((B, T), -math.log(K + 1))
+    return log_p, log_p_out
+
+
+def test_reverse_kl_is_zero_when_student_matches_target():
+    log_p_k, log_p_out = _uniform_student(K=2)
+    log_p_k.requires_grad_(True)
+    log_p_out.requires_grad_(True)
+    target = torch.full((1, 1, 3), 1 / 3)  # uniform over K+1
+    loss = compute_mpopd_kl_loss(log_p_k, log_p_out, target, torch.ones(1, 1), torch.tensor([True]))
+    assert torch.allclose(loss, torch.tensor(0.0), atol=1e-6)
+
+
+def test_student_out_term_has_gradient():
+    # method_new §8: the student's out-bucket term must carry gradient.
+    log_p_k, log_p_out = _uniform_student(K=3)
+    log_p_k.requires_grad_(True)
+    log_p_out.requires_grad_(True)
+    # target concentrated on token 0
+    target = torch.tensor([[[0.7, 0.1, 0.1, 0.1]]])
+    loss = compute_mpopd_kl_loss(log_p_k, log_p_out, target, torch.ones(1, 1), torch.tensor([True]))
+    loss.backward()
+    assert log_p_out.grad is not None
+    assert log_p_out.grad.abs().sum() > 0
+
+
+def test_reverse_kl_pushes_student_toward_target_mode():
+    log_p_k, log_p_out = _uniform_student(K=2)
+    log_p_k.requires_grad_(True)
+    target = torch.tensor([[[0.9, 0.05, 0.05]]])
+    loss = compute_mpopd_kl_loss(log_p_k, log_p_out, target, torch.ones(1, 1), torch.tensor([True]))
+    loss.backward()
+    assert log_p_k.grad is not None
+    # gradient descent raises token 0's logit → its grad should be negative
+    assert log_p_k.grad[0, 0, 0] < 0
+
+
+def test_invalid_sample_has_zero_gradient():
+    log_p_k, log_p_out = _uniform_student(K=2)
+    log_p_k.requires_grad_(True)
+    target = torch.full((1, 1, 3), 1 / 3)
+    loss = compute_mpopd_kl_loss(log_p_k, log_p_out, target, torch.ones(1, 1), torch.tensor([False]))
+    loss.backward()
+    assert torch.equal(log_p_k.grad, torch.zeros_like(log_p_k.grad))
 
 
 def test_strict_mode_raises_when_any_sample_lacks_active_experts():
-    # ``skip_samples_without_active_experts=False`` treats a sample with no active
-    # expert as a configuration error rather than silently producing a zero-gradient
-    # row, so a batch containing one should raise immediately.
-    student = torch.zeros(1, 1, 2, requires_grad=True)
-    target = torch.full((1, 1, 2), 0.5)
+    log_p_k, log_p_out = _uniform_student(K=2)
+    target = torch.full((1, 1, 3), 1 / 3)
     try:
         compute_mpopd_kl_loss(
-            student,
-            target,
-            torch.ones(1, 1),
-            torch.tensor([False]),
+            log_p_k, log_p_out, target, torch.ones(1, 1), torch.tensor([False]),
             skip_samples_without_active_experts=False,
         )
     except ValueError:
@@ -146,14 +281,40 @@ def test_strict_mode_raises_when_any_sample_lacks_active_experts():
         raise AssertionError("strict mode should raise when a sample has no active experts")
 
 
-def test_strict_mode_passes_when_all_samples_have_active_experts():
-    student = torch.tensor([[[0.0, 0.0]]], requires_grad=True)
-    target = torch.full((1, 1, 2), 0.5)
-    loss = compute_mpopd_kl_loss(
-        student,
-        target,
-        torch.ones(1, 1),
-        torch.tensor([True]),
-        skip_samples_without_active_experts=False,
-    )
-    assert torch.allclose(loss, torch.tensor(0.0))
+def test_token_kl_shape_and_padding():
+    # token_kl is per-position [B,T]; padding positions must not affect the
+    # reduced loss (mask zeroes them out).
+    log_p_k, log_p_out = _uniform_student(B=1, T=2, K=2)
+    log_p_k.requires_grad_(True)
+    target = torch.full((1, 2, 3), 1 / 3)
+    token_kl = compute_mpopd_token_kl(log_p_k, log_p_out, target)
+    assert token_kl.shape == (1, 2)
+    mask = torch.tensor([[1.0, 0.0]])
+    loss = compute_mpopd_kl_loss(log_p_k, log_p_out, target, mask, torch.tensor([True]))
+    # only the first position contributes and it matches the target → 0
+    assert torch.allclose(loss, torch.tensor(0.0), atol=1e-6)
+
+
+# --------------------------------------------------------------------------
+# log1mexp
+# --------------------------------------------------------------------------
+
+
+def test_log1mexp_matches_naive_and_is_stable():
+    x = torch.tensor([-1e-8, -0.1, -0.5, -0.6931, -1.0, -3.0, -20.0])
+    out = log1mexp(x)
+    naive = torch.log(1.0 - torch.exp(x))
+    # match the naive formula where it is numerically safe
+    assert torch.allclose(out[1:], naive[1:], atol=1e-5)
+    # extreme: x -> 0 gives log(0) -> -inf; x -> -inf gives 0
+    assert torch.isinf(log1mexp(torch.tensor([-1e-30])))
+    assert torch.allclose(log1mexp(torch.tensor([-50.0])), torch.tensor(0.0), atol=1e-6)
+
+
+def test_log1mexp_rejects_positive_input():
+    try:
+        log1mexp(torch.tensor([0.1]))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("log1mexp should reject x > 0")

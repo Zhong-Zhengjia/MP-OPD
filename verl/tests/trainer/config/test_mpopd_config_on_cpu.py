@@ -23,8 +23,11 @@ def test_defaults():
     assert cfg.expert_names == ["chasing", "long_term", "repurchase", "generalized"]
     assert set(cfg.expert_instructions) == set(cfg.expert_names)
     assert all(cfg.expert_instructions[name].strip() for name in cfg.expert_names)
-    assert (cfg.top_k, cfg.expert_temperature, cfg.token_temperature) == (10, 1.0, 1.0)
+    assert (cfg.top_k, cfg.expert_temperature) == (10, 1.0)
     assert cfg.lambda_value == 1.0
+    assert cfg.delta_normalize == "full"
+    assert cfg.enable_field_loss is True
+    assert (cfg.eta, cfg.gamma) == (0.5, 0.0)
     assert cfg.skip_samples_without_active_experts is True
     assert cfg.max_expert_prompt_length == 4096
 
@@ -36,8 +39,11 @@ def test_defaults():
         {"expert_names": ["x", "x"]},
         {"top_k": 0},
         {"expert_temperature": 0.0},
-        {"token_temperature": -1.0},
         {"lambda_value": 0.0},
+        {"delta_normalize": "bad"},
+        {"eta": 0.0},
+        {"eta": 1.0},
+        {"gamma": -1.0},
         {"expert_forward_micro_batch_size": -1},
         {"max_expert_prompt_length": 0},
         {"expert_priors": [1.0, 0.0, 1.0, 1.0]},

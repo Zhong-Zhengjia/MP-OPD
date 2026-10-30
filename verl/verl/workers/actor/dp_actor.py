@@ -30,10 +30,11 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import (
     agg_loss,
     build_mpopd_target,
-    compute_mpopd_kl_loss,
+    compute_mpopd_token_kl,
     get_policy_loss_fn,
     kl_penalty,
 )
+from verl.trainer.ppo.field_loss import compute_field_masks, compute_mpopd_field_loss
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -44,7 +45,7 @@ from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
-from verl.utils.torch_functional import logprobs_from_logits, topk_logprobs_from_logits
+from verl.utils.torch_functional import logprobs_from_logits, topk_logprobs_from_logits, log1mexp
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -139,6 +140,7 @@ class DataParallelPPOActor(BasePPOActor):
         return_selected_log_probs=False,
         return_topk_log_probs=False,
         return_topk_with_log_probs=False,
+        return_topk_out_log_prob=False,
         use_ref_inputs: bool = False,
     ):
         response_length = self._response_length_for_forward(micro_batch, use_ref_inputs)
@@ -168,6 +170,7 @@ class DataParallelPPOActor(BasePPOActor):
             topk_ids = None
             selected_log_probs = None
             topk_log_probs = None
+            topk_out_log_prob = None
 
             if position_ids.dim() == 3:
                 position_ids = position_ids.transpose(0, 1)
@@ -585,10 +588,27 @@ class DataParallelPPOActor(BasePPOActor):
                                 logits,
                             )
 
+            if return_topk_out_log_prob:
+                if topk_log_probs is None:
+                    raise ValueError(
+                        "return_topk_out_log_prob requires return_topk_log_probs or return_topk_with_log_probs"
+                    )
+                # topk_log_probs are full-vocab log_softmax values gathered at the top-k
+                # ids, so exp().sum(-1) is the top-k's share of the full-vocab probability
+                # mass. log(1 - that share) is the complement, recovered stably without a
+                # full-vocab tensor. Computed in fp32 per the method_new numerical guidance.
+                topk_out_log_prob = log1mexp(
+                    torch.logsumexp(topk_log_probs.float(), dim=-1)
+                ).to(topk_log_probs.dtype)
+
             if return_topk_with_log_probs:
+                if return_topk_out_log_prob:
+                    return entropy, log_probs, topk_ids, topk_log_probs, topk_out_log_prob
                 return entropy, log_probs, topk_ids, topk_log_probs
 
             if return_topk_log_probs:
+                if return_topk_out_log_prob:
+                    return entropy, log_probs, topk_log_probs, topk_out_log_prob
                 return entropy, log_probs, topk_log_probs
 
             if return_selected_log_probs:
@@ -866,8 +886,15 @@ class DataParallelPPOActor(BasePPOActor):
 
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_topk_log_probs_on_ids(self, data: DataProto) -> torch.Tensor:
-        """Compute true log pi(token) on fixed student top-k ids, shape (B, T, K)."""
+    def compute_topk_log_probs_on_ids(
+        self, data: DataProto, return_out_log_prob: bool = False
+    ) -> torch.Tensor:
+        """Compute true log pi(token) on fixed student top-k ids, shape (B, T, K).
+
+        When ``return_out_log_prob`` is true, also return the log-probability mass
+        outside the top-k set (shape (B, T)), as ``(topk_log_probs, out_log_probs)``;
+        otherwise return just ``topk_log_probs`` for backward compatibility.
+        """
         self.actor_module.eval()
 
         micro_batch_size = data.meta_info["micro_batch_size"]
@@ -899,18 +926,25 @@ class DataParallelPPOActor(BasePPOActor):
             micro_batches = data.split(micro_batch_size)
 
         log_probs_lst = []
+        out_log_probs_lst = []
 
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
 
             with torch.no_grad():
-                _, _, topk_log_probs = self._forward_micro_batch(
+                forward_outputs = self._forward_micro_batch(
                     model_inputs,
                     temperature=temperature,
                     calculate_entropy=False,
                     return_topk_log_probs=True,
+                    return_topk_out_log_prob=return_out_log_prob,
                 )
+                if return_out_log_prob:
+                    _, _, topk_log_probs, topk_out_log_probs = forward_outputs
+                    out_log_probs_lst.append(topk_out_log_probs)
+                else:
+                    _, _, topk_log_probs = forward_outputs
 
             log_probs_lst.append(topk_log_probs)
 
@@ -918,6 +952,12 @@ class DataParallelPPOActor(BasePPOActor):
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
+
+        if return_out_log_prob:
+            out_log_probs = torch.concat(out_log_probs_lst, dim=0)
+            if use_dynamic_bsz:
+                out_log_probs = restore_dynamic_batch(out_log_probs, batch_idx_list)
+            return log_probs, out_log_probs
 
         return log_probs
 
@@ -1271,11 +1311,12 @@ class DataParallelPPOActor(BasePPOActor):
         return metrics
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def update_policy_mpopd(self, data: DataProto):
+    def update_policy_mpopd(self, data: DataProto, tokenizer=None):
         """Update only the student against the detached fused top-k target."""
         required = (
             "student_topk_ids",
             "student_base_topk_log_probs",
+            "student_base_topk_out_log_probs",
             "teacher_base_topk_log_probs",
             "specialized_expert_topk_log_probs",
             "expert_mask",
@@ -1287,6 +1328,11 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
         temperature = data.meta_info["temperature"]
         mp_cfg = data.meta_info["mp_opd_config"]
+        enable_field_loss = bool(mp_cfg.get("enable_field_loss", True))
+        if enable_field_loss and tokenizer is None:
+            # No tokenizer available (e.g. a non-MP-OPD call path); fall back to
+            # the plain masked mean so the step still trains instead of crashing.
+            enable_field_loss = False
         select_keys = [
             "responses",
             "response_mask",
@@ -1319,29 +1365,68 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs["specialized_expert_topk_log_probs"],
                         model_inputs["teacher_base_topk_log_probs"],
                         model_inputs["student_base_topk_log_probs"],
+                        model_inputs["student_base_topk_out_log_probs"],
                         model_inputs["expert_mask"],
                         expert_temperature=float(mp_cfg["expert_temperature"]),
-                        token_temperature=float(mp_cfg["token_temperature"]),
                         lambda_value=float(mp_cfg["lambda_value"]),
                         expert_priors=mp_cfg.get("expert_priors"),
+                        delta_normalize=str(mp_cfg.get("delta_normalize", "full")),
                     )
                     if not torch.isfinite(target.target_probs).all():
                         raise FloatingPointError("MP-OPD target contains non-finite probabilities")
-                    _, _, student_log_probs = self._forward_micro_batch(
+                    _, _, student_log_probs, student_topk_out_log_prob = self._forward_micro_batch(
                         model_inputs,
                         temperature=temperature,
                         calculate_entropy=False,
                         return_topk_log_probs=True,
+                        return_topk_out_log_prob=True,
                     )
-                    loss = compute_mpopd_kl_loss(
-                        student_log_probs,
-                        target.target_probs,
-                        response_mask,
-                        target.valid_samples,
-                        skip_samples_without_active_experts=bool(
-                            mp_cfg.get("skip_samples_without_active_experts", True)
-                        ),
+                    # Per-position reverse KL over the K+1 set (gradient-bearing on
+                    # both the top-k and the out-bucket student terms).
+                    token_kl = compute_mpopd_token_kl(
+                        student_log_probs, student_topk_out_log_prob, target.target_probs
                     )
+                    valid_samples = target.valid_samples
+                    skip = bool(mp_cfg.get("skip_samples_without_active_experts", True))
+                    if not skip and not bool(valid_samples.all()):
+                        raise ValueError(
+                            "MP-OPD encountered samples with no active experts; enable "
+                            "skip_samples_without_active_experts to mask them or filter them upstream"
+                        )
+                    field_diag = {}
+                    if enable_field_loss:
+                        import time as _time
+
+                        _t0 = _time.monotonic()
+                        # Field spans are labeled on the response tokens (aligned
+                        # with response_mask / token_kl, both [B, response_len]),
+                        # NOT on input_ids ([B, total_T]). ``responses`` holds the
+                        # generated response ids; response_mask selects the valid
+                        # positions within it.
+                        field_masks = compute_field_masks(
+                            tokenizer,
+                            model_inputs["responses"],
+                            response_mask,
+                        )
+                        loss, field_diag = compute_mpopd_field_loss(
+                            token_kl,
+                            field_masks,
+                            float(mp_cfg.get("eta", 0.5)),
+                            float(mp_cfg.get("gamma", 0.0)),
+                            response_mask,
+                            valid_samples,
+                        )
+                        field_diag["timing/mpopd_field_loss_s"] = _time.monotonic() - _t0
+                    else:
+                        sample_mask = (
+                            response_mask.to(dtype=token_kl.dtype)
+                            * valid_samples[:, None].to(dtype=token_kl.dtype)
+                        )
+                        denominator = sample_mask.sum()
+                        if denominator.item() == 0:
+                            loss = student_log_probs.sum() * 0.0
+                        else:
+                            loss = (token_kl * sample_mask).sum() / denominator
                     if not torch.isfinite(loss):
                         raise FloatingPointError("MP-OPD loss is non-finite")
                     scale = response_mask.shape[0] / self.config.ppo_mini_batch_size if self.config.use_dynamic_bsz else 1 / grad_accum
@@ -1361,6 +1446,17 @@ class DataParallelPPOActor(BasePPOActor):
                         student_topk_probs = student_log_probs.detach().softmax(-1)
                         topk_mass = student_log_probs.detach().exp().sum(-1).mean()
                         target_max_prob = target.target_probs.max(-1).values.mean()
+                        # K+1 out-bucket diagnostics (method_new §5). out_mass is the
+                        # student's complement probability averaged over response
+                        # positions; target_out_prob is q[out]. If target_out_prob is
+                        # close to 1 the fused delta is being washed out and the
+                        # target collapses onto the out bucket -- a sign lambda is
+                        # too large or delta_normalize=full is too weak for this run.
+                        rm_f = response_mask.to(dtype=student_topk_out_log_prob.dtype)
+                        rm_f = rm_f * active[:, None].to(rm_f.dtype)
+                        rm_denom = rm_f.sum().clamp_min(1.0)
+                        out_mass = (student_topk_out_log_prob.detach().exp() * rm_f).sum() / rm_denom
+                        target_out_prob = (target.target_probs[..., -1].detach() * rm_f).sum() / rm_denom
 
                         # §17.2 expert-signal diagnostics. Restrict to valid experts and
                         # response positions: a conflict is a candidate token where at
@@ -1400,7 +1496,15 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/mpopd_active_expert_count": active_expert_count.item(),
                             "actor/mpopd_all_experts_unavailable_count": (~target.valid_samples).sum().item(),
                             "actor/mpopd_top_k": student_log_probs.shape[-1],
+                            "actor/mpopd_out_mass": out_mass.item(),
+                            "actor/mpopd_target_out_prob": target_out_prob.item(),
+                            "actor/mpopd_field_loss_enabled": float(enable_field_loss),
                         }
+                        if field_diag:
+                            metric_update["actor/mpopd_parse_ok_rate"] = field_diag.get("parse_ok_rate", 0.0)
+                            metric_update["actor/mpopd_field_content_samples"] = field_diag.get("content_samples", 0.0)
+                            if "timing/mpopd_field_loss_s" in field_diag:
+                                metric_update["timing/mpopd_field_loss_s"] = field_diag["timing/mpopd_field_loss_s"]
                         # Per-expert delta / weight, averaged over response positions.
                         expert_names = mp_cfg.get("expert_names", [])
                         for e, name in enumerate(expert_names):

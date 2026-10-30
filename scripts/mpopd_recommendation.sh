@@ -127,13 +127,20 @@ rm -f /dev/shm/psm_* /dev/shm/nccl-* /dev/shm/torch_* 2>/dev/null || true
 # NOTE: keep this comment OUTSIDE the backslash-continued python command --
 # a '#' inside a continued line comments out every arg after it.
 
+# delta_normalize=k + lambda_value=1.0 is the known-good sanity baseline
+# (K-normalized delta amplifies the weak expert signal). To run the literal
+# method_new math, switch delta_normalize=full and retune lambda_value to
+# ~0.01 so g/lambda can dominate the anchor's log_a.
 exec python -m verl.trainer.main_ppo \
   algorithm.train_mode=multi_prompt_distill \
   'algorithm.mp_opd.expert_names=[chasing,long_term,repurchase,generalized]' \
   algorithm.mp_opd.top_k=20 \
   algorithm.mp_opd.expert_temperature=1.0 \
-  algorithm.mp_opd.token_temperature=1.0 \
   algorithm.mp_opd.lambda_value=1.0 \
+  algorithm.mp_opd.delta_normalize=k \
+  algorithm.mp_opd.enable_field_loss=true \
+  algorithm.mp_opd.eta=0.5 \
+  algorithm.mp_opd.gamma=0.0 \
   algorithm.mp_opd.expert_forward_micro_batch_size=1 \
   algorithm.mp_opd.max_expert_prompt_length=32768 \
   critic.enable=false \

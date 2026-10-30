@@ -347,12 +347,23 @@ class MPOPDConfig(BaseConfig):
     )
     top_k: int = 10
     expert_temperature: float = 1.0
-    token_temperature: float = 1.0
     lambda_value: float = 1.0
     expert_priors: Optional[list[float]] = None
     expert_forward_micro_batch_size: int = 0
     skip_samples_without_active_experts: bool = True
     max_expert_prompt_length: int = 4096
+    # method_new: how the expert delta is scaled. "full" uses the raw full-vocab
+    # log-prob difference (method_new §4, the literal definition); "k" renormalizes
+    # both distributions within the top-k set first, putting delta in ±log(K) space
+    # and amplifying an otherwise-weak expert signal. lambda_value alone scales
+    # g against log_a (no token_temperature); in "full" mode it must be tuned small
+    # (e.g. ~0.01) for g/lambda to dominate the anchor.
+    delta_normalize: str = "full"
+    # method_new §6 field loss: when enabled, aggregate the per-position KL over
+    # category/rationale/structure spans instead of a plain token mean.
+    enable_field_loss: bool = True
+    eta: float = 0.5
+    gamma: float = 0.0
 
     def __post_init__(self):
         if not self.expert_names or len(set(self.expert_names)) != len(self.expert_names):
@@ -363,8 +374,14 @@ class MPOPDConfig(BaseConfig):
             raise ValueError("expert instructions must be non-empty")
         if self.top_k <= 0:
             raise ValueError("top_k must be positive")
-        if min(self.expert_temperature, self.token_temperature, self.lambda_value) <= 0:
-            raise ValueError("temperatures and lambda_value must be positive")
+        if min(self.expert_temperature, self.lambda_value) <= 0:
+            raise ValueError("expert_temperature and lambda_value must be positive")
+        if self.delta_normalize not in ("full", "k"):
+            raise ValueError("delta_normalize must be 'full' or 'k'")
+        if not (0.0 < self.eta < 1.0):
+            raise ValueError("eta must be in (0, 1)")
+        if self.gamma < 0.0:
+            raise ValueError("gamma must be non-negative")
         if self.expert_forward_micro_batch_size < 0:
             raise ValueError("expert_forward_micro_batch_size must be non-negative")
         if self.max_expert_prompt_length <= 0:

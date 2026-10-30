@@ -58,7 +58,13 @@ PolicyLossFn = Callable[
 
 @dataclass
 class MPOPDTarget:
-    """Detached top-k target and diagnostics for one MP-OPD update."""
+    """Detached top-k target and diagnostics for one MP-OPD update.
+
+    The target lives on the K+1 set (top-k candidates plus an ``out`` bucket
+    that collects the full-vocab probability mass outside the top-k). ``target_*``
+    tensors therefore have shape ``[B, T, K+1]``. ``expert_*`` / ``fused_delta``
+    keep the K-only shape since the expert signal is undefined on ``out`` (g[out]=0).
+    """
 
     target_probs: torch.Tensor
     target_log_probs: torch.Tensor
@@ -73,19 +79,29 @@ def build_mpopd_target(
     specialized_expert_log_probs: torch.Tensor,
     teacher_base_log_probs: torch.Tensor,
     student_base_log_probs: torch.Tensor,
+    student_base_out_log_probs: torch.Tensor,
     expert_mask: torch.Tensor,
     *,
     expert_temperature: float = 1.0,
-    token_temperature: float = 1.0,
     lambda_value: float = 1.0,
     expert_priors: list[float] | torch.Tensor | None = None,
+    delta_normalize: str = "full",
 ) -> MPOPDTarget:
-    """Fuse prompt-conditioned expert changes into an anchored top-k target.
+    """Fuse prompt-conditioned expert changes into an anchored K+1 target.
+
+    Follows method_new.md §4-§5. The candidate set is ``Omega_t = C_t ∪ {out}``,
+    where ``out`` collects the full-vocab probability mass outside the top-k.
+    The anchor ``a`` is the student-base's full-vocab distribution on this K+1 set
+    (NOT K-normalized), the fused expert delta ``g`` is defined on the K candidates
+    with ``g[out] = 0``, and the target is ``log_softmax(log_a + g / lambda, dim=-1)``
+    over K+1. ``token_temperature`` (the old scale bridge) is removed; ``lambda_value``
+    alone scales ``g`` against ``log_a``.
 
     Shapes:
-      specialized_expert_log_probs: [B, T, K, E]
-      teacher_base_log_probs:       [B, T, K]
-      student_base_log_probs:       [B, T, K]
+      specialized_expert_log_probs: [B, T, K, E]   (full-vocab log_softmax at top-k)
+      teacher_base_log_probs:       [B, T, K]      (full-vocab log_softmax at top-k)
+      student_base_log_probs:       [B, T, K]      (full-vocab log_softmax at top-k)
+      student_base_out_log_probs:   [B, T]         (log of the complement mass)
       expert_mask:                  [B, E]
     """
     if specialized_expert_log_probs.ndim != 4:
@@ -94,25 +110,29 @@ def build_mpopd_target(
         raise ValueError("teacher_base_log_probs must have shape [B,T,K]")
     if student_base_log_probs.shape != teacher_base_log_probs.shape:
         raise ValueError("student_base_log_probs must have shape [B,T,K]")
+    if student_base_out_log_probs.shape != student_base_log_probs.shape[:2]:
+        raise ValueError("student_base_out_log_probs must have shape [B,T]")
     batch_size, _, _, expert_count = specialized_expert_log_probs.shape
     if expert_mask.shape != (batch_size, expert_count):
         raise ValueError("expert_mask must have shape [B,E]")
-    if min(expert_temperature, token_temperature, lambda_value) <= 0:
-        raise ValueError("temperatures and lambda_value must be positive")
+    if min(expert_temperature, lambda_value) <= 0:
+        raise ValueError("expert_temperature and lambda_value must be positive")
+    if delta_normalize not in ("full", "k"):
+        raise ValueError("delta_normalize must be 'full' or 'k'")
 
     with torch.no_grad():
         expert_mask = expert_mask.to(device=specialized_expert_log_probs.device, dtype=torch.bool)
-        # K-normalize both teacher distributions within the top-k set before
-        # differencing. specialized_expert_log_probs and teacher_base_log_probs
-        # are full-vocab log-softmax values gathered at the top-k ids, so their
-        # raw difference lives in a full-vocab scale (±100) that mismatches the
-        # anchor log_softmax(student_base, dim=-1) which is K-normalized (±log
-        # K). Renormalizing both within K puts delta in the same space as the
-        # anchor, making their sum in the target construction scale-consistent
-        # and removing the need to tune token_temperature as a scale bridge.
-        expert_knorm = torch.log_softmax(specialized_expert_log_probs, dim=2)
-        teacher_knorm = torch.log_softmax(teacher_base_log_probs, dim=-1)
-        delta = expert_knorm - teacher_knorm.unsqueeze(-1)
+        # Δ = log π_spec(v) − log π_base(v). ``full`` uses the raw full-vocab
+        # log-prob difference (method_new §4, forbids re-softmax over K); ``k``
+        # re-normalizes both distributions within the top-k set before differencing,
+        # which puts Δ in ±log(K) space and amplifies an otherwise-weak expert
+        # signal at the cost of deviating from method_new's literal definition.
+        if delta_normalize == "k":
+            expert_knorm = torch.log_softmax(specialized_expert_log_probs, dim=2)
+            teacher_knorm = torch.log_softmax(teacher_base_log_probs, dim=-1)
+            delta = expert_knorm - teacher_knorm.unsqueeze(-1)
+        else:
+            delta = specialized_expert_log_probs - teacher_base_log_probs.unsqueeze(-1)
         safe_delta = torch.where(expert_mask[:, None, None, :], delta, torch.zeros_like(delta))
         expert_logits = delta.abs() / expert_temperature
         if expert_priors is not None:
@@ -136,12 +156,18 @@ def build_mpopd_target(
         valid_samples = expert_mask.any(dim=-1)
         fused_delta = torch.where(valid_samples[:, None, None], fused_delta, torch.zeros_like(fused_delta))
 
-        anchor_log_probs = torch.log_softmax(student_base_log_probs, dim=-1)
-        anchor_probs = anchor_log_probs.exp()
+        # Anchor distribution over K+1: a_k is the student-base full-vocab softmax
+        # at the top-k ids (so a_k already sums to < 1), a_out is the complement.
+        # student_base_log_probs are log(a_k); student_base_out_log_probs is log(a_out).
+        out_lp = student_base_out_log_probs.unsqueeze(-1)
+        log_a = torch.cat([student_base_log_probs, out_lp], dim=-1)  # [B,T,K+1]
+        anchor_probs = log_a.exp()
+        # g is defined on K (fused_delta) and 0 on the out bucket.
+        g_full = torch.cat([fused_delta, torch.zeros_like(out_lp)], dim=-1)  # [B,T,K+1]
         target_log_probs = torch.log_softmax(
-            anchor_log_probs + fused_delta / (lambda_value * token_temperature),
+            (log_a + g_full / lambda_value).float(),
             dim=-1,
-        )
+        ).to(specialized_expert_log_probs.dtype)
         target_probs = target_log_probs.exp()
 
     return MPOPDTarget(
@@ -155,30 +181,52 @@ def build_mpopd_target(
     )
 
 
+def compute_mpopd_token_kl(
+    student_topk_log_probs: torch.Tensor,
+    student_topk_out_log_prob: torch.Tensor,
+    target_probs: torch.Tensor,
+    *,
+    eps: float | None = None,
+) -> torch.Tensor:
+    """Per-position reverse KL ``Σ_b p[b]·(log p[b] − log q[b])`` over the K+1 set.
+
+    The student distribution ``p`` is built on K+1: ``p_k`` is the current student's
+    full-vocab softmax at the top-k ids (so ``student_topk_log_probs`` are
+    full-vocab log_softmax values, used directly as ``log p_k``) and ``p_out`` is
+    the complement. Gradient flows through both (the student forward keeps logits
+    ``requires_grad``), satisfying method_new §8's "学生 out 项有梯度" requirement.
+    """
+    if student_topk_log_probs.ndim != 3:
+        raise ValueError("student_topk_log_probs must have shape [B,T,K]")
+    if student_topk_out_log_prob.shape != student_topk_log_probs.shape[:2]:
+        raise ValueError("student_topk_out_log_prob must have shape [B,T]")
+    if target_probs.shape[:2] != student_topk_log_probs.shape[:2] or target_probs.shape[-1] != student_topk_log_probs.shape[-1] + 1:
+        raise ValueError("target_probs must have shape [B,T,K+1] matching the student")
+    tiny = torch.finfo(student_topk_log_probs.dtype).tiny if eps is None else eps
+    log_p_out = student_topk_out_log_prob.unsqueeze(-1)
+    log_p = torch.cat([student_topk_log_probs, log_p_out], dim=-1)  # [B,T,K+1]
+    student_probs = log_p.exp()
+    target_log_probs = torch.log(target_probs.clamp_min(tiny))
+    return (student_probs * (log_p - target_log_probs)).sum(dim=-1)  # [B,T]
+
+
 def compute_mpopd_kl_loss(
     student_topk_log_probs: torch.Tensor,
+    student_topk_out_log_prob: torch.Tensor,
     target_probs: torch.Tensor,
     response_mask: torch.Tensor,
     valid_samples: torch.Tensor,
     *,
     skip_samples_without_active_experts: bool = True,
 ) -> torch.Tensor:
-    """Compute masked ``KL(student || target)`` (reverse KL) over selected top-k tokens.
+    """Masked reverse-KL loss over the K+1 set (method_new §5).
 
     Reverse KL is mode-seeking: the student concentrates on the high-probability
-    tokens of the target rather than covering every mode. This prevents the
-    entropy growth observed with forward KL (``KL(target || student)``), where the
-    student flattens onto low-probability target tokens to cover the full support.
-
-    When ``skip_samples_without_active_experts`` is true (default), samples with no
+    tokens of the target rather than covering every mode. When
+    ``skip_samples_without_active_experts`` is true (default), samples with no
     active expert are masked out of the loss so MP-OPD never silently degrades to
-    anchor distillation on them. When false, encountering such a sample is treated
-    as a configuration error and raises instead of producing a zero-gradient loss.
+    anchor distillation on them; when false, such a sample is a configuration error.
     """
-    if student_topk_log_probs.shape != target_probs.shape:
-        raise ValueError("student_topk_log_probs and target_probs must have the same shape")
-    if student_topk_log_probs.ndim != 3:
-        raise ValueError("selected log probabilities must have shape [B,T,K]")
     if response_mask.shape != student_topk_log_probs.shape[:2]:
         raise ValueError("response_mask must have shape [B,T]")
     if valid_samples.shape != (student_topk_log_probs.shape[0],):
@@ -189,10 +237,7 @@ def compute_mpopd_kl_loss(
             "skip_samples_without_active_experts to mask them or filter them upstream"
         )
 
-    student_log_probs = torch.log_softmax(student_topk_log_probs, dim=-1)
-    student_probs = student_log_probs.exp()
-    target_log_probs = torch.log(target_probs.clamp_min(torch.finfo(target_probs.dtype).tiny))
-    token_kl = (student_probs * (student_log_probs - target_log_probs)).sum(dim=-1)
+    token_kl = compute_mpopd_token_kl(student_topk_log_probs, student_topk_out_log_prob, target_probs)
     sample_mask = response_mask.to(dtype=token_kl.dtype) * valid_samples[:, None].to(dtype=token_kl.dtype)
     denominator = sample_mask.sum()
     if denominator.item() == 0:
