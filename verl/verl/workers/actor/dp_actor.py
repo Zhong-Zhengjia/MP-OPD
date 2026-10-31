@@ -665,6 +665,23 @@ class DataParallelPPOActor(BasePPOActor):
             if isinstance(grad_norm, DTensor):
                 grad_norm = grad_norm.full_tensor()
 
+            # === DIAGNOSTIC: if grad_norm is NaN, find which params have NaN grads ===
+            import os as _os
+            if _os.environ.get("MPOPD_DEBUG_NAN") and not torch.isfinite(grad_norm):
+                nan_params = []
+                nan_grad_total = 0
+                for n, p in self.actor_module.named_parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        n_nan = int((~torch.isfinite(p.grad)).sum().item())
+                        nan_grad_total += n_nan
+                        nan_params.append(f"{n}(nan={n_nan},shape={tuple(p.shape)})")
+                        if len(nan_params) >= 10:
+                            nan_params.append("...")
+                            break
+                print(f"[MPOPD_DEBUG_NAN grad_norm={grad_norm.item()}] "
+                      f"total_nan_grad_entries={nan_grad_total} "
+                      f"first_params_with_nan_grad: {nan_params}", flush=True)
+
             if self.scaler is not None:
                 self.scaler.step(self.actor_optimizer)
                 self.scaler.update()
@@ -1399,6 +1416,44 @@ class DataParallelPPOActor(BasePPOActor):
                     token_kl = compute_mpopd_token_kl(
                         student_log_probs, student_topk_out_log_prob, target.target_probs
                     )
+
+                    # === DIAGNOSTIC: locate the NaN source (remove once fixed) ===
+                    import os as _os
+                    if _os.environ.get("MPOPD_DEBUG_NAN"):
+                        def _fin(t, name):
+                            if t is None:
+                                return f"{name}=None"
+                            with torch.no_grad():
+                                fn = torch.isfinite(t)
+                                if fn.all():
+                                    return f"{name}=finite(shape={tuple(t.shape)},max={t.abs().max().item():.3f})"
+                                return f"{name}=HAS-NAN/INF(nan={int((~fn).sum().item())},shape={tuple(t.shape)})"
+                        # Check each gradient-bearing input to compute_mpopd_token_kl
+                        # and the target (no_grad side) to see where NaN first appears.
+                        print(f"[MPOPD_DEBUG_NAN step] "
+                              f"{_fin(student_log_probs, 'student_log_probs')} "
+                              f"{_fin(student_topk_out_log_prob, 'student_topk_out_log_prob')} "
+                              f"{_fin(target.target_probs, 'target_probs')} "
+                              f"{_fin(token_kl, 'token_kl')}", flush=True)
+                        # Check the model output logits path: did the student
+                        # forward produce non-finite topk log-probs at source?
+                        # (compute_mpopd_token_kl applies nan_to_num internally, so
+                        # student_log_probs here are ALREADY nan_to_num'd -- to see
+                        # the raw forward output we re-derive is not possible, but
+                        # token_kl's finiteness tells us if the KL itself is NaN.)
+                        # Probe backward: compute a tiny dummy backward to find
+                        # which input's grad goes NaN.
+                        if torch.isfinite(token_kl).all() and token_kl.requires_grad:
+                            # token_kl is finite; if backward still yields NaN,
+                            # the NaN is generated DURING backward (autograd graph).
+                            # Probe by backprop'ing a masked sum of token_kl.
+                            probe_mask = response_mask.to(token_kl.dtype)
+                            probe_loss = (token_kl * probe_mask).sum()
+                            print(f"[MPOPD_DEBUG_NAN probe] probe_loss finite={torch.isfinite(probe_loss).item()}", flush=True)
+                            # We won't backward here (would corrupt the real
+                            # backward below); just report. The real backward
+                            # is the one that goes NaN.
+
                     valid_samples = target.valid_samples
                     skip = bool(mp_cfg.get("skip_samples_without_active_experts", True))
                     if not skip and not bool(valid_samples.all()):
@@ -1451,7 +1506,35 @@ class DataParallelPPOActor(BasePPOActor):
                     if not torch.isfinite(loss):
                         raise FloatingPointError("MP-OPD loss is non-finite")
                     scale = response_mask.shape[0] / self.config.ppo_mini_batch_size if self.config.use_dynamic_bsz else 1 / grad_accum
+
+                    # === DIAGNOSTIC: capture grad of each input BEFORE backward ===
+                    import os as _os
+                    _debug_nan = bool(_os.environ.get("MPOPD_DEBUG_NAN"))
+                    if _debug_nan:
+                        # Retain grad on intermediate tensors to see which one
+                        # goes NaN during backward.
+                        student_log_probs.retain_grad()
+                        student_topk_out_log_prob.retain_grad()
+                        token_kl.retain_grad()
+                        print(f"[MPOPD_DEBUG_NAN pre-backward] "
+                              f"loss finite={torch.isfinite(loss).item()} "
+                              f"loss.requires_grad={loss.requires_grad} "
+                              f"loss.grad_fn={type(loss.grad_fn).__name__}", flush=True)
+
                     (loss * scale).backward()
+
+                    if _debug_nan:
+                        def _grad_fin(t, name):
+                            if t is None or t.grad is None:
+                                return f"{name}.grad=None"
+                            fn = torch.isfinite(t.grad)
+                            if fn.all():
+                                return f"{name}.grad=finite(max={t.grad.abs().max().item():.3f})"
+                            return f"{name}.grad=HAS-NAN/INF(nan={int((~fn).sum().item())})"
+                        print(f"[MPOPD_DEBUG_NAN post-backward] "
+                              f"{_grad_fin(student_log_probs, 'student_log_probs')} "
+                              f"{_grad_fin(student_topk_out_log_prob, 'student_topk_out_log_prob')} "
+                              f"{_grad_fin(token_kl, 'token_kl')}", flush=True)
                     with torch.no_grad():
                         active = target.valid_samples
                         weights = target.expert_weights
