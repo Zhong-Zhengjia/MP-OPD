@@ -313,3 +313,32 @@ def test_field_loss_preserves_gradient():
     loss.backward()
     assert token_kl.grad is not None
     assert token_kl.grad.abs().sum() > 0
+
+
+def test_all_malformed_preserves_gradient_for_backward():
+    # Regression: when every sample in the micro-batch has parse_ok=False
+    # (malformed JSON, no 兴趣/理由 found), content_terms is empty. The
+    # fallback must stay grad-bearing or the downstream (loss*scale).backward()
+    # raises "element 0 of tensors does not require grad" -- which is exactly
+    # what happened in the first MP-OPD smoke run (0.8B student at step 0
+    # rarely emits valid JSON, and ppo_micro_batch_size_per_gpu=1 so each
+    # micro-batch is one sample). The grad-bearing zero (token_kl.sum()*0.0)
+    # keeps the graph so backward succeeds with a zero gradient.
+    rtext = "this is not json at all"
+    input_ids, response_mask = _make_inputs(rtext)
+    masks = compute_field_masks(TOK, input_ids, response_mask)
+    assert not bool(masks.parse_ok[0])  # precondition: empty content_terms
+    token_kl = _kl_for_response(rtext, {}, default=1.0)
+    token_kl.requires_grad_(True)
+    loss, diag = compute_mpopd_field_loss(
+        token_kl, masks, eta=0.5, gamma=0.0,
+        response_mask=response_mask, valid_samples=torch.tensor([True]),
+    )
+    # loss is zero (no content), but must carry a grad_fn so backward works.
+    assert loss.requires_grad
+    assert loss.grad_fn is not None
+    loss.backward()  # must not raise
+    assert token_kl.grad is not None
+    # zero loss -> zero gradient (the sample correctly contributes nothing).
+    assert torch.equal(token_kl.grad, torch.zeros_like(token_kl.grad))
+    assert diag["content_samples"] == 0.0

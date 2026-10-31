@@ -323,8 +323,17 @@ def compute_mpopd_field_loss(
             elif lr is not None:
                 content_terms.append(lr)
 
-    Lcontent = torch.stack(content_terms).mean() if content_terms else torch.zeros((), device=device)
-    Lformat = torch.stack(format_terms).mean() if format_terms else torch.zeros((), device=device)
+    # Grad-bearing zero fallback. When every sample has parse_ok=False (no
+    # content spans) or no structural positions, the term list is empty. Using
+    # ``torch.zeros(())`` here would drop the autograd graph and make the
+    # downstream ``(loss * scale).backward()`` raise "element 0 of tensors does
+    # not require grad". Multiplying a grad-bearing tensor (token_kl) by 0.0
+    # preserves the graph, yields a zero loss, and produces zero gradient --
+    # the correct behavior for "no content/format samples in this micro-batch".
+    # Matches the idiom in dp_actor.update_policy_mpopd's non-field branch.
+    zero_loss = token_kl.sum() * 0.0
+    Lcontent = torch.stack(content_terms).mean() if content_terms else zero_loss
+    Lformat = torch.stack(format_terms).mean() if format_terms else zero_loss
     loss = Lcontent + gamma * Lformat
     diagnostics = {
         "content_samples": float(len(content_terms)),
