@@ -126,6 +126,12 @@ class _TopKLogProbsFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits: torch.Tensor, topk_ids: torch.Tensor, row_chunk_size: int):
         ctx.row_chunk_size = row_chunk_size
+        # Clamp logits to a finite range so the forward output and the saved
+        # tensors for backward are both finite (see backward for the rationale;
+        # bf16 forward can overflow logits to +inf on long prompts). This makes
+        # the forward self-stable rather than relying on a downstream nan_to_num.
+        logit_cap = 1.0e4
+        logits = logits.clamp(min=-logit_cap, max=logit_cap)
         ctx.save_for_backward(logits, topk_ids)
         logsumexp = logsumexp_from_logits_by_row(logits)
         topk_logits = torch.gather(logits, dim=-1, index=topk_ids)
@@ -149,9 +155,22 @@ class _TopKLogProbsFunction(torch.autograd.Function):
             return grad_logits, None, None
 
         chunk_size = row_chunk_size if row_chunk_size > 0 else 256
+        # Numerical guard: the student differentiable forward (actor_module.train,
+        # bf16) can overflow logits to +inf on long prompts. The forward output
+        # is post-processed (nan_to_num in compute_mpopd_token_kl) so the loss is
+        # finite, but THIS backward recomputes ``softmax = exp(logits - logsumexp)``
+        # from the saved logits; with logits=+inf that is ``exp(+inf - inf) = NaN``,
+        # which flows into grad_logits and yields ``grad_norm=NaN`` regardless of
+        # the forward-side guards. Clamping logits to a finite range before the
+        # logsumexp absorbs the +inf (the +inf slot's softmax collapses to ~1, the
+        # rest to ~0 -- the mathematically correct softmax for an overconfident
+        # logit), and is a no-op for normal finite logits (well below the cap).
+        # The cap is bf16-safe 1e4: below the bf16 max (~3.4e38) but far above any
+        # legitimate logit (typically < 100).
+        logit_cap = 1.0e4
         for start in range(0, logits.size(0), chunk_size):
             end = min(start + chunk_size, logits.size(0))
-            logits_chunk = logits[start:end]
+            logits_chunk = logits[start:end].clamp(min=-logit_cap, max=logit_cap)
             topk_ids_chunk = topk_ids[start:end]
             grad_out_chunk = grad_output[start:end]
 
