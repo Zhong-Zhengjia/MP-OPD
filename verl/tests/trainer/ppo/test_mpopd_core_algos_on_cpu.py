@@ -326,6 +326,36 @@ def test_invalid_sample_has_zero_gradient():
     assert torch.equal(log_p_k.grad, torch.zeros_like(log_p_k.grad))
 
 
+def test_student_nan_log_probs_do_not_poison_backward():
+    # Regression for the smoke-test grad_norm=NaN bug (round 2): the student's
+    # differentiable forward under bf16 can overflow logits to +inf, making
+    # topk_logprobs_from_logits return NaN log-probs. The forward masks those
+    # positions out (response_mask / field spans) so the loss stays finite, but
+    # the autograd backward of ``.sum(-1)`` distributes gradient to every K+1
+    # entry, and at a masked position ``0 * NaN = NaN`` (IEEE 754) poisons the
+    # gradient. compute_mpopd_token_kl's nan_to_num on the student log-probs
+    # replaces NaN with a finite floor so the backward gets ``0 * finite = 0``.
+    log_p_k, log_p_out = _uniform_student(B=1, T=2, K=3)
+    # Inject a NaN into the student's top-k log-prob at position t=1, which the
+    # response_mask below excludes from the loss (only t=0 contributes).
+    log_p_k.requires_grad_(True)
+    with torch.no_grad():
+        log_p_k[0, 1, 0] = float("nan")
+    target = torch.full((1, 2, 4), 0.25)  # uniform over K+1
+    # mask out the NaN position so the forward loss is finite
+    mask = torch.tensor([[1.0, 0.0]])
+    loss = compute_mpopd_kl_loss(log_p_k, log_p_out, target, mask, torch.tensor([True]))
+    assert torch.isfinite(loss), "loss must be finite despite NaN in masked student log-probs"
+    loss.backward()
+    # The gradient must be finite everywhere (no NaN propagation via 0*NaN).
+    assert log_p_k.grad is not None
+    assert torch.isfinite(log_p_k.grad).all(), "NaN in student log-probs must not poison backward gradient"
+    # The masked NaN position gets zero gradient (nan_to_num floors it, mask
+    # zeroes the upstream grad); the clean position gets a real gradient.
+    assert torch.equal(log_p_k.grad[0, 1], torch.zeros_like(log_p_k.grad[0, 1]))
+
+
+
 def test_strict_mode_raises_when_any_sample_lacks_active_experts():
     log_p_k, log_p_out = _uniform_student(K=2)
     target = torch.full((1, 1, 3), 1 / 3)

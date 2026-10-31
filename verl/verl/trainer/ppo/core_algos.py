@@ -247,6 +247,28 @@ def compute_mpopd_token_kl(
     if target_probs.shape[:2] != student_topk_log_probs.shape[:2] or target_probs.shape[-1] != student_topk_log_probs.shape[-1] + 1:
         raise ValueError("target_probs must have shape [B,T,K+1] matching the student")
     tiny = torch.finfo(student_topk_log_probs.dtype).tiny if eps is None else eps
+    # NaN guard on the differentiable student log-probs. The student forward
+    # also runs under bf16; with a long prompt its logits can overflow to +inf,
+    # making topk_logprobs_from_logits return ``+inf - logsumexp(+inf) = NaN``
+    # (and log1mexp can return NaN for the out-mass). The forward masks these
+    # positions out (response_mask / field spans) so the loss stays finite,
+    # but the autograd backward of ``.sum(-1)`` distributes gradient to ALL
+    # K+1 entries: the per-entry grad is ``exp(log_p)*(1 + log_p - log_q) *
+    # grad_token_kl``, and even at a masked position where ``grad_token_kl = 0``,
+    # ``0 * NaN = NaN`` in IEEE 754 -- so a single NaN in ``log_p`` anywhere in
+    # the K+1 row poisons the whole row's gradient and yields ``grad_norm=NaN``
+    # despite a finite forward loss. ``nan_to_num`` replaces the NaN/inf with a
+    # finite log-prob floor BEFORE the exp/cat, so the backward gets
+    # ``0 * finite = 0`` at masked positions and a real gradient at the rest.
+    # The gradient through nan_to_num is 0 for the replaced (NaN) entries --
+    # correct, since those entries were numerically meaningless anyway.
+    logp_floor = -50.0
+    student_topk_log_probs = torch.nan_to_num(
+        student_topk_log_probs, nan=logp_floor, posinf=logp_floor, neginf=logp_floor
+    )
+    student_topk_out_log_prob = torch.nan_to_num(
+        student_topk_out_log_prob, nan=logp_floor, posinf=logp_floor, neginf=logp_floor
+    )
     log_p_out = student_topk_out_log_prob.unsqueeze(-1)
     log_p = torch.cat([student_topk_log_probs, log_p_out], dim=-1)  # [B,T,K+1]
     student_probs = log_p.exp()
@@ -285,7 +307,13 @@ def compute_mpopd_kl_loss(
     sample_mask = response_mask.to(dtype=token_kl.dtype) * valid_samples[:, None].to(dtype=token_kl.dtype)
     denominator = sample_mask.sum()
     if denominator.item() == 0:
-        return student_topk_log_probs.sum() * 0.0
+        # Grad-bearing zero (preserve the autograd graph) with a NaN backstop:
+        # if the student forward overflowed bf16 and produced NaN log-probs,
+        # ``student_topk_log_probs.sum() * 0.0`` would yield ``NaN * 0.0 = NaN``
+        # and poison grad_norm. nan_to_num first, then * 0.0 -> true 0.0.
+        return torch.nan_to_num(
+            student_topk_log_probs, nan=0.0, posinf=0.0, neginf=0.0
+        ).sum() * 0.0
     return (token_kl * sample_mask).sum() / denominator
 
 POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
