@@ -595,11 +595,24 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                 # topk_log_probs are full-vocab log_softmax values gathered at the top-k
                 # ids, so exp().sum(-1) is the top-k's share of the full-vocab probability
-                # mass. log(1 - that share) is the complement, recovered stably without a
+                # mass; log(1 - that share) is the complement, recovered stably without a
                 # full-vocab tensor. Computed in fp32 per the method_new numerical guidance.
+                #
+                # Two numerical guards (both for bf16/fp32 rounding, NOT the math — in
+                # exact arithmetic the share is <= 1 so its log is <= 0):
+                #   1. Clamp the log-sum-exp to <= 0. When the top-k captures nearly all
+                #      the mass, bf16 logsumexp rounds slightly positive (e.g. +0.005),
+                #      which would trip log1mexp's x<=0 invariant.
+                #   2. Floor the out-bucket log-prob at a finite minimum. Clamp(0) can
+                #      yield log1mexp(0) = -inf ("out bucket has zero mass"); leaving
+                #      that -inf in place would make the downstream reverse KL hit
+                #      p_out * (log_p_out - log_q) = 0 * -inf = NaN. Flooring keeps the
+                #      out term finite, where it correctly contributes ~0 (p_out=0,
+                #      0*finite=0) and ~0 gradient.
+                out_floor = torch.finfo(topk_log_probs.dtype).min
                 topk_out_log_prob = log1mexp(
-                    torch.logsumexp(topk_log_probs.float(), dim=-1)
-                ).to(topk_log_probs.dtype)
+                    torch.logsumexp(topk_log_probs.float(), dim=-1).clamp_max(0.0)
+                ).clamp_min(out_floor).to(topk_log_probs.dtype)
 
             if return_topk_with_log_probs:
                 if return_topk_out_log_prob:
