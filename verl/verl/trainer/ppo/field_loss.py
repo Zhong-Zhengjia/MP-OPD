@@ -331,7 +331,17 @@ def compute_mpopd_field_loss(
     # preserves the graph, yields a zero loss, and produces zero gradient --
     # the correct behavior for "no content/format samples in this micro-batch".
     # Matches the idiom in dp_actor.update_policy_mpopd's non-field branch.
-    zero_loss = token_kl.sum() * 0.0
+    #
+    # NaN guard: if ``token_kl`` itself contains NaN (e.g. expert forward
+    # overflowed bf16 logits to +inf, producing NaN log-probs that flow through
+    # the target into the KL), then ``NaN * 0.0 = NaN`` (NOT 0), so the bare
+    # ``token_kl.sum() * 0.0`` would propagate the NaN into ``loss`` and on into
+    # ``grad_norm``. ``nan_to_num`` first replaces any NaN/inf in ``token_kl``
+    # with finite values so the zero multiplication yields a true zero. The
+    # upstream clamps in ``build_mpopd_target`` (log-prob floor + g band-clamp)
+    # are the primary defense; this is the backstop so a stray NaN can never
+    # silently turn the zero-loss path into a NaN-loss path.
+    zero_loss = torch.nan_to_num(token_kl, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
     Lcontent = torch.stack(content_terms).mean() if content_terms else zero_loss
     Lformat = torch.stack(format_terms).mean() if format_terms else zero_loss
     loss = Lcontent + gamma * Lformat

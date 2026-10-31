@@ -172,6 +172,43 @@ def test_unavailable_experts_masked_and_all_unavailable_is_finite():
     assert torch.isfinite(result.target_probs).all()
 
 
+def test_active_expert_with_nan_or_extreme_logprobs_stays_finite():
+    # Regression for the smoke-test grad_norm=NaN bug: an expert forward under
+    # bf16 with a long prompt can overflow logits to +inf, making
+    # topk_logprobs_from_logits produce NaN log-probs, and sharp experts can
+    # produce extreme log-probs (~-1e4). The build_mpopd_target input guards
+    # (finite-floor + g band-clamp) must keep the target finite and the fused
+    # delta bounded so the downstream reverse KL never sees a one-hot target.
+    K = 4
+    # Sample 0: NaN expert log-probs (simulates bf16 logit overflow). Sample 1:
+    # extreme -1e4 log-probs (simulates bf16 underflow on a sharp expert).
+    specialized = torch.stack(
+        [
+            torch.full((1, 1, K, 2), float("nan")),
+            torch.tensor([[[[-1e4, -15.0, -15.0, -15.0], [-15.0, -15.0, -15.0, -15.0]]]]),
+        ],
+        dim=0,
+    )  # [2,1,K,2]
+    teacher = _log_softmax_kplus1(torch.zeros(2, 1, K))
+    log_a_k, log_a_out = _anchor_from_logits(torch.zeros(2, 1, K))
+    result = build_mpopd_target(
+        specialized, teacher, log_a_k, log_a_out,
+        torch.ones(2, 2, dtype=torch.bool),
+        delta_normalize="k",
+    )
+    # Target must be finite (no NaN/inf propagated from the inputs).
+    assert torch.isfinite(result.target_probs).all()
+    # Target must remain a valid K+1 distribution.
+    assert torch.allclose(result.target_probs.sum(-1), torch.ones(2, 1), atol=1e-5)
+    # Fused delta must be clamped to the g band (±10) so it cannot collapse the
+    # target to a one-hot (which would make log_q -> -inf and grad -> NaN).
+    assert result.fused_delta.abs().max() <= 10.0 + 1e-6
+    # No target entry should collapse to ~0 (which triggers log(0)=-inf in the KL).
+    # With g clamped to ±10 and lambda=1, the worst-case target entry is
+    # softmax(log_a ± 10); for a uniform anchor over K+1 this is ~exp(-10)/21 ~ 2e-6.
+    assert result.target_probs.min() > 1e-8
+
+
 def test_target_is_detached():
     anchor_logits = torch.tensor([[[1.0, -1.0]]])
     log_a_k, log_a_out = _anchor_from_logits(anchor_logits)

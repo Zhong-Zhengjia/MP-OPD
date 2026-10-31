@@ -122,6 +122,33 @@ def build_mpopd_target(
 
     with torch.no_grad():
         expert_mask = expert_mask.to(device=specialized_expert_log_probs.device, dtype=torch.bool)
+        # Numerical guard: expert forwards under bf16 with long specialized prompts
+        # (4096 tokens) can overflow logits to +inf, which makes
+        # ``topk_logprobs_from_logits`` produce NaN (``+inf - logsumexp(+inf)`` =
+        # ``+inf - inf = NaN``) or extreme log-probs (~-1e4 from bf16 underflow).
+        # Both propagate through K-mode ``log_softmax`` into ``delta`` and on into
+        # ``fused_delta``/``target``, ultimately yielding ``grad_norm=NaN``.
+        # Replace any non-finite value with a finite log-prob floor (prob ~1e-22,
+        # still a meaningful "near-zero probability" and well above bf16 tiny).
+        # The floor also caps the worst-case K-mode delta magnitude: a -50 log-prob
+        # against a -3 teacher K-norm gives delta >= -47, which (after the g-band
+        # clamp below) stays inside the target's stable range.
+        logp_floor = -50.0
+        specialized_expert_log_probs = torch.where(
+            torch.isfinite(specialized_expert_log_probs),
+            specialized_expert_log_probs,
+            torch.full_like(specialized_expert_log_probs, logp_floor),
+        ).clamp_min(logp_floor)
+        teacher_base_log_probs = torch.where(
+            torch.isfinite(teacher_base_log_probs),
+            teacher_base_log_probs,
+            torch.full_like(teacher_base_log_probs, logp_floor),
+        ).clamp_min(logp_floor)
+        student_base_log_probs = torch.where(
+            torch.isfinite(student_base_log_probs),
+            student_base_log_probs,
+            torch.full_like(student_base_log_probs, logp_floor),
+        ).clamp_min(logp_floor)
         # Δ = log π_spec(v) − log π_base(v). ``full`` uses the raw full-vocab
         # log-prob difference (method_new §4, forbids re-softmax over K); ``k``
         # re-normalizes both distributions within the top-k set before differencing,
@@ -155,6 +182,23 @@ def build_mpopd_target(
         fused_delta = (weights * safe_delta).sum(dim=-1)
         valid_samples = expert_mask.any(dim=-1)
         fused_delta = torch.where(valid_samples[:, None, None], fused_delta, torch.zeros_like(fused_delta))
+
+        # Band-clamp the fused delta before it scales into log_a. Even after the
+        # per-tensor log-prob floor above, sharp experts (one token at lp≈0,
+        # the rest at the -50 floor) produce K-mode deltas up to ~±47 on
+        # individual tokens; fused across 4 experts a single token can still
+        # carry |g| >> 10. ``log_a + g/lambda`` with |g|~47 and ``log_a~-13.8``
+        # saturates ``log_softmax`` into a near-one-hot target, which makes
+        # ``compute_mpopd_token_kl`` hit ``log(tiny)~-87`` on the suppressed
+        # tokens and blows up the reverse-KL gradient (grad_norm=NaN). The band
+        # keeps the target smooth: at g_max=10 and lambda>=1, log_a + g/lambda
+        # stays within ±10 of the anchor, so no target entry collapses below
+        # softmax(±10)≈4.5e-5 and ``log_q`` stays above ~-10. The band is wide
+        # enough not to erase the expert signal (the mean |fused_delta| in
+        # the smoke run was ~7, well inside the band) -- it only clips the
+        # catastrophic spikes that numerically destabilize the target.
+        g_max = 10.0
+        fused_delta = fused_delta.clamp(-g_max, g_max)
 
         # Anchor distribution over K+1: a_k is the student-base full-vocab softmax
         # at the top-k ids (so a_k already sums to < 1), a_out is the complement.

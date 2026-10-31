@@ -1437,7 +1437,15 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         denominator = sample_mask.sum()
                         if denominator.item() == 0:
-                            loss = student_log_probs.sum() * 0.0
+                            # Grad-bearing zero: preserve the autograd graph so
+                            # backward() doesn't raise "does not require grad".
+                            # nan_to_num guards against a stray NaN in
+                            # student_log_probs (shouldn't happen -- student is the
+                            # current-step model -- but a NaN here would otherwise
+                            # propagate as NaN*0.0=NaN into grad_norm).
+                            loss = torch.nan_to_num(
+                                student_log_probs, nan=0.0, posinf=0.0, neginf=0.0
+                            ).sum() * 0.0
                         else:
                             loss = (token_kl * sample_mask).sum() / denominator
                     if not torch.isfinite(loss):
