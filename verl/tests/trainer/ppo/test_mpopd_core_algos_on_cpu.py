@@ -356,6 +356,51 @@ def test_student_nan_log_probs_do_not_poison_backward():
 
 
 
+def test_out_mass_backward_is_finite_when_topk_captures_all_mass():
+    # Regression for the smoke-test grad_norm=NaN bug (round 4): the out-mass
+    # ``log1mexp(logsumexp(topk_log_probs).clamp_max(0.0))`` has a SINGULAR
+    # backward at LSE==0. When the top-k captures ~all the mass, logsumexp==0,
+    # ``d log1mexp/d LSE = -exp(0)/(1-exp(0)) = -inf``, and the grad arriving at
+    # the out term is ~0 (p_out~0 -> the KL out-term ~0), so the backward hits
+    # ``0 * -inf = NaN``. Because ``d LSE/d topk_log_probs_k = softmax_k``, the
+    # NaN propagates to ALL K topk_log_probs entries -> student_log_probs.grad
+    # NaN -> grad_norm=NaN, despite a finite forward loss (the round-4
+    # diagnostic: token_kl.grad finite but student_log_probs.grad had 200 NaN).
+    # The fix clamps LSE strictly below 0 (``clamp_max(-out_eps)``) so the
+    # backward gradient is finite (``-1/eps``), giving ``0 * finite = 0``.
+    K = 5
+    # Sharp student: token 0 has mass ~1 (logit 0), the rest ~0 (logit -1e4).
+    # In fp32, logsumexp([0, -1e4, ...]) == 0 exactly (exp(-1e4) underflows to 0).
+    topk_lp = torch.tensor([[[0.0] + [-1e4] * (K - 1)]])  # [1,1,K]
+    target = torch.tensor([[[0.2, 0.2, 0.2, 0.2, 0.2, 1e-10]]])  # [1,1,K+1]
+    out_floor = torch.finfo(topk_lp.dtype).min
+
+    # Reproduce the BUG: clamp_max(0.0) lets LSE hit 0 -> log1mexp backward -inf
+    # -> 0 * -inf = NaN in topk_log_probs.grad.
+    topk_lp.requires_grad_(True)
+    out_buggy = log1mexp(
+        torch.logsumexp(topk_lp.float(), dim=-1).clamp_max(0.0)
+    ).clamp_min(out_floor)
+    token_kl_buggy = compute_mpopd_token_kl(topk_lp, out_buggy, target)
+    assert torch.isfinite(token_kl_buggy).all(), "forward loss must be finite"
+    token_kl_buggy.sum().backward()
+    assert not torch.isfinite(topk_lp.grad).all(), (
+        "bug repro: clamp_max(0.0) should yield NaN in topk_log_probs.grad via 0*-inf"
+    )
+
+    # The FIX: clamp_max(-out_eps) keeps LSE strictly negative -> finite backward.
+    topk_lp.grad = None
+    out_fixed = log1mexp(
+        torch.logsumexp(topk_lp.float(), dim=-1).clamp_max(-1.0e-4)
+    ).clamp_min(out_floor)
+    token_kl_fixed = compute_mpopd_token_kl(topk_lp, out_fixed, target)
+    assert torch.isfinite(token_kl_fixed).all(), "forward loss must be finite"
+    token_kl_fixed.sum().backward()
+    assert torch.isfinite(topk_lp.grad).all(), (
+        "clamp_max(-out_eps): out-mass backward must be finite (no 0*-inf=NaN)"
+    )
+
+
 def test_strict_mode_raises_when_any_sample_lacks_active_experts():
     log_p_k, log_p_out = _uniform_student(K=2)
     target = torch.full((1, 1, 3), 1 / 3)

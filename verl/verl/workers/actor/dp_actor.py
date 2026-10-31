@@ -600,18 +600,36 @@ class DataParallelPPOActor(BasePPOActor):
                 #
                 # Two numerical guards (both for bf16/fp32 rounding, NOT the math — in
                 # exact arithmetic the share is <= 1 so its log is <= 0):
-                #   1. Clamp the log-sum-exp to <= 0. When the top-k captures nearly all
-                #      the mass, bf16 logsumexp rounds slightly positive (e.g. +0.005),
-                #      which would trip log1mexp's x<=0 invariant.
-                #   2. Floor the out-bucket log-prob at a finite minimum. Clamp(0) can
-                #      yield log1mexp(0) = -inf ("out bucket has zero mass"); leaving
-                #      that -inf in place would make the downstream reverse KL hit
-                #      p_out * (log_p_out - log_q) = 0 * -inf = NaN. Flooring keeps the
-                #      out term finite, where it correctly contributes ~0 (p_out=0,
-                #      0*finite=0) and ~0 gradient.
+                #   1. Clamp the log-sum-exp to STRICTLY below 0 (to ``-out_eps``), not
+                #      to 0. Two things go wrong at LSE == 0 (which bf16 reaches when
+                #      the top-k captures ~all the mass, or rounds slightly positive):
+                #      - forward: log1mexp(0) = log(1 - 1) = -inf ("out bucket has
+                #        zero mass");
+                #      - backward: ``d log1mexp/d LSE`` at LSE=0 is ``-exp(0)/(1-exp(0))
+                #        = -1/0 = -inf``. The grad arriving at the out term is ~0
+                #        (p_out ~ 0 -> the KL out-term p_out*(log_p_out-log_q) ~ 0), so
+                #        the backward hits ``0 * -inf = NaN``. Because
+                #        ``d LSE/d topk_lp_k = softmax_k``, that NaN propagates to ALL
+                #        K topk_log_probs entries and shows up as NaN in
+                #        student_log_probs.grad despite a finite forward loss (the
+                #        round-4 diagnostic: token_kl.grad finite, but
+                #        student_log_probs.grad had 200 NaN entries -> grad_norm=NaN).
+                #        Clamping to ``-out_eps`` keeps LSE strictly negative: forward
+                #        out-mass = log(eps) ~ -9.2 (more accurate "~eps mass" than
+                #        the -3.4e38 floor), backward grad = -1/eps finite, so
+                #        ``0 * finite = 0`` -- no NaN -- and the out term carries a
+                #        small real gradient (method_new §8: 学生 out 项有梯度). This
+                #        also covers the bf16-rounding case (LSE slightly positive,
+                #        e.g. +0.005) that the prior ``clamp_max(0.0)`` guarded, and
+                #        keeps log1mexp's ``x <= 0`` invariant satisfied.
+                #   2. Belt-and-suspenders floor on the out-bucket log-prob. With guard
+                #      1 the output is >= log(eps) ~ -9.2, so this clamp is normally a
+                #      no-op; it stays as a backstop for any path that still yields
+                #      -inf, keeping the downstream reverse KL finite.
                 out_floor = torch.finfo(topk_log_probs.dtype).min
+                out_eps = 1.0e-4
                 topk_out_log_prob = log1mexp(
-                    torch.logsumexp(topk_log_probs.float(), dim=-1).clamp_max(0.0)
+                    torch.logsumexp(topk_log_probs.float(), dim=-1).clamp_max(-out_eps)
                 ).clamp_min(out_floor).to(topk_log_probs.dtype)
 
             if return_topk_with_log_probs:
