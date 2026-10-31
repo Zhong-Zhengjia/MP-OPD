@@ -131,6 +131,17 @@ rm -f /dev/shm/psm_* /dev/shm/nccl-* /dev/shm/torch_* 2>/dev/null || true
 # (K-normalized delta amplifies the weak expert signal). To run the literal
 # method_new math, switch delta_normalize=full and retune lambda_value to
 # ~0.01 so g/lambda can dominate the anchor's log_a.
+#
+# gamma=0.1 (structure loss ON) is the method_new §6 cold-start path. The
+# fresh 0.8B base student emits no valid 兴趣/理由 JSON, so with gamma=0.0
+# (Lformat off) the field loss gives zero gradient and the student never
+# learns (observed: grad_norm=0.0, parse_ok_rate=0.0 at step 0-1). With
+# gamma>0, malformed samples tag ALL response tokens as structural, so
+# Lformat = full masked-mean KL and the student gets gamma-scaled gradient
+# during cold start; once it emits valid JSON, Lcontent (weight 1.0) takes
+# over and Lformat becomes the scaffolding-only term. 0.1 weights content
+# 10x over structure in the warm phase and gives a real (if slow) cold
+# start; bump up if parse_ok_rate stays 0 over many steps.
 exec python -m verl.trainer.main_ppo \
   algorithm.train_mode=multi_prompt_distill \
   'algorithm.mp_opd.expert_names=[chasing,long_term,repurchase,generalized]' \
@@ -140,7 +151,7 @@ exec python -m verl.trainer.main_ppo \
   algorithm.mp_opd.delta_normalize=k \
   algorithm.mp_opd.enable_field_loss=true \
   algorithm.mp_opd.eta=0.5 \
-  algorithm.mp_opd.gamma=0.0 \
+  algorithm.mp_opd.gamma=0.1 \
   algorithm.mp_opd.expert_forward_micro_batch_size=1 \
   algorithm.mp_opd.max_expert_prompt_length=32768 \
   critic.enable=false \
